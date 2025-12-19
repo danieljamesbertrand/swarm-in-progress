@@ -1,22 +1,28 @@
 //! Simple Rendezvous Listener - Registers with rndz server and waits for connections
 //! Usage: cargo run --bin listener [--server HOST] [--port PORT] [--namespace NAMESPACE]
 
+mod message;
+use message::{JsonMessage, JsonCodec};
+
 use clap::Parser;
+use serde_json;
 use libp2p::{
     identity,
     tcp,
     noise,
     yamux,
     rendezvous,
+    request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     core::transport::Transport,
-    PeerId, Multiaddr,
+    PeerId, Multiaddr, StreamProtocol,
 };
 use libp2p::swarm::Config as SwarmConfig;
 use libp2p::futures::StreamExt;
 use std::error::Error;
 use std::time::Duration;
 use tokio::time::sleep;
+use std::collections::HashMap;
 
 #[derive(Parser, Debug)]
 #[command(name = "listener")]
@@ -39,6 +45,7 @@ struct Args {
 struct Behaviour {
     rendezvous: rendezvous::client::Behaviour,
     identify: libp2p::identify::Behaviour,
+    request_response: request_response::Behaviour<JsonCodec>,
 }
 
 #[tokio::main]
@@ -69,7 +76,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         libp2p::identify::Config::new("simple-listener/1.0".to_string(), key.public())
     );
     
-    let behaviour = Behaviour { rendezvous, identify };
+    // Request-Response for JSON messaging using custom JSON codec
+    let codec = JsonCodec;
+    let request_response = request_response::Behaviour::with_codec(
+        codec,
+        [(StreamProtocol::new("/json-message/1.0"), ProtocolSupport::Full)],
+        request_response::Config::default(),
+    );
+    
+    let behaviour = Behaviour { rendezvous, identify, request_response };
     
     // Swarm
     let swarm_config = SwarmConfig::with_tokio_executor()
@@ -100,6 +115,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut registered = false;
     let mut rendezvous_peer_id: Option<PeerId> = None;
     let mut connection_retry_count = 0;
+    let mut connected_peers: HashMap<PeerId, ()> = HashMap::new();
+    let mut message_counter = 0u32;
     const MAX_RETRIES: u32 = 5;
     const INITIAL_RETRY_DELAY: u64 = 2; // seconds
     
@@ -110,6 +127,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Create a channel for retry signals
     let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     
+    // Create a channel for periodic message sending
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let msg_tx_clone = msg_tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100)); // Send every 100ms instead of 5 seconds
+        loop {
+            interval.tick().await;
+            // Send multiple triggers to send batches of messages
+            for _ in 0..10 {
+                let _ = msg_tx_clone.send(());
+            }
+        }
+    });
+    
     loop {
         tokio::select! {
             // Handle swarm events
@@ -119,6 +150,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("[VERBOSE] Listening on: {}", address);
                 // Add as external address for rendezvous registration
                 swarm.add_external_address(address.clone());
+                // Also add 127.0.0.1 version for local connections (Windows <-> Windows via WSL server)
+                let addr_str = address.to_string();
+                if addr_str.contains("/ip4/0.0.0.0/") {
+                    let localhost_addr_str = addr_str.replace("/ip4/0.0.0.0/", "/ip4/127.0.0.1/");
+                    if let Ok(localhost_addr) = localhost_addr_str.parse::<Multiaddr>() {
+                        println!("[VERBOSE] Also adding localhost address: {}", localhost_addr);
+                        swarm.add_external_address(localhost_addr);
+                    }
+                }
                 listen_addr_ready = true;
             }
             SwarmEvent::Dialing { .. } => {
@@ -153,12 +193,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 } else if !listen_addr_ready {
                     println!("[VERBOSE] Waiting for listen address before registering...");
+                } else if Some(peer_id) != rendezvous_peer_id {
+                    // This is a peer connection (not the rendezvous server)
+                    println!("✓✓✓ Peer connected: {}", peer_id);
+                    connected_peers.insert(peer_id, ());
+                    println!("[MESSAGE] Ready to exchange JSON messages with peer {}", peer_id);
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 println!("[VERBOSE] ✗ Connection closed");
                 println!("[VERBOSE]   Peer: {}", peer_id);
                 println!("[VERBOSE]   Cause: {:?}", cause);
+                
+                connected_peers.remove(&peer_id);
                 
                 // If rendezvous server connection closed, try to reconnect
                 if Some(peer_id) == rendezvous_peer_id {
@@ -176,15 +223,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             SwarmEvent::Behaviour(event) => {
                 match event {
                     BehaviourEvent::Rendezvous(rendezvous::client::Event::Registered { ttl, .. }) => {
-                        println!("[VERBOSE] âœ“ Registered with rendezvous server");
+                        println!("[VERBOSE] ✓ Registered with rendezvous server");
                         println!("[VERBOSE]   TTL: {:?}", ttl);
-                        println!("âœ“ Registered! Waiting for connections...\n");
+                        println!("✓ Registered! Waiting for connections...\n");
                         println!("Your Peer ID: {}", peer_id);
                         registered = true;
                     }
                     BehaviourEvent::Rendezvous(rendezvous::client::Event::RegisterFailed { error, .. }) => {
-                        println!("[VERBOSE] âœ— Registration failed");
-                        eprintln!("âœ— Registration failed: {:?}", error);
+                        println!("[VERBOSE] ✗ Registration failed");
+                        eprintln!("✗ Registration failed: {:?}", error);
                     }
                     BehaviourEvent::Rendezvous(e) => {
                         println!("[VERBOSE] [Rendezvous Event] {:?}", e);
@@ -193,6 +240,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("[VERBOSE] [Identify] Received from peer: {}", peer_id);
                         println!("[VERBOSE]   Protocol: {:?}", info.protocol_version);
                         println!("[VERBOSE]   Agent: {:?}", info.agent_version);
+                    }
+                    BehaviourEvent::RequestResponse(request_response::Event::Message { message, .. }) => {
+                        match message {
+                            request_response::Message::Request { request, channel, .. } => {
+                                // Received a JSON message request
+                                println!("\n[📨 RECEIVED JSON MESSAGE]");
+                                println!("  From: {}", request.from);
+                                println!("  Message: {}", request.message);
+                                println!("  Timestamp: {}", request.timestamp);
+                                // Show full JSON
+                                if let Ok(json_str) = serde_json::to_string_pretty(&request) {
+                                    println!("  Full JSON:\n{}", json_str);
+                                }
+                                
+                                // Send a response
+                                let response_msg = JsonMessage::new(
+                                    format!("listener-{}", peer_id.to_string().chars().take(8).collect::<String>()),
+                                    format!("Echo: {}", request.message),
+                                );
+                                
+                                if let Err(e) = swarm.behaviour_mut().request_response.send_response(channel, response_msg.clone()) {
+                                    eprintln!("[ERROR] Failed to send response: {:?}", e);
+                                } else {
+                                    println!("\n[📤 SENT JSON RESPONSE]");
+                                    println!("  From: {}", response_msg.from);
+                                    println!("  Message: {}", response_msg.message);
+                                    println!("  Timestamp: {}", response_msg.timestamp);
+                                }
+                            }
+                            request_response::Message::Response { response, .. } => {
+                                // Received a response to our request
+                                println!("\n[📥 RECEIVED JSON RESPONSE]");
+                                println!("  From: {}", response.from);
+                                println!("  Message: {}", response.message);
+                                println!("  Timestamp: {}", response.timestamp);
+                                // Show full JSON
+                                if let Ok(json_str) = serde_json::to_string_pretty(&response) {
+                                    println!("  Full JSON:\n{}", json_str);
+                                }
+                            }
+                        }
+                    }
+                    BehaviourEvent::RequestResponse(request_response::Event::OutboundFailure { error, .. }) => {
+                        eprintln!("[ERROR] Outbound request failed: {:?}", error);
+                    }
+                    BehaviourEvent::RequestResponse(request_response::Event::InboundFailure { error, .. }) => {
+                        eprintln!("[ERROR] Inbound request failed: {:?}", error);
                     }
                     _ => {}
                 }
@@ -262,6 +356,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("[RETRY] Attempting to reconnect to rendezvous server...");
                     if let Err(e) = swarm.dial(addr.clone()) {
                         eprintln!("[RETRY] Failed to initiate retry: {:?}", e);
+                    }
+                }
+            }
+            _ = msg_rx.recv() => {
+                // Send periodic messages to all connected peers
+                if !connected_peers.is_empty() {
+                    message_counter += 1;
+                    for peer_id in connected_peers.keys() {
+                        let json_msg = JsonMessage::new(
+                            format!("listener-{}", peer_id.to_string().chars().take(8).collect::<String>()),
+                            format!("Periodic message #{} from listener", message_counter),
+                        );
+                        let _request_id = swarm.behaviour_mut().request_response.send_request(peer_id, json_msg.clone());
+                        println!("\n[📤 SENT PERIODIC JSON MESSAGE] to peer {} (#{})", peer_id, message_counter);
+                        println!("  From: {}", json_msg.from);
+                        println!("  Message: {}", json_msg.message);
+                        println!("  Timestamp: {}", json_msg.timestamp);
                     }
                 }
             }

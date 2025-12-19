@@ -6,9 +6,12 @@ authors = ["punch-simple"]
 description = "Simple libp2p rendezvous client and server"
 
 [dependencies]
-libp2p = { version = "0.53", features = ["quic", "noise", "tcp", "dns", "macros", "rendezvous", "identify", "yamux", "tokio"] }
+libp2p = { version = "0.53", features = ["quic", "noise", "tcp", "dns", "macros", "rendezvous", "identify", "yamux", "tokio", "request-response"] }
 tokio = { version = "1.35", features = ["full"] }
 clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
 
 [[bin]]
 name = "listener"

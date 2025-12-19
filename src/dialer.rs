@@ -1,22 +1,28 @@
 //! Simple Rendezvous Dialer - Discovers peers via rndz and connects
 //! Usage: cargo run --bin dialer [--server HOST] [--port PORT] [--namespace NAMESPACE]
 
+mod message;
+use message::{JsonMessage, JsonCodec};
+
 use clap::Parser;
+use serde_json;
 use libp2p::{
     identity,
     tcp,
     noise,
     yamux,
     rendezvous,
+    request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     core::transport::Transport,
-    PeerId, Multiaddr,
+    PeerId, Multiaddr, StreamProtocol,
 };
 use libp2p::swarm::Config as SwarmConfig;
 use libp2p::futures::StreamExt;
 use std::error::Error;
 use std::time::Duration;
 use tokio::time::sleep;
+use std::collections::HashMap;
 
 #[derive(Parser, Debug)]
 #[command(name = "dialer")]
@@ -39,6 +45,7 @@ struct Args {
 struct Behaviour {
     rendezvous: rendezvous::client::Behaviour,
     identify: libp2p::identify::Behaviour,
+    request_response: request_response::Behaviour<JsonCodec>,
 }
 
 #[tokio::main]
@@ -69,7 +76,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         libp2p::identify::Config::new("simple-dialer/1.0".to_string(), key.public())
     );
     
-    let behaviour = Behaviour { rendezvous, identify };
+    // Request-Response for JSON messaging using custom JSON codec
+    let codec = JsonCodec;
+    let request_response = request_response::Behaviour::with_codec(
+        codec,
+        [(StreamProtocol::new("/json-message/1.0"), ProtocolSupport::Full)],
+        request_response::Config::default(),
+    );
+    
+    let behaviour = Behaviour { rendezvous, identify, request_response };
     
     // Swarm
     let swarm_config = SwarmConfig::with_tokio_executor()
@@ -93,7 +108,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     
     let mut rendezvous_peer_id: Option<PeerId> = None;
     let mut discovered_peers: Vec<PeerId> = Vec::new();
+    let mut connected_peers: HashMap<PeerId, ()> = HashMap::new();
     let mut connection_retry_count = 0u32;
+    let mut message_counter = 0u32;
     const MAX_RETRIES: u32 = 5;
     const INITIAL_RETRY_DELAY: u64 = 2; // seconds
     
@@ -104,6 +121,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     
     // Create a channel for retry signals
     let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    
+    // Create a channel for periodic message sending
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let msg_tx_clone = msg_tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100)); // Send every 100ms instead of 5 seconds
+        loop {
+            interval.tick().await;
+            // Send multiple triggers to send batches of messages
+            for _ in 0..10 {
+                let _ = msg_tx_clone.send(());
+            }
+        }
+    });
     
     loop {
         tokio::select! {
@@ -136,12 +167,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 } else if !discovered_peers.contains(&peer_id) {
                     println!("[VERBOSE] ✓✓✓ Connected to discovered peer: {}", peer_id);
                     println!("✓✓✓ CONNECTED to peer: {}", peer_id);
+                    connected_peers.insert(peer_id, ());
+                    
+                    // Send initial JSON message
+                    message_counter += 1;
+                    let json_msg = JsonMessage::new(
+                        format!("dialer-{}", peer_id.to_string().chars().take(8).collect::<String>()),
+                        format!("Hello from dialer! Message #{}", message_counter),
+                    );
+                    let _request_id = swarm.behaviour_mut().request_response.send_request(&peer_id, json_msg.clone());
+                    println!("\n[📤 SENT JSON MESSAGE] to peer {}", peer_id);
+                    println!("  From: {}", json_msg.from);
+                    println!("  Message: {}", json_msg.message);
+                    println!("  Timestamp: {}", json_msg.timestamp);
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 println!("[VERBOSE] ✗ Connection closed");
                 println!("[VERBOSE]   Peer: {}", peer_id);
                 println!("[VERBOSE]   Cause: {:?}", cause);
+                
+                connected_peers.remove(&peer_id);
                 
                 // If rendezvous server connection closed, try to reconnect
                 if Some(peer_id) == rendezvous_peer_id {
@@ -171,11 +217,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 println!("[VERBOSE]   Addresses: {:?}", addrs);
                                 
                                 // Try to connect to discovered peer
-                                if let Some(addr) = addrs.first() {
+                                // Prioritize 127.0.0.1 addresses for local connections
+                                let mut sorted_addrs = addrs.clone();
+                                sorted_addrs.sort_by(|a, b| {
+                                    let a_str = a.to_string();
+                                    let b_str = b.to_string();
+                                    let a_is_localhost = a_str.contains("/ip4/127.0.0.1/");
+                                    let b_is_localhost = b_str.contains("/ip4/127.0.0.1/");
+                                    match (a_is_localhost, b_is_localhost) {
+                                        (true, false) => std::cmp::Ordering::Less,
+                                        (false, true) => std::cmp::Ordering::Greater,
+                                        _ => std::cmp::Ordering::Equal,
+                                    }
+                                });
+                                
+                                // Try all addresses, starting with localhost
+                                for addr in sorted_addrs {
                                     println!("\n[3] Connecting to discovered peer: {}", discovered_peer);
-                                    println!("[VERBOSE]   Address: {}", addr);
-                                    swarm.dial(addr.clone())?;
-                                } else {
+                                    println!("[VERBOSE]   Trying address: {}", addr);
+                                    if let Err(e) = swarm.dial(addr.clone()) {
+                                        eprintln!("[VERBOSE]   Failed to dial {}: {:?}", addr, e);
+                                        continue; // Try next address
+                                    } else {
+                                        break; // Successfully initiated dial, wait for connection
+                                    }
+                                }
+                                
+                                if addrs.is_empty() {
                                     println!("[VERBOSE]   No addresses found for peer");
                                 }
                             }
@@ -188,6 +256,54 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("[VERBOSE] [Identify] Received from peer: {}", peer_id);
                         println!("[VERBOSE]   Protocol: {:?}", info.protocol_version);
                         println!("[VERBOSE]   Agent: {:?}", info.agent_version);
+                    }
+                    BehaviourEvent::RequestResponse(request_response::Event::Message { message, .. }) => {
+                        match message {
+                            request_response::Message::Request { request, channel, .. } => {
+                                // Received a JSON message request (already deserialized)
+                                println!("\n[📨 RECEIVED JSON MESSAGE]");
+                                println!("  From: {}", request.from);
+                                println!("  Message: {}", request.message);
+                                println!("  Timestamp: {}", request.timestamp);
+                                // Show full JSON
+                                if let Ok(json_str) = serde_json::to_string_pretty(&request) {
+                                    println!("  Full JSON:\n{}", json_str);
+                                }
+                                
+                                // Send a response
+                                message_counter += 1;
+                                let response_msg = JsonMessage::new(
+                                    format!("dialer-{}", peer_id.to_string().chars().take(8).collect::<String>()),
+                                    format!("Echo from dialer: {} (response #{})", request.message, message_counter),
+                                );
+                                
+                                if let Err(e) = swarm.behaviour_mut().request_response.send_response(channel, response_msg.clone()) {
+                                    eprintln!("[ERROR] Failed to send response: {:?}", e);
+                                } else {
+                                    println!("\n[📤 SENT JSON RESPONSE]");
+                                    println!("  From: {}", response_msg.from);
+                                    println!("  Message: {}", response_msg.message);
+                                    println!("  Timestamp: {}", response_msg.timestamp);
+                                }
+                            }
+                            request_response::Message::Response { response, .. } => {
+                                // Received a response to our request (already deserialized)
+                                println!("\n[📥 RECEIVED JSON RESPONSE]");
+                                println!("  From: {}", response.from);
+                                println!("  Message: {}", response.message);
+                                println!("  Timestamp: {}", response.timestamp);
+                                // Show full JSON
+                                if let Ok(json_str) = serde_json::to_string_pretty(&response) {
+                                    println!("  Full JSON:\n{}", json_str);
+                                }
+                            }
+                        }
+                    }
+                    BehaviourEvent::RequestResponse(request_response::Event::OutboundFailure { error, .. }) => {
+                        eprintln!("[ERROR] Outbound request failed: {:?}", error);
+                    }
+                    BehaviourEvent::RequestResponse(request_response::Event::InboundFailure { error, .. }) => {
+                        eprintln!("[ERROR] Inbound request failed: {:?}", error);
                     }
                     _ => {}
                 }
@@ -250,13 +366,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             _ => {}
                 }
-            },
+            }
             // Handle retry signals
             _ = retry_rx.recv() => {
                 if connection_retry_count <= MAX_RETRIES {
                     println!("[RETRY] Attempting to reconnect to rendezvous server...");
                     if let Err(e) = swarm.dial(addr.clone()) {
                         eprintln!("[RETRY] Failed to initiate retry: {:?}", e);
+                    }
+                }
+            }
+            _ = msg_rx.recv() => {
+                // Send periodic messages to all connected peers
+                if !connected_peers.is_empty() {
+                    message_counter += 1;
+                    for peer_id in connected_peers.keys() {
+                        let json_msg = JsonMessage::new(
+                            format!("dialer-{}", peer_id.to_string().chars().take(8).collect::<String>()),
+                            format!("Periodic message #{} from dialer", message_counter),
+                        );
+                        let _request_id = swarm.behaviour_mut().request_response.send_request(peer_id, json_msg.clone());
+                        println!("\n[📤 SENT PERIODIC JSON MESSAGE] to peer {} (#{})", peer_id, message_counter);
+                        println!("  From: {}", json_msg.from);
+                        println!("  Message: {}", json_msg.message);
+                        println!("  Timestamp: {}", json_msg.timestamp);
                     }
                 }
             }
