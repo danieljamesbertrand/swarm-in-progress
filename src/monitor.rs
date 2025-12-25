@@ -9,6 +9,7 @@ use libp2p::{
     yamux,
     kad,
     ping,
+    relay,
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     core::transport::Transport,
     PeerId, Multiaddr,
@@ -45,6 +46,7 @@ struct Behaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: libp2p::identify::Behaviour,
     ping: ping::Behaviour,
+    relay: relay::Behaviour,
 }
 
 // Network state for monitoring
@@ -174,14 +176,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
     );
 
-    // Ping protocol for connection keepalive (sends pings every ~15 seconds by default)
+    // Ping protocol for connection keepalive (sends pings every 25 seconds)
     let ping = ping::Behaviour::new(
         ping::Config::new()
             .with_interval(Duration::from_secs(25)) // Ping every 25 seconds
             .with_timeout(Duration::from_secs(10)), // 10 second timeout
     );
 
-    let behaviour = Behaviour { kademlia, identify, ping };
+    // Relay protocol for NAT traversal
+    // Monitor acts as a relay server to help peers behind NAT connect
+    let relay = relay::Behaviour::new(
+        local_peer_id,
+        relay::Config::default(),
+    );
+
+    let behaviour = Behaviour { kademlia, identify, ping, relay };
     
     let swarm_config = SwarmConfig::with_tokio_executor()
         .with_idle_connection_timeout(Duration::from_secs(90)); // Increased since ping keeps connections alive

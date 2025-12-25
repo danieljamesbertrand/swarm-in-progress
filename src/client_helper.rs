@@ -43,6 +43,7 @@ use libp2p::{
     noise,
     yamux,
     kad,
+    relay,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     core::transport::Transport,
@@ -61,6 +62,7 @@ struct Behaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: libp2p::identify::Behaviour,
     request_response: request_response::Behaviour<JsonCodec>,
+    relay: libp2p::relay::Behaviour,
 }
 
 #[derive(Debug)]
@@ -85,6 +87,12 @@ impl From<libp2p::identify::Event> for BehaviourEvent {
 impl From<request_response::Event<JsonCodec>> for BehaviourEvent {
     fn from(event: request_response::Event<JsonCodec>) -> Self {
         BehaviourEvent::RequestResponse(event)
+    }
+}
+
+impl From<relay::Event> for BehaviourEvent {
+    fn from(event: relay::Event) -> Self {
+        BehaviourEvent::Relay(event)
     }
 }
 
@@ -237,8 +245,14 @@ impl P2PClient {
             request_response::Config::default(),
         );
         
+        // Relay protocol for NAT traversal (client mode)
+        let relay_behaviour = relay::Behaviour::new(
+            peer_id,
+            relay::Config::default(),
+        );
+        
         // Combine all behaviours into one
-        let behaviour = Behaviour { kademlia, identify, request_response };
+        let behaviour = Behaviour { kademlia, identify, request_response, relay: relay_behaviour };
         
         // Create the swarm (main networking component)
         // This manages all connections and protocol interactions

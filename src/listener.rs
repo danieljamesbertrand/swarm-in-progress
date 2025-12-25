@@ -12,6 +12,7 @@ use libp2p::{
     noise,
     yamux,
     kad,
+    relay,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     core::transport::Transport,
@@ -42,6 +43,7 @@ struct Behaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: libp2p::identify::Behaviour,
     request_response: request_response::Behaviour<JsonCodec>,
+    relay: relay::Behaviour,
 }
 
 #[tokio::main]
@@ -87,7 +89,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         request_response::Config::default(),
     );
     
-    let behaviour = Behaviour { kademlia, identify, request_response };
+    // Relay protocol for NAT traversal (client mode)
+    let relay = relay::Behaviour::new(
+        peer_id,
+        relay::Config::default(),
+    );
+    
+    let behaviour = Behaviour { kademlia, identify, request_response, relay };
     
     // Swarm
     let swarm_config = SwarmConfig::with_tokio_executor()

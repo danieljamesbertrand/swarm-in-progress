@@ -8,6 +8,7 @@ use libp2p::{
     noise,
     yamux,
     kad,
+    relay,
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     core::transport::Transport,
     PeerId, Multiaddr,
@@ -34,6 +35,7 @@ struct Args {
 struct Behaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: libp2p::identify::Behaviour,
+    relay: relay::Behaviour,
 }
 
 #[tokio::main]
@@ -70,7 +72,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
     );
 
-    let behaviour = Behaviour { kademlia, identify };
+    // Relay protocol for NAT traversal
+    // Server acts as a relay to help peers behind NAT connect
+    let relay = relay::Behaviour::new(
+        local_peer_id,
+        relay::Config::default(),
+    );
+
+    let behaviour = Behaviour { kademlia, identify, relay };
     
     // Swarm
     let swarm_config = SwarmConfig::with_tokio_executor()
