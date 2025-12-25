@@ -2,7 +2,9 @@
 //! Usage: cargo run --bin listener [--bootstrap ADDR] [--namespace NAMESPACE]
 
 mod message;
+mod metrics;
 use message::{JsonMessage, JsonCodec};
+use metrics::{MetricsCodec, PeerMetrics, MetricsRequest, MetricsResponse};
 
 use clap::Parser;
 use serde_json;
@@ -23,6 +25,8 @@ use libp2p::futures::StreamExt;
 use std::error::Error;
 use std::time::Duration;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use rand::Rng;
 
 #[derive(Parser, Debug)]
@@ -43,6 +47,7 @@ struct Behaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: libp2p::identify::Behaviour,
     request_response: request_response::Behaviour<JsonCodec>,
+    metrics_response: request_response::Behaviour<MetricsCodec>,
     relay: relay::Behaviour,
 }
 
@@ -89,13 +94,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         request_response::Config::default(),
     );
     
+    // Request-Response for metrics reporting
+    let metrics_codec = MetricsCodec;
+    let metrics_response = request_response::Behaviour::with_codec(
+        metrics_codec,
+        [(StreamProtocol::new("/metrics/1.0"), ProtocolSupport::Full)],
+        request_response::Config::default(),
+    );
+    
     // Relay protocol for NAT traversal (client mode)
     let relay = relay::Behaviour::new(
         peer_id,
         relay::Config::default(),
     );
     
-    let behaviour = Behaviour { kademlia, identify, request_response, relay };
+    let behaviour = Behaviour { kademlia, identify, request_response, metrics_response, relay };
     
     // Swarm
     let swarm_config = SwarmConfig::with_tokio_executor()
@@ -120,6 +133,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut registered = false;
     let mut connected_peers: HashMap<PeerId, ()> = HashMap::new();
     let mut message_counter = 0u32;
+    
+    // Metrics tracking
+    let metrics = Arc::new(RwLock::new(PeerMetrics {
+        peer_id: peer_id.to_string(),
+        namespace: args.namespace.clone(),
+        messages_sent: 0,
+        messages_received: 0,
+        latency_samples: Vec::new(),
+        bytes_sent: 0,
+        bytes_received: 0,
+        message_errors: 0,
+        timeout_errors: 0,
+    }));
+    
+    // Track monitor peer ID (bootstrap node)
+    let monitor_peer_id = peer_id; // Will be updated when we connect to bootstrap
     
     // Create a channel for random message sending
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -154,6 +183,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("[VERBOSE]   Peer ID: {}", peer_id);
                 
                 if !bootstrapped {
+                    // First connection is to bootstrap node (monitor)
                     // Start bootstrap after first connection
                     if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
                         eprintln!("[WARN] Bootstrap start failed: {:?}", e);
@@ -240,15 +270,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     BehaviourEvent::RequestResponse(request_response::Event::Message { message, .. }) => {
                         match message {
                             request_response::Message::Request { request, channel, .. } => {
-                                // Received a JSON message request
-                                println!("\n[📨 RECEIVED JSON MESSAGE]");
+                                // Calculate latency if send_time_ms is present
+                                let latency_ms = if let Some(send_time) = request.send_time_ms {
+                                    let now_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis() as u64;
+                                    if now_ms > send_time {
+                                        (now_ms - send_time) as f64
+                                    } else {
+                                        0.0
+                                    }
+                                } else {
+                                    0.0
+                                };
+                                
+                                // Update metrics
+                                {
+                                    let mut m = metrics.write().await;
+                                    m.messages_received += 1;
+                                    if latency_ms > 0.0 {
+                                        m.latency_samples.push(latency_ms);
+                                        // Keep only last 100 samples
+                                        if m.latency_samples.len() > 100 {
+                                            m.latency_samples.remove(0);
+                                        }
+                                    }
+                                    if let Ok(json_bytes) = serde_json::to_vec(&request) {
+                                        m.bytes_received += json_bytes.len() as u64;
+                                    }
+                                }
+                                
+                                println!("\n[📨 RECEIVED JSON MESSAGE] (latency: {:.2}ms)", latency_ms);
                                 println!("  From: {}", request.from);
                                 println!("  Message: {}", request.message);
                                 println!("  Timestamp: {}", request.timestamp);
-                                // Show full JSON
-                                if let Ok(json_str) = serde_json::to_string_pretty(&request) {
-                                    println!("  Full JSON:\n{}", json_str);
-                                }
                                 
                                 // Send a response
                                 let response_msg = JsonMessage::new(
@@ -258,6 +314,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 
                                 if let Err(e) = swarm.behaviour_mut().request_response.send_response(channel, response_msg.clone()) {
                                     eprintln!("[ERROR] Failed to send response: {:?}", e);
+                                    let mut m = metrics.write().await;
+                                    m.message_errors += 1;
                                 } else {
                                     println!("\n[📤 SENT JSON RESPONSE]");
                                     println!("  From: {}", response_msg.from);
@@ -266,6 +324,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             request_response::Message::Response { response, .. } => {
+                                // Update metrics
+                                {
+                                    let mut m = metrics.write().await;
+                                    m.messages_received += 1;
+                                    if let Ok(json_bytes) = serde_json::to_vec(&response) {
+                                        m.bytes_received += json_bytes.len() as u64;
+                                    }
+                                }
+                                
                                 // Received a response to our request
                                 println!("\n[📥 RECEIVED JSON RESPONSE]");
                                 println!("  From: {}", response.from);
@@ -278,11 +345,54 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                     }
+                    BehaviourEvent::MetricsResponse(request_response::Event::Message { message, .. }) => {
+                        match message {
+                            request_response::Message::Request { channel, .. } => {
+                                // Monitor is requesting metrics
+                                let m = metrics.read().await;
+                                let peer_metrics = PeerMetrics {
+                                    peer_id: m.peer_id.clone(),
+                                    namespace: m.namespace.clone(),
+                                    messages_sent: m.messages_sent,
+                                    messages_received: m.messages_received,
+                                    latency_samples: m.latency_samples.clone(),
+                                    bytes_sent: m.bytes_sent,
+                                    bytes_received: m.bytes_received,
+                                    message_errors: m.message_errors,
+                                    timeout_errors: m.timeout_errors,
+                                };
+                                drop(m);
+                                
+                                let response = MetricsResponse {
+                                    success: true,
+                                    message: "Metrics sent".to_string(),
+                                    metrics: Some(peer_metrics),
+                                };
+                                
+                                if let Err(e) = swarm.behaviour_mut().metrics_response.send_response(channel, response) {
+                                    eprintln!("[ERROR] Failed to send metrics: {:?}", e);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    BehaviourEvent::MetricsResponse(request_response::Event::OutboundFailure { error, .. }) => {
+                        eprintln!("[ERROR] Metrics request failed: {:?}", error);
+                        let mut m = metrics.write().await;
+                        m.timeout_errors += 1;
+                    }
+                    BehaviourEvent::MetricsResponse(request_response::Event::InboundFailure { error, .. }) => {
+                        eprintln!("[ERROR] Metrics inbound failed: {:?}", error);
+                    }
                     BehaviourEvent::RequestResponse(request_response::Event::OutboundFailure { error, .. }) => {
                         eprintln!("[ERROR] Outbound request failed: {:?}", error);
+                        let mut m = metrics.write().await;
+                        m.message_errors += 1;
                     }
                     BehaviourEvent::RequestResponse(request_response::Event::InboundFailure { error, .. }) => {
                         eprintln!("[ERROR] Inbound request failed: {:?}", error);
+                        let mut m = metrics.write().await;
+                        m.message_errors += 1;
                     }
                     _ => {}
                 }
@@ -323,6 +433,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 format!("listener-{}", local_peer_id_str.chars().take(8).collect::<String>()),
                                 msg_text,
                             );
+                            
+                            // Update metrics
+                            {
+                                let mut m = metrics.write().await;
+                                m.messages_sent += 1;
+                                if let Ok(json_bytes) = serde_json::to_vec(&json_msg) {
+                                    m.bytes_sent += json_bytes.len() as u64;
+                                }
+                            }
+                            
                             let _request_id = swarm.behaviour_mut().request_response.send_request(peer_id, json_msg.clone());
                             println!("\n[📤 SENT RANDOM MESSAGE] to peer {} (#{})", peer_id, message_counter);
                         }

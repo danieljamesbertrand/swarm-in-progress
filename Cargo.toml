@@ -16,6 +16,7 @@ sha2 = "0.10"
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
 rand = "0.8"
+num_cpus = "1.16"
 
 [[bin]]
 name = "listener"
@@ -32,6 +33,14 @@ path = "src/server.rs"
 [[bin]]
 name = "monitor"
 path = "src/monitor.rs"
+
+[[bin]]
+name = "torrent_server"
+path = "src/torrent_server.rs"
+
+[[bin]]
+name = "torrent_client"
+path = "src/torrent_client.rs"
 
 [[example]]
 name = "simple_client"

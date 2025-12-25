@@ -270,3 +270,388 @@ cargo run --release --bin listener \
 
 The system is **fully decentralized** after the initial bootstrap - no central server needed for ongoing operations!
 
+## Troubleshooting External IP Connections
+
+### Common Issues and Solutions
+
+#### Issue 1: Cannot Connect to Bootstrap Node
+
+**Symptoms:**
+- Connection timeout when dialing bootstrap node
+- "Connection refused" errors
+- Bootstrap never completes
+
+**Diagnosis:**
+```bash
+# Test if bootstrap node is reachable
+telnet 203.0.113.1 51820
+# or
+nc -zv 203.0.113.1 51820
+```
+
+**Solutions:**
+1. **Check Firewall**: Ensure port 51820 is open on bootstrap node
+   ```bash
+   # Linux
+   sudo ufw allow 51820/tcp
+   sudo iptables -A INPUT -p tcp --dport 51820 -j ACCEPT
+   
+   # Windows
+   # Add firewall rule via Windows Firewall settings
+   ```
+
+2. **Verify Listening Address**: Bootstrap node must listen on `0.0.0.0`, not `127.0.0.1`
+   ```rust
+   // ✅ Correct
+   swarm.listen_on("/ip4/0.0.0.0/tcp/51820".parse()?)?;
+   
+   // ❌ Wrong (only localhost)
+   swarm.listen_on("/ip4/127.0.0.1/tcp/51820".parse()?)?;
+   ```
+
+3. **Check Public IP**: Verify bootstrap node's public IP is correct
+   ```bash
+   # On bootstrap node
+   curl ifconfig.me
+   # or
+   curl ipinfo.io/ip
+   ```
+
+#### Issue 2: Peers Behind NAT Cannot Connect
+
+**Symptoms:**
+- Peers bootstrap successfully
+- DHT discovery works
+- Direct connections fail
+- Messages don't reach peers
+
+**Solutions:**
+1. **Enable Relay Protocol**: Ensure relay is enabled (already implemented)
+   ```rust
+   // Relay is automatically used when direct connection fails
+   ```
+
+2. **Check NAT Type**: Some NATs are more restrictive
+   - **Symmetric NAT**: Most restrictive, may require relay
+   - **Port-Restricted NAT**: May work with hole punching
+   - **Cone NAT**: Usually works with hole punching
+
+3. **Use Relay Nodes**: Deploy dedicated relay nodes for NAT traversal
+   ```rust
+   // Monitor/server already acts as relay
+   // Peers automatically use relay when needed
+   ```
+
+#### Issue 3: DHT Discovery Fails
+
+**Symptoms:**
+- Bootstrap succeeds
+- No peers discovered
+- `get_closest_peers` returns empty results
+
+**Diagnosis:**
+```rust
+// Add logging to see DHT state
+match event {
+    BehaviourEvent::Kademlia(kad::Event::RoutingUpdated { .. }) => {
+        println!("[DHT] Routing table updated");
+    }
+    BehaviourEvent::Kademlia(kad::Event::QueryResult { result, .. }) => {
+        println!("[DHT] Query result: {:?}", result);
+    }
+}
+```
+
+**Solutions:**
+1. **Wait for Bootstrap**: DHT needs time to populate routing table
+   - Wait 10-30 seconds after bootstrap
+   - Check routing table size
+
+2. **Verify Namespace**: Ensure all peers use the same namespace
+   ```bash
+   # All peers must use identical namespace
+   --namespace my-app  # Must match exactly
+   ```
+
+3. **Check Bootstrap Success**: Verify bootstrap completed
+   ```rust
+   BehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+       result: kad::QueryResult::Bootstrap(Ok(kad::BootstrapResult::Ok { .. })),
+       ..
+   }) => {
+       println!("[DHT] Bootstrap successful!");
+   }
+   ```
+
+#### Issue 4: Intermittent Connection Failures
+
+**Symptoms:**
+- Connections work sometimes
+- Random disconnections
+- Timeouts during message exchange
+
+**Solutions:**
+1. **Increase Timeouts**: Adjust connection timeouts
+   ```rust
+   let mut config = libp2p::swarm::Config::default();
+   config.set_connection_idle_timeout(Duration::from_secs(60));
+   ```
+
+2. **Enable Keep-Alive**: Keep connections alive
+   ```rust
+   // TCP keep-alive is enabled by default in libp2p
+   ```
+
+3. **Check Network Stability**: Verify network connection is stable
+   ```bash
+   # Test network stability
+   ping -c 100 bootstrap-ip
+   ```
+
+## Security Considerations
+
+### Network Security
+
+**1. Firewall Configuration**
+- Only expose necessary ports (51820)
+- Use firewall rules to restrict access
+- Consider IP whitelisting for bootstrap node
+
+**2. Authentication**
+- Current implementation: No authentication
+- **Recommendation**: Add peer authentication for production
+  ```rust
+  // Future: Add peer authentication
+  // Use libp2p::noise for encrypted connections (already enabled)
+  ```
+
+**3. DDoS Protection**
+- Bootstrap node is vulnerable to DDoS
+- **Mitigation**: Use rate limiting, multiple bootstrap nodes
+- Consider cloud DDoS protection services
+
+**4. Message Encryption**
+- ✅ **Already Implemented**: Noise protocol provides encryption
+- All connections are encrypted by default
+- No additional configuration needed
+
+### Best Practices
+
+**1. Bootstrap Node Security**
+```bash
+# Run bootstrap node with limited privileges
+sudo -u p2p-user cargo run --release --bin monitor
+```
+
+**2. Network Isolation**
+- Use VPN for sensitive deployments
+- Isolate P2P network from other services
+- Use separate network interfaces if needed
+
+**3. Monitoring**
+- Monitor bootstrap node health
+- Log connection attempts
+- Alert on suspicious activity
+
+## Performance Optimization
+
+### Connection Pooling
+
+**Current**: Each peer maintains connections to discovered peers
+**Optimization**: Limit concurrent connections
+```rust
+let mut config = libp2p::swarm::Config::default();
+config.set_max_established_connections(100); // Limit connections
+```
+
+### DHT Optimization
+
+**1. Routing Table Size**
+```rust
+let mut config = kad::Config::default();
+config.set_max_record_age(Some(Duration::from_secs(3600))); // 1 hour
+```
+
+**2. Query Timeout**
+```rust
+// Adjust query timeout for faster discovery
+let mut config = kad::Config::default();
+config.set_query_timeout(Duration::from_secs(10));
+```
+
+### Resource Limits
+
+**1. Memory Usage**
+- Monitor memory usage with many peers
+- Consider connection limits
+- Clean up stale DHT records
+
+**2. CPU Usage**
+- DHT queries can be CPU-intensive
+- Use async/await for non-blocking operations
+- Consider rate limiting queries
+
+## Monitoring and Health Checks
+
+### Bootstrap Node Health
+
+**Check if bootstrap node is running:**
+```bash
+# Test connection
+nc -zv bootstrap-ip 51820
+
+# Check process
+ps aux | grep monitor
+```
+
+**Monitor logs:**
+```bash
+# Redirect logs to file
+cargo run --release --bin monitor 2>&1 | tee monitor.log
+```
+
+### Peer Health Monitoring
+
+**1. Connection Status**
+```rust
+// Log connection events
+SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+    println!("[HEALTH] Connected: {}", peer_id);
+    // Update health metrics
+}
+SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+    println!("[HEALTH] Disconnected: {} - {:?}", peer_id, cause);
+    // Update health metrics
+}
+```
+
+**2. DHT Health**
+```rust
+// Monitor DHT routing table
+let routing_table_size = swarm.behaviour().kademlia.num_peers();
+println!("[HEALTH] DHT peers: {}", routing_table_size);
+```
+
+**3. Message Success Rate**
+```rust
+// Track message delivery
+let mut sent = 0;
+let mut received = 0;
+// Calculate success rate: received / sent
+```
+
+### Metrics to Track
+
+**Essential Metrics:**
+- Bootstrap node uptime
+- Number of connected peers
+- DHT routing table size
+- Message delivery rate
+- Connection failure rate
+- Average connection latency
+
+**Example Metrics Collection:**
+```rust
+struct Metrics {
+    connected_peers: usize,
+    routing_table_size: usize,
+    messages_sent: u64,
+    messages_received: u64,
+    connection_failures: u64,
+}
+```
+
+## Advanced Configuration
+
+### Custom Port Configuration
+
+**Change default port:**
+```bash
+# Bootstrap node
+cargo run --release --bin monitor -- --port 9999
+
+# Peer
+cargo run --release --bin listener \
+  --bootstrap /ip4/203.0.113.1/tcp/9999 \
+  --namespace test
+```
+
+### Multiple Network Interfaces
+
+**Bind to specific interface:**
+```rust
+// Listen on specific interface
+swarm.listen_on("/ip4/192.168.1.100/tcp/51820".parse()?)?;
+
+// Or listen on all interfaces (recommended)
+swarm.listen_on("/ip4/0.0.0.0/tcp/51820".parse()?)?;
+```
+
+### IPv6 Support
+
+**Enable IPv6:**
+```rust
+// Listen on IPv6
+swarm.listen_on("/ip6/::/tcp/51820".parse()?)?;
+
+// Bootstrap with IPv6
+let bootstrap_addr = "/ip6/2001:db8::1/tcp/51820".parse()?;
+```
+
+## Production Deployment Checklist
+
+### Pre-Deployment
+
+- [ ] Bootstrap node has public IP or port forwarding configured
+- [ ] Firewall rules allow port 51820 (or custom port)
+- [ ] Bootstrap node runs as non-root user
+- [ ] Logging configured for monitoring
+- [ ] Health check endpoint (if needed)
+- [ ] Backup bootstrap nodes configured
+
+### Deployment
+
+- [ ] Start bootstrap node on public server
+- [ ] Verify bootstrap node is reachable
+- [ ] Test connection from remote peer
+- [ ] Verify DHT discovery works
+- [ ] Test message exchange
+- [ ] Monitor for 24 hours
+
+### Post-Deployment
+
+- [ ] Monitor connection success rate
+- [ ] Track DHT health
+- [ ] Monitor resource usage (CPU, memory, bandwidth)
+- [ ] Set up alerts for failures
+- [ ] Document bootstrap node IPs for users
+- [ ] Plan for bootstrap node redundancy
+
+## Additional Resources
+
+### libp2p Documentation
+- [libp2p Kademlia](https://docs.rs/libp2p-kad/latest/libp2p_kad/)
+- [libp2p Relay](https://docs.rs/libp2p-relay/latest/libp2p_relay/)
+- [libp2p Identify](https://docs.rs/libp2p-identify/latest/libp2p_identify/)
+
+### Network Tools
+- `netstat` / `ss`: Check listening ports
+- `tcpdump` / `wireshark`: Network packet analysis
+- `telnet` / `nc`: Test connectivity
+- `ping`: Test network reachability
+
+### Debugging Commands
+```bash
+# Check if port is listening
+netstat -tuln | grep 51820
+
+# Check connections
+netstat -an | grep 51820
+
+# Monitor network traffic
+tcpdump -i any port 51820
+```
+
+---
+
+**Remember**: The system is designed to be fully decentralized after bootstrap. Once peers join the network, they can communicate directly without the bootstrap node, making it resilient and scalable!

@@ -4,11 +4,14 @@ A simple libp2p-based peer-to-peer networking library using **Kademlia DHT** for
 
 ## Overview
 
-This project provides a decentralized P2P networking solution with three main components:
+This project provides a decentralized P2P networking solution with multiple components:
 
 - **server** - Bootstrap node that helps peers join the Kademlia DHT network
 - **listener** - Peer that joins the DHT and waits for incoming connections
 - **dialer** - Peer that discovers and connects to other peers via the DHT
+- **monitor** - Web-based network monitoring dashboard
+- **torrent_server** - Serves files via BitTorrent-like protocol over libp2p
+- **torrent_client** - Downloads files from peers via DHT discovery
 
 ## Key Features
 
@@ -16,6 +19,9 @@ This project provides a decentralized P2P networking solution with three main co
 - **libp2p 0.53** compatible with modern networking stack
 - **Encrypted**: TCP transport with Noise encryption and Yamux multiplexing
 - **JSON Messaging**: Built-in request-response protocol for JSON message exchange
+- **File Sharing**: BitTorrent-like file sharing with DHT-based discovery
+- **NAT Traversal**: Relay protocol for connecting peers behind NATs
+- **Web Monitoring**: Real-time network dashboard with metrics and visualization
 - **Cross-platform**: Works on Windows, Linux, and macOS
 - **Simple API**: Easy-to-use client helper for integration into your applications
 
@@ -43,10 +49,13 @@ Unlike centralized rendezvous systems, Kademlia is a **distributed hash table (D
 cargo build --release
 ```
 
-This builds three binaries:
-- `target/release/server.exe` (or `server` on Unix)
-- `target/release/listener.exe`
-- `target/release/dialer.exe`
+This builds multiple binaries:
+- `target/release/server.exe` - Bootstrap node
+- `target/release/listener.exe` - Listener peer
+- `target/release/dialer.exe` - Dialer peer
+- `target/release/monitor.exe` - Network monitor with web dashboard
+- `target/release/torrent_server.exe` - Torrent file server
+- `target/release/torrent_client.exe` - Torrent file client
 
 ## Quick Start
 
@@ -227,6 +236,32 @@ For better reliability, you can specify multiple bootstrap nodes:
 # Multiple bootstrap support can be added by modifying the code
 ```
 
+## Documentation
+
+### Complete Documentation
+
+- **[Complete Guide](docs/COMPLETE_GUIDE.md)** - Comprehensive guide with JSON command protocol, weighted selection, and reputation system
+- **[Node Documentation](docs/NODE_DOCUMENTATION.md)** - Complete documentation for all nodes
+- **[Documentation Index](docs/README.md)** - Documentation overview
+- **[External IP Connection Guide](EXTERNAL_IP_CONNECTION.md)** - Complete guide for internet-wide peer connections
+
+### Node-Specific Documentation
+
+- **[Server](docs/SERVER.md)** - Bootstrap node documentation
+- **[Listener](docs/LISTENER.md)** - Task executor documentation
+- **[Dialer](docs/DIALER.md)** - Request router documentation
+- **[Monitor](docs/MONITOR.md)** - Network monitoring dashboard
+- **[Torrent Server](docs/TORRENT_SERVER.md)** - File server documentation
+- **[Torrent Client](docs/TORRENT_CLIENT.md)** - File client documentation
+
+### Key Features
+
+- **JSON Command Protocol**: All nodes communicate via standardized JSON commands
+- **Weighted Node Selection**: Requests routed to best nodes based on CPU, memory, disk, latency, and reputation
+- **Reputation System**: Nodes maintain reputation scores based on performance
+- **Unique Addressing**: Each node uniquely addressable by PeerId
+- **Capability Reporting**: Nodes automatically report system capabilities
+
 ## Integration
 
 See [INTEGRATION_EXAMPLE.md](INTEGRATION_EXAMPLE.md) for detailed integration examples using the `P2PClient` helper.
@@ -301,6 +336,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - Verify the bootstrap node is listening on the correct address
 - Check firewall rules allow incoming connections
 - Use `0.0.0.0` as listen address (not `127.0.0.1`) for remote access
+
+## File Sharing (Torrent)
+
+The project includes BitTorrent-like file sharing functionality:
+
+### Torrent Server
+
+Serves files from a directory to other peers:
+
+```bash
+# Create shared directory and add files
+mkdir shared
+echo "Hello, P2P World!" > shared/test.txt
+
+# Start torrent server
+cargo run --release --bin torrent_server \
+  --bootstrap /ip4/127.0.0.1/tcp/51820 \
+  --share-dir ./shared
+```
+
+### Torrent Client
+
+Downloads files from peers:
+
+```bash
+# List available files
+cargo run --release --bin torrent_client \
+  --bootstrap /ip4/127.0.0.1/tcp/51820 \
+  --download-dir ./downloads
+
+# Download specific file
+cargo run --release --bin torrent_client \
+  --bootstrap /ip4/127.0.0.1/tcp/51820 \
+  --download-dir ./downloads \
+  --info-hash <file-info-hash>
+```
+
+**Features:**
+- DHT-based file discovery (no central tracker)
+- Piece-based file transfer (64 KB pieces)
+- SHA256 verification for file integrity
+- Automatic peer discovery
+
+See [TORRENT_GUIDE.md](TORRENT_GUIDE.md) for detailed documentation.
+
+## Additional Features
+
+### Network Monitoring
+
+Real-time web dashboard for monitoring the P2P network:
+
+```bash
+cargo run --release --bin monitor \
+  --listen-addr 0.0.0.0 \
+  --port 51820 \
+  --web-port 8080
+```
+
+Access the dashboard at `http://localhost:8080`
+
+### NAT Traversal
+
+All nodes support the libp2p relay protocol for NAT traversal:
+- Automatic relay usage when direct connection fails
+- Monitor/server nodes act as relay servers
+- Transparent operation - no configuration needed
+
+See [RELAY_PROTOCOL_GUIDE.md](RELAY_PROTOCOL_GUIDE.md) for details.
+
+### External IP Connections
+
+Complete guide for connecting peers across the internet without a central rendezvous server:
+- How Kademlia enables decentralized peer discovery
+- Setting up bootstrap nodes with public IPs
+- NAT traversal and port forwarding
+- Troubleshooting external connections
+- Security and performance considerations
+- Production deployment checklist
+
+See [EXTERNAL_IP_CONNECTION.md](EXTERNAL_IP_CONNECTION.md) for comprehensive documentation.
 
 ## License
 
