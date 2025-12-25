@@ -11,6 +11,8 @@ pub struct JsonMessage {
     pub from: String,
     pub message: String,
     pub timestamp: u64,
+    #[serde(default)]
+    pub send_time_ms: Option<u64>, // For latency tracking
 }
 
 impl JsonMessage {
@@ -22,6 +24,12 @@ impl JsonMessage {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            send_time_ms: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            ),
         }
     }
 }

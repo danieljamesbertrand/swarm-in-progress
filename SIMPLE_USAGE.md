@@ -1,8 +1,8 @@
-# Simple Usage: P2P JSON Messaging Code Fragment
+# Simple Usage: P2P JSON Messaging with Kademlia
 
-This is a **standalone code fragment** you can copy into your program to enable P2P JSON messaging.
+Quick-start guide for using P2P JSON messaging with Kademlia DHT.
 
-## Quick Copy-Paste Solution
+## Quick Start
 
 ### Step 1: Add Dependencies
 
@@ -10,11 +10,12 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-libp2p = { version = "0.53", features = ["quic", "noise", "tcp", "dns", "macros", "rendezvous", "identify", "yamux", "tokio", "request-response"] }
+libp2p = { version = "0.53", features = ["quic", "noise", "tcp", "dns", "macros", "kad", "identify", "yamux", "tokio", "request-response"] }
 tokio = { version = "1.35", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-trait = "0.1"
+sha2 = "0.10"
 ```
 
 ### Step 2: Copy Message Types
@@ -98,19 +99,31 @@ impl Codec for JsonCodec {
 }
 ```
 
-### Step 3: Use the Simple Function
+### Step 3: Use the Client Helper
 
 ```rust
+use client_helper::P2PClient;
 use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Send a message and wait for response
-    let response = send_p2p_json_message(
-        "127.0.0.1:51820",  // Rendezvous server
-        "simple-chat",      // Namespace
-        "Hello from my application!"  // Your message
+    // Bootstrap to DHT network
+    let mut client = P2PClient::new(
+        &["/ip4/127.0.0.1/tcp/51820"],  // Bootstrap node
+        "my-namespace"                  // Namespace
     ).await?;
+    
+    // Discover and connect to a peer
+    let peer_id = client.connect_to_peer().await?;
+    
+    // Send a message
+    let response = client.send_and_wait(peer_id, json!({
+        "from": "my-app",
+        "message": "Hello from my application!",
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+    })).await?;
     
     println!("Received response: {}", serde_json::to_string_pretty(&response)?);
     
@@ -120,10 +133,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## What It Does
 
-1. **Connects** to the rendezvous server
-2. **Discovers** peers in the specified namespace
+1. **Bootstraps** to the Kademlia DHT network via bootstrap nodes
+2. **Discovers** peers in the specified namespace using DHT queries
 3. **Connects** to the first available peer
-4. **Sends** your JSON message
+4. **Sends** your JSON message over encrypted connection
 5. **Waits** for a response (10 second timeout)
 6. **Returns** the response as JSON
 
@@ -138,14 +151,23 @@ The response will be a JSON object:
 }
 ```
 
+## Key Differences from Rendezvous
+
+| Aspect | Old (Rendezvous) | New (Kademlia) |
+|--------|------------------|----------------|
+| **API** | `P2PClient::new(server, namespace)` | `P2PClient::new(bootstrap_nodes, namespace)` |
+| **Server** | Central rendezvous server required | Bootstrap nodes (decentralized) |
+| **Address Format** | `"127.0.0.1:51820"` | `"/ip4/127.0.0.1/tcp/51820"` (Multiaddr) |
+| **Discovery** | Server maintains peer list | DHT queries for peers |
+
 ## Notes
 
 - The function blocks until a peer is found and connected
 - Timeout is 10 seconds for receiving a response
-- The peer must be running and registered in the same namespace
-- Messages are sent over encrypted libp2p connections
+- The peer must be running and in the same namespace
+- Messages are sent over encrypted libp2p connections using Noise protocol
+- DHT discovery may take 10-30 seconds after bootstrap
 
 ## Full Example
 
-See `CODE_FRAGMENT.rs` for the complete implementation that you can copy into your project.
-
+See `INTEGRATION_EXAMPLE.md` for complete integration examples and API reference.

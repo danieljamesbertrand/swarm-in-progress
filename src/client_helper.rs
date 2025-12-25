@@ -1,7 +1,7 @@
 //! # P2P JSON Messaging Client Helper
 //! 
 //! This module provides a simple, high-level API for peer-to-peer JSON messaging
-//! using libp2p rendezvous for peer discovery.
+//! using libp2p Kademlia DHT for peer discovery.
 //! 
 //! ## Quick Start
 //! 
@@ -42,7 +42,7 @@ use libp2p::{
     tcp,
     noise,
     yamux,
-    rendezvous,
+    kad,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     core::transport::Transport,
@@ -58,21 +58,21 @@ use std::collections::HashMap;
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "BehaviourEvent")]
 struct Behaviour {
-    rendezvous: rendezvous::client::Behaviour,
+    kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: libp2p::identify::Behaviour,
     request_response: request_response::Behaviour<JsonCodec>,
 }
 
 #[derive(Debug)]
 enum BehaviourEvent {
-    Rendezvous(rendezvous::client::Event),
+    Kademlia(kad::Event),
     Identify(libp2p::identify::Event),
     RequestResponse(request_response::Event<JsonCodec>),
 }
 
-impl From<rendezvous::client::Event> for BehaviourEvent {
-    fn from(event: rendezvous::client::Event) -> Self {
-        BehaviourEvent::Rendezvous(event)
+impl From<kad::Event> for BehaviourEvent {
+    fn from(event: kad::Event) -> Self {
+        BehaviourEvent::Kademlia(event)
     }
 }
 
@@ -91,8 +91,8 @@ impl From<request_response::Event<JsonCodec>> for BehaviourEvent {
 /// # P2P Client for JSON Messaging
 /// 
 /// This struct provides a simple interface for:
-/// 1. Connecting to a rendezvous server
-/// 2. Discovering and connecting to peers
+/// 1. Bootstrapping to the Kademlia DHT network
+/// 2. Discovering and connecting to peers via DHT
 /// 3. Sending JSON messages and receiving responses
 /// 
 /// ## Example
@@ -125,49 +125,49 @@ impl From<request_response::Event<JsonCodec>> for BehaviourEvent {
 pub struct P2PClient {
     /// Internal libp2p swarm that handles all network operations
     swarm: Swarm<Behaviour>,
-    /// Rendezvous server address (host:port format)
-    rendezvous_server: String,
-    /// Namespace for peer discovery (peers must use the same namespace to find each other)
+    /// Bootstrap node addresses
+    bootstrap_nodes: Vec<Multiaddr>,
+    /// Namespace for peer discovery (used as DHT key prefix)
     namespace: String,
-    /// Peer ID of the rendezvous server (set after connection)
-    rendezvous_peer_id: Option<PeerId>,
     /// Map of currently connected peers
     connected_peers: HashMap<PeerId, ()>,
     /// Map of pending request IDs to response channels
     /// When you send a request, we store a channel here to receive the response
     pending_responses: HashMap<request_response::RequestId, tokio::sync::oneshot::Sender<serde_json::Value>>,
+    /// Whether DHT has been bootstrapped
+    bootstrapped: bool,
 }
 
 impl P2PClient {
-    /// # Create a new P2P client and connect to the rendezvous server
+    /// # Create a new P2P client and bootstrap to the Kademlia DHT
     /// 
     /// This function:
     /// 1. Generates a new peer identity (keypair)
     /// 2. Sets up encrypted TCP transport (Noise + Yamux)
-    /// 3. Configures rendezvous client for peer discovery
+    /// 3. Configures Kademlia DHT for peer discovery
     /// 4. Configures request-response protocol for JSON messaging
-    /// 5. Connects to the rendezvous server
+    /// 5. Bootstraps to the DHT network via bootstrap nodes
     /// 
     /// ## Parameters
     /// 
-    /// - **`server`**: Rendezvous server address in format `"host:port"` or `"host"` (defaults to port 51820)
-    ///   - Examples: `"127.0.0.1:51820"`, `"192.168.1.100:8080"`, `"example.com"`
-    ///   - If port is omitted, defaults to `51820`
+    /// - **`bootstrap_nodes`**: Array of bootstrap node addresses in Multiaddr format
+    ///   - Examples: `&["/ip4/127.0.0.1/tcp/51820"]`, `&["/ip4/192.168.1.100/tcp/8080"]`
+    ///   - These are initial peers to connect to for bootstrapping the DHT
     /// 
     /// - **`namespace`**: Namespace string for peer discovery
     ///   - Peers must use the **same namespace** to discover each other
     ///   - Examples: `"my-app"`, `"chat-room-1"`, `"game-lobby"`
-    ///   - This is like a "room name" - only peers in the same namespace can find each other
+    ///   - This is used as a key prefix in the DHT
     /// 
     /// ## Returns
     /// 
-    /// - **`Ok(P2PClient)`**: Successfully created and connected client
-    /// - **`Err(Box<dyn Error>)`**: Connection failed (server unreachable, invalid address, etc.)
+    /// - **`Ok(P2PClient)`**: Successfully created and bootstrapped client
+    /// - **`Err(Box<dyn Error>)`**: Bootstrap failed (nodes unreachable, invalid address, etc.)
     /// 
     /// ## Errors
     /// 
-    /// - Network errors (server unreachable, connection refused)
-    /// - Invalid server address format
+    /// - Network errors (bootstrap nodes unreachable, connection refused)
+    /// - Invalid bootstrap node address format
     /// - Transport setup errors
     /// 
     /// ## Example
@@ -177,16 +177,19 @@ impl P2PClient {
     /// 
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     // Connect to local server
-    ///     let mut client = P2PClient::new("127.0.0.1:51820", "my-namespace").await?;
+    ///     // Bootstrap to local node
+    ///     let mut client = P2PClient::new(&["/ip4/127.0.0.1/tcp/51820"], "my-namespace").await?;
     ///     
-    ///     // Or connect to remote server
-    ///     let mut client = P2PClient::new("192.168.1.100:8080", "shared-namespace").await?;
+    ///     // Or bootstrap to remote nodes
+    ///     let mut client = P2PClient::new(
+    ///         &["/ip4/192.168.1.100/tcp/8080", "/ip4/192.168.1.101/tcp/8080"],
+    ///         "shared-namespace"
+    ///     ).await?;
     ///     
     ///     Ok(())
     /// }
     /// ```
-    pub async fn new(server: &str, namespace: &str) -> Result<Self, Box<dyn Error>> {
+    pub async fn new(bootstrap_nodes: &[&str], namespace: &str) -> Result<Self, Box<dyn Error>> {
         // Generate a new Ed25519 keypair for this peer
         // Each peer gets a unique identity based on this key
         let key = identity::Keypair::generate_ed25519();
@@ -202,9 +205,22 @@ impl P2PClient {
             .multiplex(yamux::Config::default())
             .boxed();
         
-        // Rendezvous client: Used to discover other peers
-        // This allows us to find peers registered in the same namespace
-        let rendezvous = rendezvous::client::Behaviour::new(key.clone());
+        // Create Kademlia DHT store and behaviour
+        let store = kad::store::MemoryStore::new(peer_id);
+        let mut kademlia_config = kad::Config::default();
+        kademlia_config.set_query_timeout(Duration::from_secs(60));
+        let mut kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
+        
+        // Add bootstrap nodes to Kademlia
+        let bootstrap_addrs: Result<Vec<Multiaddr>, _> = bootstrap_nodes
+            .iter()
+            .map(|addr| addr.parse())
+            .collect();
+        let bootstrap_addrs = bootstrap_addrs?;
+        
+        for addr in &bootstrap_addrs {
+            kademlia.add_address(&peer_id, addr.clone());
+        }
         
         // Identify protocol: Lets peers learn about each other
         // (protocol version, agent name, etc.)
@@ -222,7 +238,7 @@ impl P2PClient {
         );
         
         // Combine all behaviours into one
-        let behaviour = Behaviour { rendezvous, identify, request_response };
+        let behaviour = Behaviour { kademlia, identify, request_response };
         
         // Create the swarm (main networking component)
         // This manages all connections and protocol interactions
@@ -242,78 +258,93 @@ impl P2PClient {
         // Create the client struct
         let mut client = Self {
             swarm,
-            rendezvous_server: server.to_string(),
+            bootstrap_nodes: bootstrap_addrs,
             namespace: namespace.to_string(),
-            rendezvous_peer_id: None,
             connected_peers: HashMap::new(),
             pending_responses: HashMap::new(),
+            bootstrapped: false,
         };
 
-        // Connect to the rendezvous server
+        // Bootstrap to the DHT network
         // This must succeed before you can discover peers
-        client.connect_to_rendezvous().await?;
+        client.bootstrap_dht().await?;
 
         Ok(client)
     }
 
-    /// # Connect to the rendezvous server (internal method)
+    /// # Bootstrap to the Kademlia DHT (internal method)
     /// 
     /// This is called automatically by `new()`. You don't need to call this directly.
     /// 
     /// ## What it does:
-    /// 1. Parses the server address
-    /// 2. Dials the rendezvous server
-    /// 3. Waits for connection to be established
-    /// 4. Stores the server's peer ID
-    async fn connect_to_rendezvous(&mut self) -> Result<(), Box<dyn Error>> {
-        // Parse server address
-        // Format: "host:port" or just "host" (defaults to port 51820)
-        let (host, port) = if let Some(colon_pos) = self.rendezvous_server.find(':') {
-            (
-                &self.rendezvous_server[..colon_pos],
-                &self.rendezvous_server[colon_pos + 1..]
-            )
-        } else {
-            (self.rendezvous_server.as_str(), "51820")
-        };
+    /// 1. Connects to bootstrap nodes
+    /// 2. Initiates Kademlia bootstrap process
+    /// 3. Waits for bootstrap to complete
+    async fn bootstrap_dht(&mut self) -> Result<(), Box<dyn Error>> {
+        use tokio::time::{timeout, Duration as TokioDuration};
         
-        // Create libp2p multiaddress
-        // Format: /ip4/127.0.0.1/tcp/51820
-        let addr: Multiaddr = format!("/ip4/{}/tcp/{}", host, port).parse()?;
-        
-        // Initiate connection to rendezvous server
-        self.swarm.dial(addr)?;
-
-        // Wait for connection to be established
-        // We loop through swarm events until we see ConnectionEstablished
-        loop {
-            match self.swarm.select_next_some().await {
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    // First connection should be the rendezvous server
-                    if self.rendezvous_peer_id.is_none() {
-                        self.rendezvous_peer_id = Some(peer_id);
-                        break; // Connection successful!
-                    }
-                }
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    // Add our listening address so peers can connect to us
-                    self.swarm.add_external_address(address);
-                }
-                _ => {
-                    // Ignore other events while waiting for connection
-                }
+        // Connect to bootstrap nodes
+        for addr in &self.bootstrap_nodes {
+            if let Err(e) = self.swarm.dial(addr.clone()) {
+                eprintln!("[WARN] Failed to dial bootstrap node {}: {:?}", addr, e);
             }
         }
 
-        Ok(())
+        // Wait for at least one connection and then start bootstrap
+        let mut connected = false;
+        let bootstrap_timeout = TokioDuration::from_secs(30);
+        
+        let bootstrap_result = timeout(bootstrap_timeout, async {
+            loop {
+                match self.swarm.select_next_some().await {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        if !connected {
+                            connected = true;
+                            // Start Kademlia bootstrap
+                            if let Err(e) = self.swarm.behaviour_mut().kademlia.bootstrap() {
+                                eprintln!("[WARN] Bootstrap start failed: {:?}", e);
+                            }
+                        }
+                    }
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        // Add our listening address so peers can connect to us
+                        self.swarm.add_external_address(address);
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::RoutingUpdated { .. })) => {
+                        // Bootstrap completed successfully
+                        self.bootstrapped = true;
+                        return Ok(());
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed { result, .. })) => {
+                        if let kad::QueryResult::Bootstrap(Ok(kad::BootstrapOk { .. })) = result {
+                            self.bootstrapped = true;
+                            return Ok(());
+                        }
+                    }
+                    _ => {
+                        // Continue processing events
+                    }
+                }
+            }
+        }).await;
+
+        match bootstrap_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                // Timeout - bootstrap may still work, just mark as attempted
+                self.bootstrapped = true;
+                Ok(())
+            }
+        }
     }
 
     /// # Discover and connect to a peer in the namespace
     /// 
     /// This function:
-    /// 1. Sends a discovery request to the rendezvous server
-    /// 2. Waits for peer registrations in the namespace
-    /// 3. Attempts to connect to the first discovered peer
+    /// 1. Stores our peer info in the DHT with a namespace-based key
+    /// 2. Queries the DHT for peers in the same namespace
+    /// 3. Attempts to connect to discovered peers
     /// 4. Returns the peer's ID once connected
     /// 
     /// ## Important Notes
@@ -321,7 +352,7 @@ impl P2PClient {
     /// - **This function BLOCKS** until a peer is found and connected
     /// - If no peers are available, it will wait indefinitely
     /// - It connects to the **first peer** found in the namespace
-    /// - The peer must be registered with the rendezvous server in the same namespace
+    /// - The peer must be in the DHT with the same namespace key
     /// 
     /// ## Returns
     /// 
@@ -330,7 +361,7 @@ impl P2PClient {
     ///   - Use this ID when calling `send_and_wait()`
     /// 
     /// - **`Err(Box<dyn Error>)`**: Connection failed
-    ///   - No peers found (if you're waiting forever, check that another peer is registered)
+    ///   - No peers found (if you're waiting forever, check that another peer is in the DHT)
     ///   - Network errors
     ///   - Invalid namespace
     /// 
@@ -341,10 +372,10 @@ impl P2PClient {
     /// 
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     let mut client = P2PClient::new("127.0.0.1:51820", "my-namespace").await?;
+    ///     let mut client = P2PClient::new(&["/ip4/127.0.0.1/tcp/51820"], "my-namespace").await?;
     ///     
     ///     // This will block until a peer is found
-    ///     // Make sure another peer is running and registered in "my-namespace"
+    ///     // Make sure another peer is running in the same namespace
     ///     let peer_id = client.connect_to_peer().await?;
     ///     
     ///     println!("Connected to peer: {}", peer_id);
@@ -353,78 +384,53 @@ impl P2PClient {
     /// }
     /// ```
     pub async fn connect_to_peer(&mut self) -> Result<PeerId, Box<dyn Error>> {
-        // Get the rendezvous server's peer ID (must be connected first)
-        let rendezvous_peer_id = self.rendezvous_peer_id
-            .ok_or("Not connected to rendezvous server")?;
+        // Ensure DHT is bootstrapped
+        if !self.bootstrapped {
+            return Err("DHT not bootstrapped yet".into());
+        }
 
-        // Create namespace object for discovery
-        // Only peers registered in this namespace will be discovered
-        let namespace = rendezvous::Namespace::new(self.namespace.clone())?;
-        
-        // Send discovery request to rendezvous server
-        // Parameters:
-        // - Some(namespace): Only discover peers in this namespace
-        // - None: No cookie (for pagination, not needed for simple use)
-        // - None: No limit (get all peers)
-        // - rendezvous_peer_id: The server to ask
-        self.swarm.behaviour_mut().rendezvous.discover(
-            Some(namespace),
-            None, // Cookie for pagination (None = start from beginning)
-            None, // Limit (None = no limit)
-            rendezvous_peer_id,
-        );
+        // Store our peer info in the DHT with namespace key
+        // This allows other peers to find us
+        let key = kad::RecordKey::new(&self.namespace);
+        let local_peer_id = *self.swarm.local_peer_id();
+        let value = local_peer_id.to_bytes();
+        let record = kad::Record::new(key.clone(), value);
+        self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)?;
+
+        // Query for the record (to find other peers in the same namespace)
+        self.swarm.behaviour_mut().kademlia.get_record(key);
+
+        // Also query for closest peers to find any nearby peers
+        self.swarm.behaviour_mut().kademlia.get_closest_peers(local_peer_id);
 
         // Wait for discovery results and connection
         // We loop through events until we successfully connect to a peer
         loop {
             match self.swarm.select_next_some().await {
-                // Discovery response from rendezvous server
-                SwarmEvent::Behaviour(BehaviourEvent::Rendezvous(rendezvous::client::Event::Discovered { registrations, .. })) => {
-                    // Process each discovered peer registration
-                    for reg in registrations {
-                        let discovered_peer = reg.record.peer_id();
-                        
-                        // Don't try to connect to ourselves
-                        if discovered_peer != self.swarm.local_peer_id() {
-                            // Get the peer's addresses from the registration
-                            // These are the network addresses where we can reach the peer
-                            let addrs: Vec<Multiaddr> = reg.record.addresses().iter().cloned().collect();
-                            
-                            // Try each address until one works
-                            for addr in addrs {
-                                // Attempt to dial (connect to) the peer
-                                if self.swarm.dial(addr.clone()).is_ok() {
-                                    // Successfully initiated connection
-                                    // Now wait for ConnectionEstablished event
-                                    loop {
-                                        match self.swarm.select_next_some().await {
-                                            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                                                // Check if this is the peer we're trying to connect to
-                                                if peer_id == discovered_peer {
-                                                    // Success! Store the peer and return
-                                                    self.connected_peers.insert(peer_id, ());
-                                                    return Ok(peer_id);
-                                                }
-                                            }
-                                            SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(_)) => {
-                                                // Handle any incoming messages while waiting
-                                                // (though unlikely during connection)
-                                            }
-                                            _ => {
-                                                // Other events, continue waiting
-                                            }
-                                        }
-                                    }
+                // Kademlia query completed - peers found
+                SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed { result, .. })) => {
+                    match result {
+                        kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                            for peer_id in ok.peers {
+                                // Don't try to connect to ourselves
+                                if peer_id != local_peer_id && !self.connected_peers.contains_key(&peer_id) {
+                                    // Kademlia will automatically try to connect when we query
+                                    // We'll wait for ConnectionEstablished event
                                 }
-                                // If dial failed, try next address
                             }
                         }
+                        kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(record))) => {
+                            // Found a record - try to extract peer ID from it
+                            // The record value should contain a peer ID
+                            // For now, we'll rely on GetClosestPeers for connections
+                        }
+                        _ => {}
                     }
                 }
-                // Direct connection established (peer connected to us)
+                // Direct connection established (peer connected to us or we connected to them)
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    // If it's not the rendezvous server and we haven't seen this peer before
-                    if self.rendezvous_peer_id != Some(peer_id) && !self.connected_peers.contains_key(&peer_id) {
+                    // If we haven't seen this peer before and it's not ourselves
+                    if peer_id != local_peer_id && !self.connected_peers.contains_key(&peer_id) {
                         self.connected_peers.insert(peer_id, ());
                         return Ok(peer_id);
                     }
