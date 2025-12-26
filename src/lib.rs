@@ -34,6 +34,7 @@ pub mod llama_inference;
 pub mod kademlia_shard_discovery;
 pub mod pipeline_coordinator;
 pub mod quic_transport;
+pub mod shard_optimization;
 
 pub use message::{JsonMessage, JsonCodec};
 pub use command_protocol::{Command, CommandResponse, NodeCapabilities, NodeWeights, ReputationData, ResponseStatus, commands};
@@ -54,6 +55,10 @@ pub use quic_transport::{
     create_quic_transport, create_tcp_transport, create_dual_transport,
     create_transport, TransportType, TransportError, TransportStats,
     get_listen_address, get_dual_listen_addresses,
+};
+pub use shard_optimization::{
+    QuantizationType, ShardOptimization, OptimizationPriority,
+    select_quantization,
 };
 
 
