@@ -62,3 +62,7 @@ path = "examples/simple_client.rs"
 [[example]]
 name = "shard_discovery_client"
 path = "examples/shard_discovery_client.rs"
+
+[[example]]
+name = "partial_pipeline_demo"
+path = "examples/partial_pipeline_demo.rs"

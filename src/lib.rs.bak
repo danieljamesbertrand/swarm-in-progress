@@ -15,6 +15,7 @@ pub mod llama_fragment_processor;
 pub mod llama_model_loader;
 pub mod llama_inference;
 pub mod kademlia_shard_discovery;
+pub mod pipeline_coordinator;
 
 pub use message::{JsonMessage, JsonCodec};
 pub use command_protocol::{Command, CommandResponse, NodeCapabilities, NodeWeights, ReputationData, ResponseStatus, commands};
@@ -25,6 +26,11 @@ pub use llama_model_loader::{LlamaModelManager, RsyncConfig, ModelShard, create_
 pub use kademlia_shard_discovery::{
     KademliaShardDiscovery, ShardAnnouncement, ShardCapabilities, 
     ClusterMetadata, PipelineStatus, dht_keys
+};
+pub use pipeline_coordinator::{
+    PipelineCoordinator, PipelineStrategy, PipelineError,
+    InferenceRequest, InferenceResponse, CoordinatorState, CoordinatorStats,
+    DynamicShardLoader, SingleNodeFallback,
 };
 
 
