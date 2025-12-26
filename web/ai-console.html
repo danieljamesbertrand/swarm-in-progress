@@ -1,0 +1,1145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neural Pulse - Distributed AI Console</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Outfit:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-deep: #0a0a0f;
+            --bg-surface: #12121a;
+            --bg-elevated: #1a1a24;
+            --bg-glass: rgba(26, 26, 36, 0.85);
+            --accent-cyan: #00f5d4;
+            --accent-magenta: #f72585;
+            --accent-violet: #7b2cbf;
+            --accent-gold: #ffd60a;
+            --text-primary: #f0f0f5;
+            --text-secondary: #8888aa;
+            --text-dim: #555566;
+            --green-glow: #00ff88;
+            --orange-glow: #ff9500;
+            --red-glow: #ff3b3b;
+            --black-off: #1a1a24;
+            --border-subtle: rgba(255,255,255,0.06);
+            --shadow-glow: 0 0 60px rgba(0, 245, 212, 0.15);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html, body {
+            height: 100%;
+            overflow-x: hidden;
+        }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: var(--bg-deep);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+
+        /* Animated background */
+        .bg-mesh {
+            position: fixed;
+            inset: 0;
+            z-index: -1;
+            background: 
+                radial-gradient(ellipse 80% 50% at 20% 40%, rgba(123, 44, 191, 0.12) 0%, transparent 50%),
+                radial-gradient(ellipse 60% 40% at 80% 60%, rgba(0, 245, 212, 0.08) 0%, transparent 50%),
+                radial-gradient(ellipse 50% 30% at 50% 80%, rgba(247, 37, 133, 0.06) 0%, transparent 50%),
+                var(--bg-deep);
+        }
+
+        .grid-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: -1;
+            background-image: 
+                linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+            background-size: 50px 50px;
+            mask-image: radial-gradient(ellipse 100% 100% at 50% 0%, black 0%, transparent 70%);
+        }
+
+        /* Main container */
+        .console-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 40px 24px;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Header */
+        .console-header {
+            text-align: center;
+            margin-bottom: 48px;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .logo-icon {
+            width: 56px;
+            height: 56px;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-violet));
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            box-shadow: 0 8px 32px rgba(0, 245, 212, 0.3);
+            animation: pulse-glow 3s ease-in-out infinite;
+        }
+
+        @keyframes pulse-glow {
+            0%, 100% { box-shadow: 0 8px 32px rgba(0, 245, 212, 0.3); }
+            50% { box-shadow: 0 8px 48px rgba(0, 245, 212, 0.5); }
+        }
+
+        .logo-text {
+            font-size: 32px;
+            font-weight: 800;
+            background: linear-gradient(135deg, var(--text-primary), var(--accent-cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.5px;
+        }
+
+        .tagline {
+            color: var(--text-secondary);
+            font-size: 15px;
+            font-weight: 400;
+        }
+
+        /* Centerpiece Card */
+        .ai-centerpiece {
+            background: var(--bg-glass);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-subtle);
+            border-radius: 24px;
+            padding: 0;
+            box-shadow: var(--shadow-glow);
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Input Section */
+        .input-section {
+            padding: 32px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .input-modes {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .mode-btn {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 20px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            color: var(--text-secondary);
+            font-family: 'Outfit', sans-serif;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .mode-btn:hover {
+            background: var(--bg-surface);
+            color: var(--text-primary);
+            border-color: var(--accent-cyan);
+        }
+
+        .mode-btn.active {
+            background: linear-gradient(135deg, rgba(0, 245, 212, 0.15), rgba(123, 44, 191, 0.15));
+            border-color: var(--accent-cyan);
+            color: var(--accent-cyan);
+        }
+
+        .mode-btn .icon {
+            font-size: 18px;
+        }
+
+        .query-input-wrapper {
+            position: relative;
+        }
+
+        .query-input {
+            width: 100%;
+            min-height: 120px;
+            padding: 20px 24px;
+            padding-right: 140px;
+            background: var(--bg-deep);
+            border: 2px solid var(--border-subtle);
+            border-radius: 16px;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 16px;
+            line-height: 1.6;
+            resize: vertical;
+            transition: all 0.3s ease;
+        }
+
+        .query-input::placeholder {
+            color: var(--text-dim);
+        }
+
+        .query-input:focus {
+            outline: none;
+            border-color: var(--accent-cyan);
+            box-shadow: 0 0 0 4px rgba(0, 245, 212, 0.1);
+        }
+
+        .submit-btn {
+            position: absolute;
+            bottom: 16px;
+            right: 16px;
+            padding: 14px 28px;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-violet));
+            border: none;
+            border-radius: 12px;
+            color: var(--bg-deep);
+            font-family: 'Outfit', sans-serif;
+            font-size: 15px;
+            font-weight: 700;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: all 0.3s ease;
+        }
+
+        .submit-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(0, 245, 212, 0.4);
+        }
+
+        .submit-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .submit-btn .spinner {
+            width: 18px;
+            height: 18px;
+            border: 2px solid transparent;
+            border-top-color: var(--bg-deep);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            display: none;
+        }
+
+        .submit-btn.loading .spinner {
+            display: block;
+        }
+
+        .submit-btn.loading .btn-text {
+            display: none;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Pipeline Tracker */
+        .pipeline-tracker {
+            padding: 32px;
+            background: linear-gradient(180deg, var(--bg-surface) 0%, var(--bg-elevated) 100%);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .tracker-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            margin-bottom: 24px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .tracker-title::before {
+            content: '';
+            display: block;
+            width: 4px;
+            height: 16px;
+            background: var(--accent-cyan);
+            border-radius: 2px;
+        }
+
+        .pipeline-stages {
+            display: flex;
+            align-items: center;
+            gap: 0;
+            position: relative;
+        }
+
+        .stage {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            position: relative;
+            z-index: 1;
+        }
+
+        .stage-light-container {
+            position: relative;
+            margin-bottom: 16px;
+        }
+
+        .stage-light {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            background: var(--black-off);
+            border: 3px solid var(--text-dim);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            transition: all 0.4s ease;
+            position: relative;
+        }
+
+        .stage-light.off {
+            background: var(--black-off);
+            border-color: var(--text-dim);
+            color: var(--text-dim);
+        }
+
+        .stage-light.waiting {
+            background: radial-gradient(circle at 30% 30%, var(--orange-glow), #cc7700);
+            border-color: var(--orange-glow);
+            color: var(--bg-deep);
+            box-shadow: 0 0 20px var(--orange-glow), 0 0 40px rgba(255, 149, 0, 0.3);
+            animation: pulse-orange 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse-orange {
+            0%, 100% { box-shadow: 0 0 20px var(--orange-glow), 0 0 40px rgba(255, 149, 0, 0.3); }
+            50% { box-shadow: 0 0 30px var(--orange-glow), 0 0 60px rgba(255, 149, 0, 0.5); }
+        }
+
+        .stage-light.active {
+            background: radial-gradient(circle at 30% 30%, var(--green-glow), #00cc6a);
+            border-color: var(--green-glow);
+            color: var(--bg-deep);
+            box-shadow: 0 0 20px var(--green-glow), 0 0 40px rgba(0, 255, 136, 0.3);
+            animation: pulse-green 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse-green {
+            0%, 100% { box-shadow: 0 0 20px var(--green-glow), 0 0 40px rgba(0, 255, 136, 0.3); }
+            50% { box-shadow: 0 0 30px var(--green-glow), 0 0 60px rgba(0, 255, 136, 0.5); }
+        }
+
+        .stage-light.error {
+            background: radial-gradient(circle at 30% 30%, var(--red-glow), #cc2222);
+            border-color: var(--red-glow);
+            color: white;
+            box-shadow: 0 0 20px var(--red-glow), 0 0 40px rgba(255, 59, 59, 0.3);
+            animation: pulse-red 0.8s ease-in-out infinite;
+        }
+
+        @keyframes pulse-red {
+            0%, 100% { box-shadow: 0 0 20px var(--red-glow), 0 0 40px rgba(255, 59, 59, 0.3); }
+            50% { box-shadow: 0 0 30px var(--red-glow), 0 0 60px rgba(255, 59, 59, 0.5); }
+        }
+
+        .stage-light.complete {
+            background: radial-gradient(circle at 30% 30%, var(--green-glow), #00cc6a);
+            border-color: var(--green-glow);
+            color: var(--bg-deep);
+            box-shadow: 0 0 15px var(--green-glow);
+            animation: none;
+        }
+
+        .stage-connector {
+            position: absolute;
+            top: 24px;
+            left: calc(50% + 24px);
+            width: calc(100% - 48px);
+            height: 4px;
+            background: var(--text-dim);
+            z-index: 0;
+            transition: all 0.4s ease;
+        }
+
+        .stage:last-child .stage-connector {
+            display: none;
+        }
+
+        .stage-connector.active {
+            background: linear-gradient(90deg, var(--green-glow), var(--accent-cyan));
+            box-shadow: 0 0 10px var(--green-glow);
+        }
+
+        .stage-label {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-align: center;
+            max-width: 100px;
+        }
+
+        .stage-sublabel {
+            font-size: 10px;
+            color: var(--text-dim);
+            margin-top: 4px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .stage.active .stage-label {
+            color: var(--accent-cyan);
+        }
+
+        /* Response Section */
+        .response-section {
+            flex: 1;
+            padding: 32px;
+            display: flex;
+            flex-direction: column;
+            min-height: 300px;
+        }
+
+        .response-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .response-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .response-title::before {
+            content: '';
+            display: block;
+            width: 4px;
+            height: 16px;
+            background: var(--accent-magenta);
+            border-radius: 2px;
+        }
+
+        .response-meta {
+            font-size: 12px;
+            color: var(--text-dim);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .response-content {
+            flex: 1;
+            background: var(--bg-deep);
+            border: 1px solid var(--border-subtle);
+            border-radius: 16px;
+            padding: 24px;
+            overflow-y: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            line-height: 1.8;
+            color: var(--text-primary);
+        }
+
+        .response-placeholder {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-dim);
+            text-align: center;
+        }
+
+        .response-placeholder .icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+
+        .response-placeholder p {
+            font-size: 14px;
+        }
+
+        .typing-cursor {
+            display: inline-block;
+            width: 10px;
+            height: 20px;
+            background: var(--accent-cyan);
+            margin-left: 4px;
+            animation: blink 1s step-end infinite;
+        }
+
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
+        }
+
+        /* Stats Bar */
+        .stats-bar {
+            display: flex;
+            gap: 24px;
+            padding: 20px 32px;
+            background: var(--bg-surface);
+            border-top: 1px solid var(--border-subtle);
+            flex-wrap: wrap;
+        }
+
+        .stat-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .stat-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--accent-cyan);
+        }
+
+        .stat-dot.orange { background: var(--orange-glow); }
+        .stat-dot.red { background: var(--red-glow); }
+        .stat-dot.green { background: var(--green-glow); }
+
+        .stat-label {
+            font-size: 12px;
+            color: var(--text-dim);
+        }
+
+        .stat-value {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* Accessibility panel */
+        .accessibility-panel {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            z-index: 100;
+        }
+
+        .a11y-btn {
+            width: 56px;
+            height: 56px;
+            border-radius: 50%;
+            background: var(--bg-glass);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--border-subtle);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            color: var(--text-secondary);
+        }
+
+        .a11y-btn:hover {
+            background: var(--bg-elevated);
+            border-color: var(--accent-cyan);
+            color: var(--accent-cyan);
+            transform: scale(1.1);
+        }
+
+        .a11y-btn.recording {
+            background: linear-gradient(135deg, rgba(247, 37, 133, 0.3), rgba(247, 37, 133, 0.1));
+            border-color: var(--accent-magenta);
+            color: var(--accent-magenta);
+            animation: pulse-recording 1s ease-in-out infinite;
+        }
+
+        @keyframes pulse-recording {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(247, 37, 133, 0.4); }
+            50% { box-shadow: 0 0 0 12px rgba(247, 37, 133, 0); }
+        }
+
+        /* Voice wave animation */
+        .voice-wave {
+            display: none;
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            margin-bottom: 12px;
+            background: var(--bg-glass);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            padding: 12px 20px;
+            white-space: nowrap;
+        }
+
+        .voice-wave.active {
+            display: flex;
+            gap: 4px;
+            align-items: center;
+        }
+
+        .wave-bar {
+            width: 4px;
+            height: 20px;
+            background: var(--accent-magenta);
+            border-radius: 2px;
+            animation: wave 0.5s ease-in-out infinite;
+        }
+
+        .wave-bar:nth-child(2) { animation-delay: 0.1s; }
+        .wave-bar:nth-child(3) { animation-delay: 0.2s; }
+        .wave-bar:nth-child(4) { animation-delay: 0.3s; }
+        .wave-bar:nth-child(5) { animation-delay: 0.4s; }
+
+        @keyframes wave {
+            0%, 100% { height: 8px; }
+            50% { height: 24px; }
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .console-container {
+                padding: 20px 16px;
+            }
+
+            .logo-text {
+                font-size: 24px;
+            }
+
+            .input-section, .pipeline-tracker, .response-section {
+                padding: 20px;
+            }
+
+            .mode-btn {
+                padding: 10px 14px;
+                font-size: 12px;
+            }
+
+            .stage-light {
+                width: 36px;
+                height: 36px;
+                font-size: 16px;
+            }
+
+            .stage-label {
+                font-size: 10px;
+            }
+
+            .stats-bar {
+                padding: 16px 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-mesh"></div>
+    <div class="grid-overlay"></div>
+
+    <div class="console-container">
+        <header class="console-header">
+            <div class="logo">
+                <div class="logo-icon">⚡</div>
+                <span class="logo-text">Neural Pulse</span>
+            </div>
+            <p class="tagline">Distributed AI Inference Console • Powered by Kademlia DHT</p>
+        </header>
+
+        <main class="ai-centerpiece">
+            <!-- Input Section -->
+            <section class="input-section">
+                <div class="input-modes">
+                    <button class="mode-btn active" data-mode="text" aria-label="Text input">
+                        <span class="icon">⌨️</span>
+                        <span>Text</span>
+                    </button>
+                    <button class="mode-btn" data-mode="voice" aria-label="Voice input">
+                        <span class="icon">🎤</span>
+                        <span>Voice</span>
+                    </button>
+                    <button class="mode-btn" data-mode="camera" aria-label="Camera input">
+                        <span class="icon">📷</span>
+                        <span>Vision</span>
+                    </button>
+                    <button class="mode-btn" data-mode="accessibility" aria-label="Accessibility tools">
+                        <span class="icon">♿</span>
+                        <span>Accessibility</span>
+                    </button>
+                </div>
+
+                <div class="query-input-wrapper">
+                    <textarea 
+                        class="query-input" 
+                        id="queryInput"
+                        placeholder="Ask anything... Your query will be distributed across the neural network for processing."
+                        aria-label="AI Query Input"
+                    ></textarea>
+                    <button class="submit-btn" id="submitBtn" aria-label="Submit query">
+                        <span class="btn-text">Send Query</span>
+                        <span class="spinner"></span>
+                    </button>
+                </div>
+            </section>
+
+            <!-- Pipeline Tracker -->
+            <section class="pipeline-tracker">
+                <h2 class="tracker-title">Pipeline Status</h2>
+                <div class="pipeline-stages" id="pipelineStages">
+                    <div class="stage" data-stage="input">
+                        <div class="stage-light-container">
+                            <div class="stage-light off">📝</div>
+                        </div>
+                        <span class="stage-label">Input</span>
+                        <span class="stage-sublabel">Tokenizing</span>
+                        <div class="stage-connector"></div>
+                    </div>
+                    <div class="stage" data-stage="discovery">
+                        <div class="stage-light-container">
+                            <div class="stage-light off">🔍</div>
+                        </div>
+                        <span class="stage-label">Discovery</span>
+                        <span class="stage-sublabel">DHT Lookup</span>
+                        <div class="stage-connector"></div>
+                    </div>
+                    <div class="stage" data-stage="shard0">
+                        <div class="stage-light-container">
+                            <div class="stage-light off">🧠</div>
+                        </div>
+                        <span class="stage-label">Shard 0</span>
+                        <span class="stage-sublabel">Layers 0-7</span>
+                        <div class="stage-connector"></div>
+                    </div>
+                    <div class="stage" data-stage="shard1">
+                        <div class="stage-light-container">
+                            <div class="stage-light off">🧠</div>
+                        </div>
+                        <span class="stage-label">Shard 1</span>
+                        <span class="stage-sublabel">Layers 8-15</span>
+                        <div class="stage-connector"></div>
+                    </div>
+                    <div class="stage" data-stage="shard2">
+                        <div class="stage-light-container">
+                            <div class="stage-light off">🧠</div>
+                        </div>
+                        <span class="stage-label">Shard 2</span>
+                        <span class="stage-sublabel">Layers 16-23</span>
+                        <div class="stage-connector"></div>
+                    </div>
+                    <div class="stage" data-stage="shard3">
+                        <div class="stage-light-container">
+                            <div class="stage-light off">🧠</div>
+                        </div>
+                        <span class="stage-label">Shard 3</span>
+                        <span class="stage-sublabel">Layers 24-31</span>
+                        <div class="stage-connector"></div>
+                    </div>
+                    <div class="stage" data-stage="output">
+                        <div class="stage-light-container">
+                            <div class="stage-light off">✨</div>
+                        </div>
+                        <span class="stage-label">Output</span>
+                        <span class="stage-sublabel">Decoding</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Response Section -->
+            <section class="response-section">
+                <div class="response-header">
+                    <h2 class="response-title">Response</h2>
+                    <div class="response-meta" id="responseMeta"></div>
+                </div>
+                <div class="response-content" id="responseContent">
+                    <div class="response-placeholder">
+                        <span class="icon">💭</span>
+                        <p>Your AI response will appear here...</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Stats Bar -->
+            <footer class="stats-bar">
+                <div class="stat-item">
+                    <span class="stat-dot green"></span>
+                    <span class="stat-label">Nodes Online:</span>
+                    <span class="stat-value" id="nodesOnline">4</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-dot orange"></span>
+                    <span class="stat-label">Avg Latency:</span>
+                    <span class="stat-value" id="avgLatency">--</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-dot"></span>
+                    <span class="stat-label">Tokens/sec:</span>
+                    <span class="stat-value" id="tokensPerSec">--</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-dot"></span>
+                    <span class="stat-label">Strategy:</span>
+                    <span class="stat-value" id="strategyUsed">Adaptive</span>
+                </div>
+            </footer>
+        </main>
+    </div>
+
+    <!-- Accessibility Panel -->
+    <div class="accessibility-panel">
+        <button class="a11y-btn" id="voiceBtn" aria-label="Voice input" title="Voice Input">
+            🎤
+            <div class="voice-wave" id="voiceWave">
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+            </div>
+        </button>
+        <button class="a11y-btn" id="cameraBtn" aria-label="Camera input" title="Camera/Vision">
+            📷
+        </button>
+        <button class="a11y-btn" id="speakBtn" aria-label="Read response aloud" title="Text-to-Speech">
+            🔊
+        </button>
+    </div>
+
+    <script>
+        // State
+        let isProcessing = false;
+        let isRecording = false;
+        let recognition = null;
+        let currentStage = -1;
+
+        // DOM Elements
+        const queryInput = document.getElementById('queryInput');
+        const submitBtn = document.getElementById('submitBtn');
+        const responseContent = document.getElementById('responseContent');
+        const responseMeta = document.getElementById('responseMeta');
+        const voiceBtn = document.getElementById('voiceBtn');
+        const voiceWave = document.getElementById('voiceWave');
+        const speakBtn = document.getElementById('speakBtn');
+        const modeBtns = document.querySelectorAll('.mode-btn');
+        const stages = document.querySelectorAll('.stage');
+
+        // Mode switching
+        modeBtns.forEach(btn => {
+            btn.addEventListener('click', () => {
+                modeBtns.forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                
+                const mode = btn.dataset.mode;
+                if (mode === 'voice') {
+                    startVoiceInput();
+                } else if (mode === 'camera') {
+                    startCameraInput();
+                }
+            });
+        });
+
+        // Submit query
+        submitBtn.addEventListener('click', () => {
+            const query = queryInput.value.trim();
+            if (query && !isProcessing) {
+                processQuery(query);
+            }
+        });
+
+        // Keyboard shortcut
+        queryInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && e.ctrlKey) {
+                e.preventDefault();
+                submitBtn.click();
+            }
+        });
+
+        // Pipeline stage animation
+        function setStageStatus(stageIndex, status) {
+            const stage = stages[stageIndex];
+            if (!stage) return;
+
+            const light = stage.querySelector('.stage-light');
+            const connector = stage.querySelector('.stage-connector');
+
+            // Remove all status classes
+            light.classList.remove('off', 'waiting', 'active', 'error', 'complete');
+            
+            // Add new status
+            light.classList.add(status);
+
+            // Update connector if complete
+            if (status === 'complete' && connector) {
+                connector.classList.add('active');
+            }
+
+            // Update stage class
+            if (status === 'active' || status === 'complete') {
+                stage.classList.add('active');
+            }
+        }
+
+        function resetPipeline() {
+            stages.forEach((stage, index) => {
+                const light = stage.querySelector('.stage-light');
+                const connector = stage.querySelector('.stage-connector');
+                
+                light.classList.remove('waiting', 'active', 'error', 'complete');
+                light.classList.add('off');
+                
+                if (connector) {
+                    connector.classList.remove('active');
+                }
+                
+                stage.classList.remove('active');
+            });
+            currentStage = -1;
+        }
+
+        // Simulate processing through pipeline
+        async function processQuery(query) {
+            isProcessing = true;
+            submitBtn.classList.add('loading');
+            submitBtn.disabled = true;
+            resetPipeline();
+
+            const stageNames = ['input', 'discovery', 'shard0', 'shard1', 'shard2', 'shard3', 'output'];
+            const stageTimes = [200, 400, 600, 500, 500, 500, 300];
+            
+            responseContent.innerHTML = '<div class="response-placeholder"><span class="icon">⏳</span><p>Processing your query...</p></div>';
+
+            const startTime = Date.now();
+            let totalLatency = 0;
+
+            try {
+                for (let i = 0; i < stages.length; i++) {
+                    currentStage = i;
+                    setStageStatus(i, 'waiting');
+                    
+                    await sleep(100);
+                    setStageStatus(i, 'active');
+                    
+                    // Simulate processing time
+                    const processingTime = stageTimes[i] + Math.random() * 200;
+                    await sleep(processingTime);
+                    totalLatency += processingTime;
+                    
+                    setStageStatus(i, 'complete');
+                }
+
+                // Generate response
+                const response = await generateResponse(query);
+                displayResponse(response, Date.now() - startTime);
+
+            } catch (error) {
+                setStageStatus(currentStage, 'error');
+                responseContent.innerHTML = `<div style="color: var(--red-glow);">❌ Error: ${error.message}</div>`;
+            }
+
+            isProcessing = false;
+            submitBtn.classList.remove('loading');
+            submitBtn.disabled = false;
+        }
+
+        // Generate simulated response (would be real API call in production)
+        async function generateResponse(query) {
+            // Simulate response
+            const responses = {
+                default: `Based on distributed processing across 4 neural network shards, here's my analysis:
+
+The query "${query}" has been processed through our Kademlia-distributed inference pipeline. Each shard contributed to understanding different aspects of your request.
+
+**Key Insights:**
+• Shard 0 (Embedding Layer): Tokenized and embedded your query into 768-dimensional vectors
+• Shard 1-2 (Hidden Layers): Processed contextual relationships and semantic meaning  
+• Shard 3 (Output Layer): Generated this response with temperature=0.7
+
+The distributed approach allows us to process larger models by splitting computation across multiple nodes in the network.
+
+Would you like me to elaborate on any specific aspect?`,
+            };
+
+            return responses.default;
+        }
+
+        // Display response with typing effect
+        function displayResponse(text, latencyMs) {
+            responseMeta.textContent = `Latency: ${latencyMs}ms • Tokens: ${text.split(' ').length * 1.3 | 0}`;
+            
+            document.getElementById('avgLatency').textContent = `${latencyMs}ms`;
+            document.getElementById('tokensPerSec').textContent = `${((text.split(' ').length * 1.3) / (latencyMs / 1000)).toFixed(1)}`;
+
+            // Typing effect
+            responseContent.innerHTML = '';
+            let i = 0;
+            const cursor = document.createElement('span');
+            cursor.className = 'typing-cursor';
+            
+            function type() {
+                if (i < text.length) {
+                    responseContent.innerHTML = formatMarkdown(text.substring(0, i + 1));
+                    responseContent.appendChild(cursor);
+                    i++;
+                    setTimeout(type, 5 + Math.random() * 10);
+                } else {
+                    cursor.remove();
+                }
+            }
+            
+            type();
+        }
+
+        // Simple markdown formatting
+        function formatMarkdown(text) {
+            return text
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                .replace(/•/g, '<span style="color: var(--accent-cyan);">•</span>')
+                .replace(/\n/g, '<br>');
+        }
+
+        // Voice input
+        voiceBtn.addEventListener('click', toggleVoiceInput);
+
+        function startVoiceInput() {
+            toggleVoiceInput();
+        }
+
+        function toggleVoiceInput() {
+            if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+                alert('Voice recognition is not supported in your browser. Try Chrome or Edge.');
+                return;
+            }
+
+            if (isRecording) {
+                stopRecording();
+            } else {
+                startRecording();
+            }
+        }
+
+        function startRecording() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            recognition = new SpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+
+            recognition.onresult = (event) => {
+                let transcript = '';
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    transcript += event.results[i][0].transcript;
+                }
+                queryInput.value = transcript;
+            };
+
+            recognition.onerror = (event) => {
+                console.error('Speech recognition error:', event.error);
+                stopRecording();
+            };
+
+            recognition.onend = () => {
+                stopRecording();
+            };
+
+            recognition.start();
+            isRecording = true;
+            voiceBtn.classList.add('recording');
+            voiceWave.classList.add('active');
+        }
+
+        function stopRecording() {
+            if (recognition) {
+                recognition.stop();
+            }
+            isRecording = false;
+            voiceBtn.classList.remove('recording');
+            voiceWave.classList.remove('active');
+        }
+
+        // Text-to-speech
+        speakBtn.addEventListener('click', () => {
+            const text = responseContent.textContent;
+            if (text && 'speechSynthesis' in window) {
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.rate = 1;
+                utterance.pitch = 1;
+                speechSynthesis.speak(utterance);
+            }
+        });
+
+        // Camera input placeholder
+        function startCameraInput() {
+            alert('Camera/Vision input will capture an image and analyze it using the distributed AI pipeline. Feature coming soon!');
+        }
+
+        document.getElementById('cameraBtn').addEventListener('click', startCameraInput);
+
+        // Utility
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        // WebSocket connection for real stats (if available)
+        function connectWebSocket() {
+            try {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+                
+                ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    if (data.metrics) {
+                        document.getElementById('nodesOnline').textContent = data.metrics.total_nodes || '4';
+                    }
+                };
+                
+                ws.onerror = () => {
+                    // Use simulated data
+                    document.getElementById('nodesOnline').textContent = '4';
+                };
+            } catch (e) {
+                // Ignore - use simulated data
+            }
+        }
+
+        // Initialize
+        connectWebSocket();
+    </script>
+</body>
+</html>
+
