@@ -12,17 +12,21 @@
 //! provides strategies to handle missing shards gracefully rather than failing.
 //!
 //! ## Usage
-//! ```rust
+//! ```rust,ignore
 //! use punch_simple::pipeline_coordinator::{PipelineCoordinator, InferenceRequest, PipelineStrategy};
 //!
+//! // Requires discovery and shard_manager setup
 //! let mut coordinator = PipelineCoordinator::new(discovery, shard_manager);
-//! coordinator.set_strategy(PipelineStrategy::WaitAndRetry { timeout_secs: 60 });
+//! coordinator.set_strategy(PipelineStrategy::WaitAndRetry { 
+//!     timeout_secs: 60, 
+//!     retry_interval_ms: 1000 
+//! });
 //!
 //! // Submit request - will queue if pipeline incomplete
-//! let handle = coordinator.submit_inference(request).await?;
+//! let handle = coordinator.submit_inference(request).await.unwrap();
 //!
 //! // Wait for result (may wait for shards to become available)
-//! let response = handle.await?;
+//! let response = handle.await.unwrap();
 //! ```
 
 use crate::kademlia_shard_discovery::{

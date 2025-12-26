@@ -12,7 +12,7 @@
 //! - NAT traversal support via libp2p relay
 //!
 //! ## Usage
-//! ```rust
+//! ```rust,ignore
 //! use punch_simple::kademlia_shard_discovery::{
 //!     KademliaShardDiscovery, ShardAnnouncement, dht_keys
 //! };
@@ -20,9 +20,9 @@
 //! // Create discovery instance
 //! let mut discovery = KademliaShardDiscovery::new("llama-8b-cluster");
 //!
-//! // Announce this node's shard
+//! // Announce this node's shard (requires swarm setup)
 //! let record = discovery.create_announcement(0, shard_info);
-//! swarm.behaviour_mut().kademlia.put_record(record, Quorum::One)?;
+//! swarm.behaviour_mut().kademlia.put_record(record, Quorum::One).unwrap();
 //!
 //! // Discover all shards
 //! let pipeline = discovery.get_pipeline();

@@ -11,14 +11,16 @@
 //! - **Connection migration** - survives IP address changes
 //!
 //! ## Usage
-//! ```rust
+//! ```rust,ignore
 //! use punch_simple::quic_transport::{create_quic_transport, create_dual_transport};
+//! use libp2p::identity::Keypair;
 //!
+//! let key = Keypair::generate_ed25519();
 //! // QUIC-only transport
-//! let transport = create_quic_transport(&key)?;
+//! let transport = create_quic_transport(&key).unwrap();
 //!
 //! // Or dual-stack (TCP fallback)
-//! let transport = create_dual_transport(&key)?;
+//! let transport = create_dual_transport(&key).unwrap();
 //! ```
 
 use libp2p::{
