@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Neural Pulse - Distributed AI Console</title>
+    <title>Promethos-AI Swarm - Distributed Intelligence Console</title>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Outfit:wght@300;400;600;700;800&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -11,10 +11,10 @@
             --bg-surface: #12121a;
             --bg-elevated: #1a1a24;
             --bg-glass: rgba(26, 26, 36, 0.85);
+            --accent-flame: #ff6b35;
+            --accent-gold: #ffd700;
+            --accent-ember: #dc2626;
             --accent-cyan: #00f5d4;
-            --accent-magenta: #f72585;
-            --accent-violet: #7b2cbf;
-            --accent-gold: #ffd60a;
             --text-primary: #f0f0f5;
             --text-secondary: #8888aa;
             --text-dim: #555566;
@@ -94,25 +94,25 @@
         .logo-icon {
             width: 56px;
             height: 56px;
-            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-violet));
+            background: linear-gradient(135deg, var(--accent-flame), var(--accent-gold));
             border-radius: 16px;
             display: flex;
             align-items: center;
             justify-content: center;
             font-size: 28px;
-            box-shadow: 0 8px 32px rgba(0, 245, 212, 0.3);
+            box-shadow: 0 8px 32px rgba(255, 107, 53, 0.4);
             animation: pulse-glow 3s ease-in-out infinite;
         }
 
         @keyframes pulse-glow {
-            0%, 100% { box-shadow: 0 8px 32px rgba(0, 245, 212, 0.3); }
-            50% { box-shadow: 0 8px 48px rgba(0, 245, 212, 0.5); }
+            0%, 100% { box-shadow: 0 8px 32px rgba(255, 107, 53, 0.4); }
+            50% { box-shadow: 0 8px 48px rgba(255, 215, 0, 0.6); }
         }
 
         .logo-text {
             font-size: 32px;
             font-weight: 800;
-            background: linear-gradient(135deg, var(--text-primary), var(--accent-cyan));
+            background: linear-gradient(135deg, var(--accent-gold), var(--accent-flame));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
@@ -219,7 +219,7 @@
             bottom: 16px;
             right: 16px;
             padding: 14px 28px;
-            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-violet));
+            background: linear-gradient(135deg, var(--accent-flame), var(--accent-gold));
             border: none;
             border-radius: 12px;
             color: var(--bg-deep);
@@ -235,7 +235,7 @@
 
         .submit-btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 8px 24px rgba(0, 245, 212, 0.4);
+            box-shadow: 0 8px 24px rgba(255, 107, 53, 0.5);
         }
 
         .submit-btn:disabled {
@@ -677,10 +677,10 @@
     <div class="console-container">
         <header class="console-header">
             <div class="logo">
-                <div class="logo-icon">⚡</div>
-                <span class="logo-text">Neural Pulse</span>
+                <div class="logo-icon">🔥</div>
+                <span class="logo-text">Promethos-AI Swarm</span>
             </div>
-            <p class="tagline">Distributed AI Inference Console • Powered by Kademlia DHT</p>
+            <p class="tagline">Bringing Fire to the Machines • Distributed Intelligence Network</p>
         </header>
 
         <main class="ai-centerpiece">
