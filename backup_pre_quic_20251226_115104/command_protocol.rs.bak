@@ -456,43 +456,13 @@ mod tests {
             disk_available_mb: 500000,
             latency_ms: 10.0,
             reputation: 0.9,
-            gpu_memory_mb: 0,
-            gpu_compute_units: 0,
-            gpu_usage: 0.0,
-            gpu_available: false,
         };
         
         let weights = NodeWeights::default();
         let score = capabilities.calculate_score(&weights);
         
         assert!(score > 0.0);
-        // With GPU weight at 0.25 but no GPU available, max score is ~0.75
         assert!(score <= 1.0);
-    }
-    
-    #[test]
-    fn test_node_capabilities_score_with_gpu() {
-        let capabilities = NodeCapabilities {
-            cpu_cores: 16,
-            cpu_usage: 25.0,
-            cpu_speed_ghz: 4.0,
-            memory_total_mb: 32768,
-            memory_available_mb: 24576,
-            disk_total_mb: 2000000,
-            disk_available_mb: 1500000,
-            latency_ms: 5.0,
-            reputation: 0.95,
-            gpu_memory_mb: 24576, // 24GB
-            gpu_compute_units: 16384, // RTX 4090
-            gpu_usage: 10.0,
-            gpu_available: true,
-        };
-        
-        let weights = NodeWeights::gpu_optimized();
-        let score = capabilities.calculate_score(&weights);
-        
-        assert!(score > 0.5, "GPU-equipped node should score well");
-        assert!(score <= 1.5);
     }
 
     #[test]
@@ -530,25 +500,9 @@ mod tests {
     #[test]
     fn test_node_weights_default() {
         let weights = NodeWeights::default();
-        let sum = weights.cpu + weights.memory + weights.disk + weights.latency + weights.reputation + weights.gpu;
+        let sum = weights.cpu + weights.memory + weights.disk + weights.latency + weights.reputation;
         // Weights should sum to approximately 1.0 (allowing for floating point)
-        assert!((sum - 1.0).abs() < 0.01, "Weights sum to {} instead of 1.0", sum);
-    }
-    
-    #[test]
-    fn test_node_weights_validate() {
-        let valid = NodeWeights::default();
-        assert!(valid.validate(), "Default weights should be valid");
-        
-        let invalid = NodeWeights {
-            cpu: 0.5,
-            memory: 0.5,
-            disk: 0.5,
-            latency: 0.5,
-            reputation: 0.5,
-            gpu: 0.5,
-        };
-        assert!(!invalid.validate(), "Weights summing to 3.0 should be invalid");
+        assert!((sum - 1.0).abs() < 0.01);
     }
 }
 

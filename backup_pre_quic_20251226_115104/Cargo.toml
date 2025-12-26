@@ -1,0 +1,68 @@
+[package]
+name = "punch-simple"
+version = "0.1.0"
+edition = "2021"
+authors = ["punch-simple"]
+description = "Simple libp2p rendezvous client and server"
+
+[dependencies]
+libp2p = { version = "0.53", features = ["quic", "noise", "tcp", "dns", "macros", "kad", "identify", "yamux", "tokio", "request-response", "ping", "relay"] }
+tokio = { version = "1.35", features = ["full"] }
+clap = { version = "4.4", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["ws", "json"] }
+futures-util = "0.3"
+rand = "0.8"
+num_cpus = "1.16"
+bytes = "1.5"
+tokio-stream = "0.1"
+# Candle dependencies - optional to avoid rand version conflicts
+candle-core = { version = "0.4", optional = true }
+candle-transformers = { version = "0.4", optional = true }
+candle-nn = { version = "0.4", optional = true }
+reqwest = { version = "0.12", features = ["stream"] }
+sha2 = "0.10"
+hex = "0.4"
+tokio-process = "0.2"
+uuid = { version = "1.10", features = ["v4"] }
+
+[features]
+default = []
+candle = ["candle-core", "candle-transformers", "candle-nn"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "listener"
+path = "src/listener.rs"
+
+[[bin]]
+name = "dialer"
+path = "src/dialer.rs"
+
+[[bin]]
+name = "server"
+path = "src/server.rs"
+
+[[bin]]
+name = "monitor"
+path = "src/monitor.rs"
+
+[[bin]]
+name = "shard_listener"
+path = "src/shard_listener.rs"
+
+[[example]]
+name = "simple_client"
+path = "examples/simple_client.rs"
+
+[[example]]
+name = "shard_discovery_client"
+path = "examples/shard_discovery_client.rs"
+
+[[example]]
+name = "partial_pipeline_demo"
+path = "examples/partial_pipeline_demo.rs"

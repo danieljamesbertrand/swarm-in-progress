@@ -145,6 +145,9 @@ fn test_shard_capabilities_score_calculation() {
         memory_total_mb: 32768,
         memory_available_mb: 24576,
         gpu_memory_mb: 0,
+        gpu_compute_units: 0,
+        gpu_usage: 0.0,
+        gpu_available: false,
         latency_ms: 10.0,
         reputation: 0.95,
         shard_loaded: true,
@@ -166,13 +169,16 @@ fn test_capabilities_score_comparison() {
     
     let weights = NodeWeights::default();
 
-    // High-capacity node
+    // High-capacity node (with GPU)
     let high_caps = ShardCapabilities {
         cpu_cores: 32,
         cpu_usage: 10.0,
         memory_total_mb: 65536,
         memory_available_mb: 50000,
         gpu_memory_mb: 24000,
+        gpu_compute_units: 10000,
+        gpu_usage: 20.0,
+        gpu_available: true,
         latency_ms: 5.0,
         reputation: 1.0,
         shard_loaded: true,
@@ -180,13 +186,16 @@ fn test_capabilities_score_comparison() {
         max_concurrent: 8,
     };
 
-    // Low-capacity node
+    // Low-capacity node (no GPU)
     let low_caps = ShardCapabilities {
         cpu_cores: 4,
         cpu_usage: 90.0,
         memory_total_mb: 8192,
         memory_available_mb: 1000,
         gpu_memory_mb: 0,
+        gpu_compute_units: 0,
+        gpu_usage: 0.0,
+        gpu_available: false,
         latency_ms: 100.0,
         reputation: 0.5,
         shard_loaded: false,

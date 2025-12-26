@@ -1,53 +1,46 @@
-//! Simple example showing how to use the P2P client helper with Kademlia DHT
+//! Simple example showing QUIC transport configuration
 //! 
-//! This example demonstrates:
-//! 1. Bootstrapping to the Kademlia DHT network
-//! 2. Discovering and connecting to a peer
-//! 3. Sending a JSON message and waiting for a response
+//! This example demonstrates how to configure and use QUIC transport
+//! for P2P communication in the Promethos-AI Swarm.
 
-mod client_helper;
-use client_helper::P2PClient;
-use serde_json::json;
+use punch_simple::quic_transport::{
+    TransportType, 
+    get_listen_address, 
+    get_dual_listen_addresses,
+};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Simple P2P Client Example ===\n");
+fn main() {
+    println!("=== Promethos-AI Swarm - Transport Configuration Example ===\n");
 
-    // Step 1: Bootstrap to DHT network
-    // Replace with your actual bootstrap node address
-    let bootstrap_nodes = &["/ip4/127.0.0.1/tcp/51820"];
-    let namespace = "simple-chat";
+    // QUIC addresses
+    println!("QUIC Transport:");
+    let quic_addr = get_listen_address(TransportType::QuicOnly, 51820);
+    println!("  Listen address: {}", quic_addr);
     
-    println!("[1] Bootstrapping to DHT network...");
-    println!("    Bootstrap: {:?}", bootstrap_nodes);
-    println!("    Namespace: {}", namespace);
+    // TCP addresses  
+    println!("\nTCP Transport:");
+    let tcp_addr = get_listen_address(TransportType::TcpOnly, 51820);
+    println!("  Listen address: {}", tcp_addr);
     
-    let mut client = P2PClient::new(bootstrap_nodes, namespace).await?;
-    println!("    ✓ Bootstrapped! My Peer ID: {}\n", client.local_peer_id());
-
-    // Step 2: Discover and connect to a peer
-    println!("[2] Discovering peers in namespace: {}", namespace);
-    println!("    (This will block until a peer is found...)");
-    let peer_id = client.connect_to_peer().await?;
-    println!("    ✓ Connected to peer: {}\n", peer_id);
-
-    // Step 3: Send a JSON message and wait for response
-    println!("[3] Sending JSON message...");
-    let request = json!({
-        "from": "my-client",
-        "message": "Hello, peer! This is a test message from the example client.",
-        "timestamp": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    });
+    // Dual-stack addresses
+    println!("\nDual-Stack Transport (QUIC preferred, TCP fallback):");
+    let (quic, tcp) = get_dual_listen_addresses(51820);
+    println!("  QUIC address: {}", quic);
+    println!("  TCP address:  {}", tcp);
     
-    println!("    Request: {}", serde_json::to_string_pretty(&request)?);
+    // Parsing transport type from string
+    println!("\nParsing transport types:");
+    let types = ["quic", "tcp", "dual", "QUIC-only", "TCP-only", "both"];
+    for t in types {
+        match t.parse::<TransportType>() {
+            Ok(tt) => println!("  '{}' -> {:?}", t, tt),
+            Err(e) => println!("  '{}' -> Error: {}", t, e),
+        }
+    }
     
-    let response = client.send_and_wait(peer_id, request).await?;
-    println!("    ✓ Received response!");
-    println!("    Response: {}", serde_json::to_string_pretty(&response)?);
-
-    println!("\n=== Example Complete ===");
-    Ok(())
+    println!("\n=== Configuration Complete ===");
+    println!("\nTo run a node with QUIC transport:");
+    println!("  listener --transport quic --port 51820");
+    println!("\nTo run a node with dual-stack transport:");
+    println!("  listener --transport dual --port 51820");
 }
