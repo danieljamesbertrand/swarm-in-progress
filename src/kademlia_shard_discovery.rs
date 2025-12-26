@@ -29,6 +29,7 @@
 //! ```
 
 use crate::command_protocol::NodeWeights;
+use crate::shard_optimization::{QuantizationType, OptimizationPriority};
 use libp2p::kad;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -64,6 +65,10 @@ pub struct ShardAnnouncement {
     pub timestamp: u64,
     /// Version of this announcement format
     pub version: u32,
+    /// Quantization type used for this shard (affects size/speed/quality)
+    pub quantization: QuantizationType,
+    /// Model parameter count in billions (for memory estimation)
+    pub model_params_billions: f32,
 }
 
 /// Capabilities specific to shard processing
@@ -232,8 +237,17 @@ impl ShardAnnouncement {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            version: 1,
+            version: 2, // Updated version for quantization support
+            quantization: QuantizationType::default(), // Default to FP16
+            model_params_billions: 7.0, // Default assumption (Llama 7B)
         }
+    }
+    
+    /// Create with specific quantization settings
+    pub fn with_quantization(mut self, quantization: QuantizationType, params_billions: f32) -> Self {
+        self.quantization = quantization;
+        self.model_params_billions = params_billions;
+        self
     }
 
     /// Create from environment variables
@@ -248,6 +262,21 @@ impl ShardAnnouncement {
             .and_then(|s| s.parse().ok())
             .unwrap_or(32);
         let model_name = std::env::var("LLAMA_MODEL_NAME").unwrap_or_else(|_| "llama-8b".to_string());
+        
+        // Parse quantization from environment or model filename
+        let quantization = std::env::var("LLAMA_QUANTIZATION")
+            .ok()
+            .and_then(|s| {
+                // Try to parse from filename format
+                QuantizationType::from_filename(&s)
+            })
+            .unwrap_or_default();
+        
+        // Parse model params (in billions)
+        let model_params = std::env::var("LLAMA_MODEL_PARAMS_B")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7.0);
 
         Some(Self::new(
             peer_id,
@@ -256,7 +285,7 @@ impl ShardAnnouncement {
             total_layers,
             multiaddr,
             &model_name,
-        ))
+        ).with_quantization(quantization, model_params))
     }
 
     /// Check if this announcement is still fresh (less than TTL seconds old)
@@ -473,16 +502,72 @@ impl KademliaShardDiscovery {
 
     /// Get the best node for a specific shard based on capabilities
     pub fn get_best_node_for_shard(&self, shard_id: u32) -> Option<&ShardAnnouncement> {
+        self.get_best_node_for_shard_with_priority(shard_id, OptimizationPriority::Balanced)
+    }
+    
+    /// Get the best node for a specific shard based on optimization priority
+    /// 
+    /// # Arguments
+    /// * `shard_id` - The shard to find
+    /// * `priority` - Optimization priority (Speed, Quality, Balanced, Memory)
+    /// 
+    /// # Returns
+    /// The best node announcement based on the priority, or None if no nodes available
+    pub fn get_best_node_for_shard_with_priority(
+        &self,
+        shard_id: u32,
+        priority: OptimizationPriority,
+    ) -> Option<&ShardAnnouncement> {
         self.known_shards.get(&shard_id).and_then(|replicas| {
             replicas
                 .iter()
                 .filter(|r| r.is_fresh(self.ttl_seconds))
                 .max_by(|a, b| {
-                    let score_a = a.capabilities.calculate_score(&self.weights);
-                    let score_b = b.capabilities.calculate_score(&self.weights);
+                    let score_a = self.calculate_priority_score(a, priority);
+                    let score_b = self.calculate_priority_score(b, priority);
                     score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
                 })
         })
+    }
+    
+    /// Calculate a composite score for a shard announcement based on priority
+    fn calculate_priority_score(&self, announcement: &ShardAnnouncement, priority: OptimizationPriority) -> f64 {
+        let base_score = announcement.capabilities.calculate_score(&self.weights);
+        let quant = &announcement.quantization;
+        
+        match priority {
+            OptimizationPriority::Speed => {
+                // Prioritize speed factor: faster quantization = higher score
+                let speed_bonus = quant.speed_factor() as f64 / 10.0; // Normalize to ~0-1.5
+                base_score * 0.5 + speed_bonus * 0.5
+            }
+            OptimizationPriority::Quality => {
+                // Prioritize quality factor: higher quality quantization = higher score
+                let quality_bonus = quant.quality_factor() as f64;
+                base_score * 0.5 + quality_bonus * 0.5
+            }
+            OptimizationPriority::Balanced => {
+                // Balance between base capabilities, speed, and quality
+                let speed_factor = quant.speed_factor() as f64 / 10.0;
+                let quality_factor = quant.quality_factor() as f64;
+                base_score * 0.4 + speed_factor * 0.3 + quality_factor * 0.3
+            }
+            OptimizationPriority::Memory => {
+                // Prioritize low memory usage
+                let memory_factor = 1.0 - quant.size_factor() as f64; // Lower size = higher score
+                let available_memory = announcement.capabilities.memory_available_mb as f64
+                    / announcement.capabilities.memory_total_mb.max(1) as f64;
+                base_score * 0.3 + memory_factor * 0.4 + available_memory * 0.3
+            }
+        }
+    }
+    
+    /// Get the complete pipeline optimized for a specific priority
+    pub fn get_pipeline_with_priority(&self, priority: OptimizationPriority) -> Vec<&ShardAnnouncement> {
+        self.pipeline_order
+            .iter()
+            .filter_map(|id| self.get_best_node_for_shard_with_priority(*id, priority))
+            .collect()
     }
 
     /// Get entry node (shard 0 with embeddings)

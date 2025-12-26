@@ -16,6 +16,7 @@
 mod message;
 mod metrics;
 mod command_protocol;
+mod shard_optimization;
 mod kademlia_shard_discovery;
 
 use message::{JsonMessage, JsonCodec};
