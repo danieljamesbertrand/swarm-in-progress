@@ -4,7 +4,7 @@
 mod message;
 mod metrics;
 use message::{JsonMessage, JsonCodec};
-use metrics::{MetricsCodec, PeerMetrics, MetricsRequest, MetricsResponse};
+use metrics::{MetricsCodec, PeerMetrics, MetricsResponse};
 
 use clap::Parser;
 use serde_json;
@@ -148,7 +148,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }));
     
     // Track monitor peer ID (bootstrap node)
-    let monitor_peer_id = peer_id; // Will be updated when we connect to bootstrap
+    let _monitor_peer_id = peer_id; // Will be updated when we connect to bootstrap
     
     // Create a channel for random message sending
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<()>();

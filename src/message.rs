@@ -85,5 +85,48 @@ impl Codec for JsonCodec {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_json_message_new() {
+        let msg = JsonMessage::new("sender".to_string(), "Hello".to_string());
+        assert_eq!(msg.from, "sender");
+        assert_eq!(msg.message, "Hello");
+        assert!(msg.timestamp > 0);
+        assert!(msg.send_time_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_json_codec_serialization() {
+        let mut codec = JsonCodec;
+        let protocol = StreamProtocol::new("/test/1.0");
+        
+        let message = JsonMessage::new("test".to_string(), "message".to_string());
+        
+        // Test serialization
+        let mut buffer = Vec::new();
+        codec.write_request(&protocol, &mut buffer, message.clone()).await.unwrap();
+        
+        // Test deserialization using &[u8] which implements AsyncRead
+        let mut reader: &[u8] = &buffer;
+        let deserialized = codec.read_request(&protocol, &mut reader).await.unwrap();
+        
+        assert_eq!(message.from, deserialized.from);
+        assert_eq!(message.message, deserialized.message);
+    }
+
+    #[test]
+    fn test_json_message_timestamp() {
+        let msg1 = JsonMessage::new("sender".to_string(), "msg1".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let msg2 = JsonMessage::new("sender".to_string(), "msg2".to_string());
+        
+        // Timestamps should be different (or very close)
+        assert!(msg2.timestamp >= msg1.timestamp);
+    }
+}
+
 
 

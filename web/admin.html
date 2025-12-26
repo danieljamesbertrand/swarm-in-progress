@@ -1,0 +1,1130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Panel - Network Monitor</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+        
+        header {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+        
+        .header-actions {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: #5568d3;
+        }
+        
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+        
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+        
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+        
+        .btn-danger:hover {
+            background: #c82333;
+        }
+        
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+        
+        .btn-success:hover {
+            background: #218838;
+        }
+        
+        .main-layout {
+            display: grid;
+            grid-template-columns: 250px 1fr;
+            gap: 20px;
+        }
+        
+        .sidebar {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            height: fit-content;
+            position: sticky;
+            top: 20px;
+        }
+        
+        .sidebar h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            font-size: 18px;
+        }
+        
+        .nav-item {
+            padding: 12px 15px;
+            margin-bottom: 5px;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .nav-item:hover {
+            background: #f0f0f0;
+        }
+        
+        .nav-item.active {
+            background: #667eea;
+            color: white;
+        }
+        
+        .nav-item .shortcut {
+            margin-left: auto;
+            font-size: 11px;
+            opacity: 0.7;
+            background: rgba(0,0,0,0.1);
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+        
+        .content-area {
+            background: white;
+            border-radius: 10px;
+            padding: 30px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            min-height: 600px;
+        }
+        
+        .content-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid #eee;
+        }
+        
+        .content-header h2 {
+            color: #667eea;
+            font-size: 24px;
+        }
+        
+        .table-container {
+            overflow-x: auto;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+        
+        th {
+            background: #f8f9fa;
+            font-weight: bold;
+            color: #667eea;
+            position: sticky;
+            top: 0;
+        }
+        
+        tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        
+        .badge-success {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .badge-danger {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .badge-primary {
+            background: #cfe2ff;
+            color: #084298;
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 5px;
+        }
+        
+        .btn-sm {
+            padding: 5px 10px;
+            font-size: 12px;
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            overflow: auto;
+        }
+        
+        .modal-content {
+            background: white;
+            margin: 5% auto;
+            padding: 30px;
+            border-radius: 10px;
+            width: 90%;
+            max-width: 600px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
+        
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #eee;
+        }
+        
+        .modal-header h3 {
+            color: #667eea;
+        }
+        
+        .close {
+            color: #aaa;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        
+        .close:hover {
+            color: #000;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .form-group input,
+        .form-group textarea,
+        .form-group select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        
+        .form-group textarea {
+            resize: vertical;
+            min-height: 80px;
+        }
+        
+        .form-group .checkbox-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .checkbox-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .context-menu {
+            display: none;
+            position: fixed;
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            z-index: 2000;
+            min-width: 200px;
+        }
+        
+        .context-menu-item {
+            padding: 10px 15px;
+            cursor: pointer;
+            border-bottom: 1px solid #eee;
+        }
+        
+        .context-menu-item:last-child {
+            border-bottom: none;
+        }
+        
+        .context-menu-item:hover {
+            background: #f0f0f0;
+        }
+        
+        .context-menu-item .shortcut {
+            float: right;
+            color: #999;
+            font-size: 11px;
+        }
+        
+        .search-box {
+            margin-bottom: 20px;
+        }
+        
+        .search-box input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #999;
+        }
+        
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 20px;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+        }
+        
+        .stat-card h3 {
+            font-size: 32px;
+            margin-bottom: 5px;
+        }
+        
+        .stat-card p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+        
+        .help-text {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>⚙️ Admin Panel</h1>
+                <p style="color: #666; font-size: 14px;">Network Monitor Administration</p>
+            </div>
+            <div class="header-actions">
+                <button class="btn btn-secondary" onclick="window.location.href='/'">← Back to Dashboard</button>
+            </div>
+        </header>
+        
+        <div class="main-layout">
+            <div class="sidebar">
+                <h2>Navigation</h2>
+                <div class="nav-item active" data-section="users" onclick="showSection('users')">
+                    <span>👥</span>
+                    <span>Users</span>
+                    <span class="shortcut">U</span>
+                </div>
+                <div class="nav-item" data-section="roles" onclick="showSection('roles')">
+                    <span>🔐</span>
+                    <span>Roles</span>
+                    <span class="shortcut">R</span>
+                </div>
+                <div class="nav-item" data-section="regions" onclick="showSection('regions')">
+                    <span>🌍</span>
+                    <span>Regions</span>
+                    <span class="shortcut">G</span>
+                </div>
+            </div>
+            
+            <div class="content-area">
+                <!-- Users Section -->
+                <div id="users-section" class="content-section">
+                    <div class="content-header">
+                        <h2>👥 User Management</h2>
+                        <button class="btn btn-primary" onclick="openUserModal()">+ Add User</button>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <h3 id="users-count">0</h3>
+                            <p>Total Users</p>
+                        </div>
+                        <div class="stat-card">
+                            <h3 id="active-users-count">0</h3>
+                            <p>Active Users</p>
+                        </div>
+                    </div>
+                    <div class="search-box">
+                        <input type="text" id="users-search" placeholder="Search users..." onkeyup="filterUsers()">
+                    </div>
+                    <div class="table-container">
+                        <table id="users-table">
+                            <thead>
+                                <tr>
+                                    <th>Username</th>
+                                    <th>Email</th>
+                                    <th>Roles</th>
+                                    <th>Regions</th>
+                                    <th>Status</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="users-tbody">
+                                <tr><td colspan="6" class="empty-state">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                
+                <!-- Roles Section -->
+                <div id="roles-section" class="content-section" style="display: none;">
+                    <div class="content-header">
+                        <h2>🔐 Role Management</h2>
+                        <button class="btn btn-primary" onclick="openRoleModal()">+ Add Role</button>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <h3 id="roles-count">0</h3>
+                            <p>Total Roles</p>
+                        </div>
+                    </div>
+                    <div class="search-box">
+                        <input type="text" id="roles-search" placeholder="Search roles..." onkeyup="filterRoles()">
+                    </div>
+                    <div class="table-container">
+                        <table id="roles-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Description</th>
+                                    <th>Permissions</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="roles-tbody">
+                                <tr><td colspan="4" class="empty-state">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                
+                <!-- Regions Section -->
+                <div id="regions-section" class="content-section" style="display: none;">
+                    <div class="content-header">
+                        <h2>🌍 Region Management</h2>
+                        <button class="btn btn-primary" onclick="openRegionModal()">+ Add Region</button>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <h3 id="regions-count">0</h3>
+                            <p>Total Regions</p>
+                        </div>
+                        <div class="stat-card">
+                            <h3 id="active-regions-count">0</h3>
+                            <p>Active Regions</p>
+                        </div>
+                    </div>
+                    <div class="search-box">
+                        <input type="text" id="regions-search" placeholder="Search regions..." onkeyup="filterRegions()">
+                    </div>
+                    <div class="table-container">
+                        <table id="regions-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Code</th>
+                                    <th>Description</th>
+                                    <th>Status</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="regions-tbody">
+                                <tr><td colspan="5" class="empty-state">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- User Modal -->
+    <div id="user-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="user-modal-title">Add User</h3>
+                <span class="close" onclick="closeUserModal()">&times;</span>
+            </div>
+            <form id="user-form" onsubmit="saveUser(event)">
+                <div class="form-group">
+                    <label>Username *</label>
+                    <input type="text" id="user-username" required>
+                </div>
+                <div class="form-group">
+                    <label>Email *</label>
+                    <input type="email" id="user-email" required>
+                </div>
+                <div class="form-group">
+                    <label>Roles</label>
+                    <div class="checkbox-group" id="user-roles-checkboxes"></div>
+                </div>
+                <div class="form-group">
+                    <label>Regions</label>
+                    <div class="checkbox-group" id="user-regions-checkboxes"></div>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="user-active"> Active
+                    </label>
+                </div>
+                <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
+                    <button type="button" class="btn btn-secondary" onclick="closeUserModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- Role Modal -->
+    <div id="role-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="role-modal-title">Add Role</h3>
+                <span class="close" onclick="closeRoleModal()">&times;</span>
+            </div>
+            <form id="role-form" onsubmit="saveRole(event)">
+                <div class="form-group">
+                    <label>Name *</label>
+                    <input type="text" id="role-name" required>
+                </div>
+                <div class="form-group">
+                    <label>Description *</label>
+                    <textarea id="role-description" required></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Permissions</label>
+                    <div class="checkbox-group">
+                        <div class="checkbox-item">
+                            <input type="checkbox" id="perm-read" value="read">
+                            <label for="perm-read">Read</label>
+                        </div>
+                        <div class="checkbox-item">
+                            <input type="checkbox" id="perm-write" value="write">
+                            <label for="perm-write">Write</label>
+                        </div>
+                        <div class="checkbox-item">
+                            <input type="checkbox" id="perm-admin" value="admin">
+                            <label for="perm-admin">Admin</label>
+                        </div>
+                        <div class="checkbox-item">
+                            <input type="checkbox" id="perm-delete" value="delete">
+                            <label for="perm-delete">Delete</label>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
+                    <button type="button" class="btn btn-secondary" onclick="closeRoleModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- Region Modal -->
+    <div id="region-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="region-modal-title">Add Region</h3>
+                <span class="close" onclick="closeRegionModal()">&times;</span>
+            </div>
+            <form id="region-form" onsubmit="saveRegion(event)">
+                <div class="form-group">
+                    <label>Name *</label>
+                    <input type="text" id="region-name" required>
+                </div>
+                <div class="form-group">
+                    <label>Code *</label>
+                    <input type="text" id="region-code" required placeholder="e.g., us-east">
+                    <div class="help-text">Unique identifier for the region</div>
+                </div>
+                <div class="form-group">
+                    <label>Description *</label>
+                    <textarea id="region-description" required></textarea>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="region-active" checked> Active
+                    </label>
+                </div>
+                <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
+                    <button type="button" class="btn btn-secondary" onclick="closeRegionModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <script>
+        let users = [];
+        let roles = [];
+        let regions = [];
+        let currentEditingId = null;
+        
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.ctrlKey || e.metaKey) {
+                switch(e.key) {
+                    case 'u':
+                        e.preventDefault();
+                        showSection('users');
+                        break;
+                    case 'r':
+                        e.preventDefault();
+                        showSection('roles');
+                        break;
+                    case 'g':
+                        e.preventDefault();
+                        showSection('regions');
+                        break;
+                }
+            }
+            if (e.key === 'Escape') {
+                closeAllModals();
+            }
+        });
+        
+        // Load data on page load
+        window.addEventListener('load', () => {
+            loadUsers();
+            loadRoles();
+            loadRegions();
+        });
+        
+        function showSection(section) {
+            // Hide all sections
+            document.querySelectorAll('.content-section').forEach(s => s.style.display = 'none');
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            
+            // Show selected section
+            document.getElementById(`${section}-section`).style.display = 'block';
+            document.querySelector(`[data-section="${section}"]`).classList.add('active');
+        }
+        
+        // Users
+        async function loadUsers() {
+            try {
+                const response = await fetch('/api/admin/users');
+                users = await response.json();
+                renderUsers();
+                updateUserStats();
+            } catch (error) {
+                console.error('Error loading users:', error);
+            }
+        }
+        
+        function renderUsers() {
+            const tbody = document.getElementById('users-tbody');
+            if (users.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><div class="empty-state-icon">👥</div>No users found</td></tr>';
+                return;
+            }
+            
+            tbody.innerHTML = users.map(user => {
+                const roleNames = user.role_ids.map(rid => {
+                    const role = roles.find(r => r.id === rid);
+                    return role ? role.name : rid;
+                }).join(', ') || 'None';
+                
+                const regionNames = user.region_ids.map(rid => {
+                    const region = regions.find(r => r.id === rid);
+                    return region ? region.name : rid;
+                }).join(', ') || 'None';
+                
+                return `
+                    <tr>
+                        <td>${user.username}</td>
+                        <td>${user.email}</td>
+                        <td>${roleNames}</td>
+                        <td>${regionNames}</td>
+                        <td><span class="badge ${user.active ? 'badge-success' : 'badge-danger'}">${user.active ? 'Active' : 'Inactive'}</span></td>
+                        <td>
+                            <div class="action-buttons">
+                                <button class="btn btn-primary btn-sm" onclick="editUser('${user.id}')">Edit</button>
+                                <button class="btn btn-danger btn-sm" onclick="deleteUser('${user.id}')">Delete</button>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+        
+        function updateUserStats() {
+            document.getElementById('users-count').textContent = users.length;
+            document.getElementById('active-users-count').textContent = users.filter(u => u.active).length;
+        }
+        
+        function filterUsers() {
+            const search = document.getElementById('users-search').value.toLowerCase();
+            const rows = document.querySelectorAll('#users-tbody tr');
+            rows.forEach(row => {
+                const text = row.textContent.toLowerCase();
+                row.style.display = text.includes(search) ? '' : 'none';
+            });
+        }
+        
+        function openUserModal(userId = null) {
+            currentEditingId = userId;
+            const modal = document.getElementById('user-modal');
+            const form = document.getElementById('user-form');
+            form.reset();
+            
+            if (userId) {
+                const user = users.find(u => u.id === userId);
+                document.getElementById('user-modal-title').textContent = 'Edit User';
+                document.getElementById('user-username').value = user.username;
+                document.getElementById('user-email').value = user.email;
+                document.getElementById('user-active').checked = user.active;
+                
+                // Populate role checkboxes
+                populateRoleCheckboxes(user.role_ids);
+                populateRegionCheckboxes(user.region_ids);
+            } else {
+                document.getElementById('user-modal-title').textContent = 'Add User';
+                populateRoleCheckboxes([]);
+                populateRegionCheckboxes([]);
+            }
+            
+            modal.style.display = 'block';
+        }
+        
+        function populateRoleCheckboxes(selectedIds) {
+            const container = document.getElementById('user-roles-checkboxes');
+            container.innerHTML = roles.map(role => `
+                <div class="checkbox-item">
+                    <input type="checkbox" id="user-role-${role.id}" value="${role.id}" ${selectedIds.includes(role.id) ? 'checked' : ''}>
+                    <label for="user-role-${role.id}">${role.name}</label>
+                </div>
+            `).join('');
+        }
+        
+        function populateRegionCheckboxes(selectedIds) {
+            const container = document.getElementById('user-regions-checkboxes');
+            container.innerHTML = regions.map(region => `
+                <div class="checkbox-item">
+                    <input type="checkbox" id="user-region-${region.id}" value="${region.id}" ${selectedIds.includes(region.id) ? 'checked' : ''}>
+                    <label for="user-region-${region.id}">${region.name}</label>
+                </div>
+            `).join('');
+        }
+        
+        async function saveUser(e) {
+            e.preventDefault();
+            const selectedRoles = Array.from(document.querySelectorAll('#user-roles-checkboxes input:checked')).map(cb => cb.value);
+            const selectedRegions = Array.from(document.querySelectorAll('#user-regions-checkboxes input:checked')).map(cb => cb.value);
+            
+            const userData = {
+                username: document.getElementById('user-username').value,
+                email: document.getElementById('user-email').value,
+                role_ids: selectedRoles,
+                region_ids: selectedRegions,
+                active: document.getElementById('user-active').checked
+            };
+            
+            try {
+                if (currentEditingId) {
+                    await fetch(`/api/admin/users/${currentEditingId}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(userData)
+                    });
+                } else {
+                    await fetch('/api/admin/users', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(userData)
+                    });
+                }
+                closeUserModal();
+                loadUsers();
+            } catch (error) {
+                alert('Error saving user: ' + error.message);
+            }
+        }
+        
+        function editUser(id) {
+            openUserModal(id);
+        }
+        
+        async function deleteUser(id) {
+            if (!confirm('Are you sure you want to delete this user?')) return;
+            
+            try {
+                await fetch(`/api/admin/users/${id}`, { method: 'DELETE' });
+                loadUsers();
+            } catch (error) {
+                alert('Error deleting user: ' + error.message);
+            }
+        }
+        
+        function closeUserModal() {
+            document.getElementById('user-modal').style.display = 'none';
+            currentEditingId = null;
+        }
+        
+        // Roles
+        async function loadRoles() {
+            try {
+                const response = await fetch('/api/admin/roles');
+                roles = await response.json();
+                renderRoles();
+                updateRoleStats();
+            } catch (error) {
+                console.error('Error loading roles:', error);
+            }
+        }
+        
+        function renderRoles() {
+            const tbody = document.getElementById('roles-tbody');
+            if (roles.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" class="empty-state"><div class="empty-state-icon">🔐</div>No roles found</td></tr>';
+                return;
+            }
+            
+            tbody.innerHTML = roles.map(role => {
+                const perms = role.permissions.map(p => `<span class="badge badge-primary">${p}</span>`).join(' ');
+                return `
+                    <tr>
+                        <td>${role.name}</td>
+                        <td>${role.description}</td>
+                        <td>${perms}</td>
+                        <td>
+                            <div class="action-buttons">
+                                <button class="btn btn-primary btn-sm" onclick="editRole('${role.id}')">Edit</button>
+                                <button class="btn btn-danger btn-sm" onclick="deleteRole('${role.id}')">Delete</button>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+        
+        function updateRoleStats() {
+            document.getElementById('roles-count').textContent = roles.length;
+        }
+        
+        function filterRoles() {
+            const search = document.getElementById('roles-search').value.toLowerCase();
+            const rows = document.querySelectorAll('#roles-tbody tr');
+            rows.forEach(row => {
+                const text = row.textContent.toLowerCase();
+                row.style.display = text.includes(search) ? '' : 'none';
+            });
+        }
+        
+        function openRoleModal(roleId = null) {
+            currentEditingId = roleId;
+            const modal = document.getElementById('role-modal');
+            const form = document.getElementById('role-form');
+            form.reset();
+            
+            if (roleId) {
+                const role = roles.find(r => r.id === roleId);
+                document.getElementById('role-modal-title').textContent = 'Edit Role';
+                document.getElementById('role-name').value = role.name;
+                document.getElementById('role-description').value = role.description;
+                role.permissions.forEach(perm => {
+                    const checkbox = document.getElementById(`perm-${perm}`);
+                    if (checkbox) checkbox.checked = true;
+                });
+            } else {
+                document.getElementById('role-modal-title').textContent = 'Add Role';
+            }
+            
+            modal.style.display = 'block';
+        }
+        
+        async function saveRole(e) {
+            e.preventDefault();
+            const selectedPerms = Array.from(document.querySelectorAll('#role-form input[type="checkbox"]:checked')).map(cb => cb.value);
+            
+            const roleData = {
+                name: document.getElementById('role-name').value,
+                description: document.getElementById('role-description').value,
+                permissions: selectedPerms
+            };
+            
+            try {
+                if (currentEditingId) {
+                    await fetch(`/api/admin/roles/${currentEditingId}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(roleData)
+                    });
+                } else {
+                    await fetch('/api/admin/roles', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(roleData)
+                    });
+                }
+                closeRoleModal();
+                loadRoles();
+            } catch (error) {
+                alert('Error saving role: ' + error.message);
+            }
+        }
+        
+        function editRole(id) {
+            openRoleModal(id);
+        }
+        
+        async function deleteRole(id) {
+            if (!confirm('Are you sure you want to delete this role?')) return;
+            
+            try {
+                await fetch(`/api/admin/roles/${id}`, { method: 'DELETE' });
+                loadRoles();
+            } catch (error) {
+                alert('Error deleting role: ' + error.message);
+            }
+        }
+        
+        function closeRoleModal() {
+            document.getElementById('role-modal').style.display = 'none';
+            currentEditingId = null;
+        }
+        
+        // Regions
+        async function loadRegions() {
+            try {
+                const response = await fetch('/api/admin/regions');
+                regions = await response.json();
+                renderRegions();
+                updateRegionStats();
+            } catch (error) {
+                console.error('Error loading regions:', error);
+            }
+        }
+        
+        function renderRegions() {
+            const tbody = document.getElementById('regions-tbody');
+            if (regions.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="empty-state"><div class="empty-state-icon">🌍</div>No regions found</td></tr>';
+                return;
+            }
+            
+            tbody.innerHTML = regions.map(region => `
+                <tr>
+                    <td>${region.name}</td>
+                    <td><code>${region.code}</code></td>
+                    <td>${region.description}</td>
+                    <td><span class="badge ${region.active ? 'badge-success' : 'badge-danger'}">${region.active ? 'Active' : 'Inactive'}</span></td>
+                    <td>
+                        <div class="action-buttons">
+                            <button class="btn btn-primary btn-sm" onclick="editRegion('${region.id}')">Edit</button>
+                            <button class="btn btn-danger btn-sm" onclick="deleteRegion('${region.id}')">Delete</button>
+                        </div>
+                    </td>
+                </tr>
+            `).join('');
+        }
+        
+        function updateRegionStats() {
+            document.getElementById('regions-count').textContent = regions.length;
+            document.getElementById('active-regions-count').textContent = regions.filter(r => r.active).length;
+        }
+        
+        function filterRegions() {
+            const search = document.getElementById('regions-search').value.toLowerCase();
+            const rows = document.querySelectorAll('#regions-tbody tr');
+            rows.forEach(row => {
+                const text = row.textContent.toLowerCase();
+                row.style.display = text.includes(search) ? '' : 'none';
+            });
+        }
+        
+        function openRegionModal(regionId = null) {
+            currentEditingId = regionId;
+            const modal = document.getElementById('region-modal');
+            const form = document.getElementById('region-form');
+            form.reset();
+            
+            if (regionId) {
+                const region = regions.find(r => r.id === regionId);
+                document.getElementById('region-modal-title').textContent = 'Edit Region';
+                document.getElementById('region-name').value = region.name;
+                document.getElementById('region-code').value = region.code;
+                document.getElementById('region-description').value = region.description;
+                document.getElementById('region-active').checked = region.active;
+            } else {
+                document.getElementById('region-modal-title').textContent = 'Add Region';
+            }
+            
+            modal.style.display = 'block';
+        }
+        
+        async function saveRegion(e) {
+            e.preventDefault();
+            
+            const regionData = {
+                name: document.getElementById('region-name').value,
+                code: document.getElementById('region-code').value,
+                description: document.getElementById('region-description').value,
+                active: document.getElementById('region-active').checked
+            };
+            
+            try {
+                if (currentEditingId) {
+                    await fetch(`/api/admin/regions/${currentEditingId}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(regionData)
+                    });
+                } else {
+                    await fetch('/api/admin/regions', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(regionData)
+                    });
+                }
+                closeRegionModal();
+                loadRegions();
+            } catch (error) {
+                alert('Error saving region: ' + error.message);
+            }
+        }
+        
+        function editRegion(id) {
+            openRegionModal(id);
+        }
+        
+        async function deleteRegion(id) {
+            if (!confirm('Are you sure you want to delete this region?')) return;
+            
+            try {
+                await fetch(`/api/admin/regions/${id}`, { method: 'DELETE' });
+                loadRegions();
+            } catch (error) {
+                alert('Error deleting region: ' + error.message);
+            }
+        }
+        
+        function closeRegionModal() {
+            document.getElementById('region-modal').style.display = 'none';
+            currentEditingId = null;
+        }
+        
+        function closeAllModals() {
+            closeUserModal();
+            closeRoleModal();
+            closeRegionModal();
+        }
+        
+        // Close modals when clicking outside
+        window.onclick = function(event) {
+            const modals = ['user-modal', 'role-modal', 'region-modal'];
+            modals.forEach(modalId => {
+                const modal = document.getElementById(modalId);
+                if (event.target === modal) {
+                    modal.style.display = 'none';
+                }
+            });
+        }
+    </script>
+</body>
+</html>
+
+
+
+
+

@@ -27,3 +27,8 @@ Write-Host ""
 Write-Host "If you prefer SSH, use:" -ForegroundColor Gray
 Write-Host "   git remote set-url origin git@github.com:$githubUsername/$newRepoName.git" -ForegroundColor Gray
 
+
+
+
+
+

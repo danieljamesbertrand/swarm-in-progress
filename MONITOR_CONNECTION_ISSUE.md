@@ -76,3 +76,8 @@ You would need to:
 
 I've fixed the connection counting logic so it properly increments/decrements. Now you should see connections when peers connect to the monitor.
 
+
+
+
+
+

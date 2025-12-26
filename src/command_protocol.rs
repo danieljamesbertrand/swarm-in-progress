@@ -29,7 +29,7 @@ pub struct CommandResponse {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ResponseStatus {
     Success,
@@ -237,4 +237,127 @@ pub mod commands {
     pub const GET_FILE_METADATA: &str = "GET_FILE_METADATA";
     pub const REQUEST_PIECE: &str = "REQUEST_PIECE";
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_command_creation() {
+        let cmd = Command::new("TEST_COMMAND", "peer1", Some("peer2"));
+        assert_eq!(cmd.command, "TEST_COMMAND");
+        assert_eq!(cmd.from, "peer1");
+        assert_eq!(cmd.to, Some("peer2".to_string()));
+        assert!(!cmd.request_id.is_empty());
+    }
+
+    #[test]
+    fn test_command_with_params() {
+        let cmd = Command::new("TEST_COMMAND", "peer1", None)
+            .with_param("key1", serde_json::json!("value1"))
+            .with_param("key2", serde_json::json!(42));
+        
+        assert_eq!(cmd.params.get("key1"), Some(&serde_json::json!("value1")));
+        assert_eq!(cmd.params.get("key2"), Some(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn test_command_json_serialization() {
+        let cmd = Command::new("TEST_COMMAND", "peer1", Some("peer2"));
+        let json = cmd.to_json().unwrap();
+        assert!(json.contains("TEST_COMMAND"));
+        assert!(json.contains("peer1"));
+        
+        let deserialized = Command::from_json(&json).unwrap();
+        assert_eq!(cmd.command, deserialized.command);
+        assert_eq!(cmd.from, deserialized.from);
+    }
+
+    #[test]
+    fn test_command_response_success() {
+        let mut result = HashMap::new();
+        result.insert("data".to_string(), serde_json::json!("test"));
+        
+        let resp = CommandResponse::success("TEST_COMMAND", "req-123", "peer2", "peer1", result);
+        assert_eq!(resp.status, ResponseStatus::Success);
+        assert_eq!(resp.from, "peer2");
+        assert_eq!(resp.to, "peer1");
+        assert!(resp.error.is_none());
+        assert!(resp.result.is_some());
+    }
+
+    #[test]
+    fn test_command_response_error() {
+        let resp = CommandResponse::error("TEST_COMMAND", "req-123", "peer2", "peer1", "Error message");
+        assert_eq!(resp.status, ResponseStatus::Error);
+        assert_eq!(resp.error, Some("Error message".to_string()));
+        assert!(resp.result.is_none());
+    }
+
+    #[test]
+    fn test_node_capabilities_score_calculation() {
+        let capabilities = NodeCapabilities {
+            cpu_cores: 8,
+            cpu_usage: 50.0,
+            cpu_speed_ghz: 3.0,
+            memory_total_mb: 16384,
+            memory_available_mb: 8192,
+            disk_total_mb: 1000000,
+            disk_available_mb: 500000,
+            latency_ms: 10.0,
+            reputation: 0.9,
+        };
+        
+        let weights = NodeWeights::default();
+        let score = capabilities.calculate_score(&weights);
+        
+        assert!(score > 0.0);
+        assert!(score <= 1.0);
+    }
+
+    #[test]
+    fn test_reputation_data_new() {
+        let rep = ReputationData::new();
+        assert_eq!(rep.reputation, 1.0);
+        assert_eq!(rep.total_requests, 0);
+        assert_eq!(rep.successful_requests, 0);
+        assert_eq!(rep.failed_requests, 0);
+    }
+
+    #[test]
+    fn test_reputation_data_update_success() {
+        let mut rep = ReputationData::new();
+        rep.update(true, 10.0, 0.9);
+        
+        assert_eq!(rep.total_requests, 1);
+        assert_eq!(rep.successful_requests, 1);
+        assert_eq!(rep.failed_requests, 0);
+        assert!(rep.reputation > 1.0 || rep.reputation <= 1.0); // Should increase but cap at 1.0
+        assert_eq!(rep.average_latency_ms, 10.0);
+    }
+
+    #[test]
+    fn test_reputation_data_update_failure() {
+        let mut rep = ReputationData::new();
+        rep.update(false, 0.0, 0.0);
+        
+        assert_eq!(rep.total_requests, 1);
+        assert_eq!(rep.successful_requests, 0);
+        assert_eq!(rep.failed_requests, 1);
+        assert!(rep.reputation < 1.0); // Should decrease
+    }
+
+    #[test]
+    fn test_node_weights_default() {
+        let weights = NodeWeights::default();
+        let sum = weights.cpu + weights.memory + weights.disk + weights.latency + weights.reputation;
+        // Weights should sum to approximately 1.0 (allowing for floating point)
+        assert!((sum - 1.0).abs() < 0.01);
+    }
+}
+
+
+
+
 

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use libp2p::request_response::Codec;
 use libp2p::StreamProtocol;
 use libp2p::futures::{AsyncRead, AsyncWrite};
+use std::io;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerMetrics {

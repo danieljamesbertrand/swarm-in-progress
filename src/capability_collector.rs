@@ -107,7 +107,7 @@ impl CapabilityCollector {
 
     fn get_disk_total() -> u64 {
         // Get disk space of current directory
-        if let Ok(metadata) = std::fs::metadata(".") {
+        if let Ok(_metadata) = std::fs::metadata(".") {
             // This is simplified - in production, would check actual disk
             // For now, return a reasonable default
         }
@@ -127,4 +127,77 @@ impl Default for CapabilityCollector {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_capability_collector_new() {
+        let collector = CapabilityCollector::new();
+        assert!(collector.last_collection.is_none());
+        assert!(collector.cached_capabilities.is_none());
+    }
+
+    #[test]
+    fn test_capability_collector_collect() {
+        let mut collector = CapabilityCollector::new();
+        let capabilities = collector.collect();
+        
+        assert!(capabilities.cpu_cores > 0);
+        assert!(capabilities.memory_total_mb > 0);
+        assert!(capabilities.disk_total_mb > 0);
+    }
+
+    #[test]
+    fn test_capability_collector_caching() {
+        let mut collector = CapabilityCollector::new();
+        let cap1 = collector.collect();
+        
+        // Immediately collect again - should use cache
+        let cap2 = collector.collect();
+        
+        // Values should be the same (cached)
+        assert_eq!(cap1.cpu_cores, cap2.cpu_cores);
+        assert_eq!(cap1.memory_total_mb, cap2.memory_total_mb);
+    }
+
+    #[test]
+    fn test_get_cpu_cores() {
+        let cores = CapabilityCollector::get_cpu_cores();
+        assert!(cores > 0);
+    }
+
+    #[test]
+    fn test_get_memory_total() {
+        let memory = CapabilityCollector::get_memory_total();
+        assert!(memory > 0);
+    }
+
+    #[test]
+    fn test_get_memory_available() {
+        let available = CapabilityCollector::get_memory_available();
+        let total = CapabilityCollector::get_memory_total();
+        assert!(available <= total);
+        assert!(available > 0);
+    }
+
+    #[test]
+    fn test_get_disk_total() {
+        let disk = CapabilityCollector::get_disk_total();
+        assert!(disk > 0);
+    }
+
+    #[test]
+    fn test_get_disk_available() {
+        let available = CapabilityCollector::get_disk_available();
+        let total = CapabilityCollector::get_disk_total();
+        assert!(available <= total);
+        assert!(available > 0);
+    }
+}
+
+
+
+
 

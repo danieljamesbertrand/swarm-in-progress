@@ -327,3 +327,8 @@ Node 1 (DHT) ←→ Node 2 (DHT) ←→ Node 3 (DHT)
 
 This is what makes Kademlia truly decentralized - there's no central DHT server, the DHT exists across all participating nodes!
 
+
+
+
+
+

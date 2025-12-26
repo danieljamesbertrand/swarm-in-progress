@@ -70,6 +70,7 @@ enum BehaviourEvent {
     Kademlia(kad::Event),
     Identify(libp2p::identify::Event),
     RequestResponse(request_response::Event<JsonCodec>),
+    Relay(libp2p::relay::Event),
 }
 
 impl From<kad::Event> for BehaviourEvent {
@@ -90,8 +91,8 @@ impl From<request_response::Event<JsonCodec>> for BehaviourEvent {
     }
 }
 
-impl From<relay::Event> for BehaviourEvent {
-    fn from(event: relay::Event) -> Self {
+impl From<libp2p::relay::Event> for BehaviourEvent {
+    fn from(event: libp2p::relay::Event) -> Self {
         BehaviourEvent::Relay(event)
     }
 }

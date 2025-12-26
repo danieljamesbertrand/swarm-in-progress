@@ -369,3 +369,8 @@ cargo run --release --bin torrent_client -- --download-dir ./downloads
 
 The torrent functionality integrates seamlessly with the existing Kademlia DHT network, allowing decentralized file sharing across all nodes!
 
+
+
+
+
+
