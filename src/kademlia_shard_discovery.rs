@@ -67,6 +67,7 @@ pub struct ShardAnnouncement {
 }
 
 /// Capabilities specific to shard processing
+/// Extends NodeCapabilities with shard-specific information
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct ShardCapabilities {
     /// Number of CPU cores available
@@ -79,6 +80,12 @@ pub struct ShardCapabilities {
     pub memory_available_mb: u64,
     /// GPU memory in MB (0 if no GPU)
     pub gpu_memory_mb: u64,
+    /// Number of GPU compute units (CUDA cores / stream processors)
+    pub gpu_compute_units: u32,
+    /// GPU utilization percentage (0-100)
+    pub gpu_usage: f64,
+    /// Whether GPU is available for inference
+    pub gpu_available: bool,
     /// Network latency to bootstrap node in ms
     pub latency_ms: f64,
     /// Node reputation score (0.0 - 1.0)
@@ -94,12 +101,18 @@ pub struct ShardCapabilities {
 impl ShardCapabilities {
     /// Create new capabilities with system detection
     pub fn detect() -> Self {
+        // Try to detect GPU from environment or nvidia-smi
+        let (gpu_mem, gpu_compute, gpu_avail) = Self::detect_gpu();
+        
         Self {
             cpu_cores: num_cpus::get() as u32,
             cpu_usage: 0.0, // Would need system monitoring
             memory_total_mb: 16384, // Would need sysinfo crate
             memory_available_mb: 8192,
-            gpu_memory_mb: 0,
+            gpu_memory_mb: gpu_mem,
+            gpu_compute_units: gpu_compute,
+            gpu_usage: 0.0,
+            gpu_available: gpu_avail,
             latency_ms: 0.0,
             reputation: 1.0,
             shard_loaded: false,
@@ -108,19 +121,80 @@ impl ShardCapabilities {
         }
     }
 
-    /// Calculate a composite score for node selection
-    pub fn calculate_score(&self, weights: &NodeWeights) -> f64 {
-        let cpu_score = (self.cpu_cores as f64 / 16.0).min(1.0) * (1.0 - self.cpu_usage / 100.0);
-        let memory_score = self.memory_available_mb as f64 / self.memory_total_mb.max(1) as f64;
-        let load_score = 1.0 - (self.active_requests as f64 / self.max_concurrent.max(1) as f64);
-        let latency_score = 1.0 / (1.0 + self.latency_ms / 100.0);
-        let reputation_score = self.reputation;
+    /// Detect GPU information from environment or system
+    fn detect_gpu() -> (u64, u32, bool) {
+        // Check environment variables first
+        if let Ok(gpu_mem) = std::env::var("NODE_GPU_MEMORY_MB") {
+            if let Ok(mem) = gpu_mem.parse::<u64>() {
+                let compute = std::env::var("NODE_GPU_COMPUTE_UNITS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(5000);
+                return (mem, compute, true);
+            }
+        }
+        
+        // No GPU detected
+        (0, 0, false)
+    }
 
-        weights.cpu * cpu_score
+    /// Calculate a composite score for node selection
+    /// 
+    /// Factors considered:
+    /// - CPU: cores and available capacity
+    /// - Memory: available/total ratio
+    /// - GPU: memory, compute units, availability
+    /// - Latency: network responsiveness
+    /// - Reputation: historical performance
+    /// - Load: current request load vs capacity
+    pub fn calculate_score(&self, weights: &NodeWeights) -> f64 {
+        // CPU score: normalized cores * available capacity
+        let cpu_score = (self.cpu_cores as f64 / 16.0).min(1.0) * (1.0 - self.cpu_usage / 100.0);
+        
+        // Memory score: available/total ratio
+        let memory_score = self.memory_available_mb as f64 / self.memory_total_mb.max(1) as f64;
+        
+        // Load score: how much capacity is available
+        let load_score = 1.0 - (self.active_requests as f64 / self.max_concurrent.max(1) as f64);
+        
+        // Latency score: inverse relationship
+        let latency_score = 1.0 / (1.0 + self.latency_ms / 100.0);
+        
+        // Reputation score: direct 0-1 value
+        let reputation_score = self.reputation.clamp(0.0, 1.0);
+        
+        // GPU score: composite of memory, compute, and availability
+        let gpu_score = if self.gpu_available && self.gpu_memory_mb > 0 {
+            let memory_factor = (self.gpu_memory_mb as f64 / 24576.0).min(1.0); // Normalized to 24GB
+            let compute_factor = (self.gpu_compute_units as f64 / 10000.0).min(1.0); // Normalized to 10k units
+            let usage_factor = 1.0 - (self.gpu_usage / 100.0);
+            
+            // Weighted: memory most important for LLMs
+            0.5 * memory_factor + 0.3 * compute_factor + 0.2 * usage_factor
+        } else {
+            0.0
+        };
+        
+        // Shard loaded bonus: prefer nodes with shard already in memory
+        let shard_bonus = if self.shard_loaded { 0.1 } else { 0.0 };
+
+        // Calculate weighted total
+        let base_score = weights.cpu * cpu_score
             + weights.memory * memory_score
             + weights.latency * latency_score
             + weights.reputation * reputation_score
-            + 0.15 * load_score // Add load balancing weight
+            + weights.gpu * gpu_score;
+        
+        // Add load balancing (10% weight) and shard bonus
+        base_score + 0.10 * load_score + shard_bonus
+    }
+
+    /// Check if this node is a good candidate for AI inference
+    pub fn is_inference_capable(&self) -> bool {
+        // Minimum requirements for inference
+        self.memory_available_mb >= 4096 && // At least 4GB RAM
+        (self.gpu_available || self.cpu_cores >= 4) && // GPU or decent CPU
+        self.active_requests < self.max_concurrent // Has capacity
     }
 }
 
