@@ -1548,10 +1548,14 @@ impl PipelineCoordinator {
 
         if status.is_complete {
             // Pipeline ready - process immediately
-            println!("[COORDINATOR] Pipeline is complete, processing inference immediately");
+            println!("[COORDINATOR] ✅ Pipeline is complete, processing inference immediately");
+            println!("[COORDINATOR]   Request ID: {}", request.request_id);
+            println!("[COORDINATOR]   Prompt: \"{}\"", request.prompt);
             return self.process_inference(request, start).await;
         } else {
-            println!("[COORDINATOR] Pipeline incomplete (missing: {:?}), applying strategy: {:?}", missing_shards, self.strategy);
+            println!("[COORDINATOR] ⚠️  Pipeline incomplete (missing: {:?}), applying strategy: {:?}", missing_shards, self.strategy);
+            println!("[COORDINATOR]   Request ID: {}", request.request_id);
+            println!("[COORDINATOR]   Prompt: \"{}\"", request.prompt);
         }
 
         // Pipeline incomplete - apply strategy
@@ -2080,7 +2084,9 @@ impl PipelineCoordinator {
             println!("[INFERENCE] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
             // Send inference request to the shard node
+            println!("[INFERENCE] Checking command_sender for shard {}...", shard.shard_id);
             let shard_output = if let Some(ref sender) = self.command_sender {
+                println!("[INFERENCE] ✅ command_sender is set, sending real inference request");
                 // Real inference: send command to node
                 use crate::command_protocol::{Command, commands};
                 use serde_json::json;
@@ -2208,7 +2214,9 @@ impl PipelineCoordinator {
                 }
             } else {
                 // Fallback: simulate processing if no command sender
-                println!("[INFERENCE] WARNING: No command sender configured, simulating shard processing");
+                eprintln!("[INFERENCE] ❌ WARNING: No command sender configured, simulating shard processing");
+                eprintln!("[INFERENCE]   This means inference commands are NOT being sent to shard nodes!");
+                eprintln!("[INFERENCE]   Shard: {} (layers {}-{})", shard.shard_id, shard.layer_start, shard.layer_end);
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 format!("[Shard {} processed layers {}-{}]", 
                     shard.shard_id, shard.layer_start, shard.layer_end)

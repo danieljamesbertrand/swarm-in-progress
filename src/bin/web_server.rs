@@ -459,8 +459,8 @@ struct InferenceEngine {
     coordinator: Arc<PipelineCoordinator>,
     peer_id: PeerId,
     swarm: Arc<Mutex<Swarm<DiscoveryBehaviour>>>,
-    // Store pending responses - RequestId type is inferred from Behaviour
-    pending_responses: Arc<Mutex<HashMap<u64, oneshot::Sender<punch_simple::command_protocol::CommandResponse>>>>,
+    // Store pending responses - using command request_id string as key for reliable matching
+    pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<punch_simple::command_protocol::CommandResponse>>>>,
     discovery_task: Arc<tokio::task::JoinHandle<()>>,
     metrics: Arc<RwLock<SystemMetrics>>,
     // Channel for broadcasting node events to all WebSocket connections
@@ -559,8 +559,8 @@ impl InferenceEngine {
             }
         }
         
-        // Create pending responses map
-        let pending_responses: Arc<Mutex<HashMap<u64, oneshot::Sender<punch_simple::command_protocol::CommandResponse>>>> = Arc::new(Mutex::new(HashMap::new()));
+        // Create pending responses map - using command request_id string as key
+        let pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<punch_simple::command_protocol::CommandResponse>>>> = Arc::new(Mutex::new(HashMap::new()));
         
         // Create P2P command sender with real P2P communication
         let metrics_for_sender = Arc::clone(&metrics);
@@ -669,26 +669,23 @@ impl InferenceEngine {
                 
                 // Send request via P2P
                 let (tx, rx) = oneshot::channel();
-                let request_id_u64 = {
-                    let mut swarm = swarm_clone.lock().await;
-                    let request_id = swarm.behaviour_mut().request_response.send_request(&target_peer, msg);
-                    // Convert RequestId to u64 for storage (RequestId implements Debug, we'll use a hash)
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    format!("{:?}", request_id).hash(&mut hasher);
-                    hasher.finish()
-                };
-                
-                // Store channel for response using request_id from command as key
                 let cmd_request_id = cmd.request_id.clone();
                 {
-                    let mut pending = pending_clone.lock().await;
-                    // Use command's request_id string as key instead
-                    pending.insert(request_id_u64, tx);
+                    let mut swarm = swarm_clone.lock().await;
+                    let _libp2p_request_id = swarm.behaviour_mut().request_response.send_request(&target_peer, msg);
+                    // Store using command's request_id string for reliable matching
+                    println!("[P2P] 📤 Sending command {} to node {} (libp2p request_id: {:?}, command request_id: {})", 
+                        cmd.command, peer_id_str, _libp2p_request_id, cmd_request_id);
                 }
                 
-                println!("[P2P] 📤 Sending command {} to node {} (request_id: {})", cmd.command, peer_id_str, cmd_request_id);
-                println!("[P2P]   Command details: {:?}", serde_json::to_string(&cmd).unwrap_or_default());
+                // Store channel for response using command's request_id string as key
+                {
+                    let mut pending = pending_clone.lock().await;
+                    pending.insert(cmd_request_id.clone(), tx);
+                    println!("[P2P]   Stored pending response channel for request_id: {}", cmd_request_id);
+                }
+                
+                println!("[P2P]   Command details: {}", serde_json::to_string(&cmd).unwrap_or_default());
                 
                 // Broadcast node event: command sent
                 if let Some(ref tx) = node_event_tx_clone {
@@ -710,13 +707,13 @@ impl InferenceEngine {
                 }
                 
                 // Wait for response with timeout
-                println!("[P2P] ⏳ Waiting for response from {}...", peer_id_str);
+                println!("[P2P] ⏳ Waiting for response from {} (request_id: {})...", peer_id_str, cmd_request_id);
                 let response = tokio::time::timeout(Duration::from_secs(30), rx).await;
                 
                 // Remove from pending
                 {
                     let mut pending = pending_clone.lock().await;
-                    pending.remove(&request_id_u64);
+                    pending.remove(&cmd_request_id);
                 }
                 
                 let latency_ms = cmd_start.elapsed().as_millis() as f64;
@@ -1010,26 +1007,24 @@ impl InferenceEngine {
                         // Handle request-response protocol responses
                         if let DiscoveryBehaviourEvent::RequestResponse(request_response::Event::Message { message, .. }) = &behaviour_event {
                             match message {
-                                request_response::Message::Response { response, request_id, .. } => {
+                                request_response::Message::Response { response, request_id: _libp2p_request_id, .. } => {
                                     // Parse response and send to waiting channel
                                     // The response.message contains the serialized CommandResponse
-                                    println!("[P2P] 📥 Received response (request_id: {:?}): {}", request_id, response.message);
+                                    println!("[P2P] 📥 Received response (libp2p request_id: {:?}): {}", _libp2p_request_id, response.message);
                                     
                                     if let Ok(cmd_response) = serde_json::from_str::<punch_simple::command_protocol::CommandResponse>(&response.message) {
-                                        println!("[P2P] ✓ Parsed CommandResponse: status={:?}, command={}", cmd_response.status, cmd_response.command);
+                                        println!("[P2P] ✓ Parsed CommandResponse: status={:?}, command={}, request_id={}", 
+                                            cmd_response.status, cmd_response.command, cmd_response.request_id);
                                         
-                                        // Convert RequestId to u64 to match storage
-                                        use std::hash::{Hash, Hasher};
-                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                        format!("{:?}", request_id).hash(&mut hasher);
-                                        let request_id_u64 = hasher.finish();
-                                        
+                                        // Use command's request_id string to match with stored channel
                                         let mut pending = pending_for_events.lock().await;
-                                        if let Some(tx) = pending.remove(&request_id_u64) {
-                                            println!("[P2P] ✓ Sending response to waiting channel");
+                                        if let Some(tx) = pending.remove(&cmd_response.request_id) {
+                                            println!("[P2P] ✓ Matched response to waiting channel for request_id: {}", cmd_response.request_id);
                                             let _ = tx.send(cmd_response);
                                         } else {
-                                            println!("[P2P] ⚠️  No waiting channel found for request_id {:?}", request_id);
+                                            eprintln!("[P2P] ⚠️  No waiting channel found for request_id: {} (libp2p request_id: {:?})", 
+                                                cmd_response.request_id, _libp2p_request_id);
+                                            eprintln!("[P2P]   Available pending request_ids: {:?}", pending.keys().collect::<Vec<_>>());
                                         }
                                     } else {
                                         eprintln!("[P2P] ❌ Failed to parse CommandResponse from: {}", response.message);
@@ -1291,7 +1286,11 @@ impl InferenceEngine {
         }
 
         // Submit to pipeline coordinator
-        println!("[INFERENCE] Submitting inference request: {}", query);
+        println!("[INFERENCE] ═══════════════════════════════════════════════════════════════════════════");
+        println!("[INFERENCE] Submitting inference request: \"{}\"", query);
+        println!("[INFERENCE]   Request ID: {}", inference_request.request_id);
+        println!("[INFERENCE]   Max tokens: {}", inference_request.max_tokens);
+        println!("[INFERENCE]   Temperature: {}", inference_request.temperature);
         
         // Check pipeline status before submitting
         let (online_nodes, total_nodes, missing_shards, is_complete) = self.coordinator.get_pipeline_status().await;
@@ -1304,7 +1303,9 @@ impl InferenceEngine {
             eprintln!("[INFERENCE]   Nodes may still be starting up. Please wait...");
         }
         
+        println!("[INFERENCE] Calling coordinator.submit_inference()...");
         let result = self.coordinator.submit_inference(inference_request).await;
+        println!("[INFERENCE] coordinator.submit_inference() returned");
         match &result {
             Ok(_) => {
                 println!("[INFERENCE] ✓ Inference request succeeded");
@@ -1492,28 +1493,29 @@ impl InferenceEngine {
         
         // Send request via P2P
         let (tx, rx) = oneshot::channel();
-        let request_id_u64 = {
+        let cmd_request_id = p2p_command.request_id.clone();
+        {
             let mut swarm = self.swarm.lock().await;
-            let request_id = swarm.behaviour_mut().request_response.send_request(&target_peer, msg);
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            format!("{:?}", request_id).hash(&mut hasher);
-            hasher.finish()
-        };
+            let _libp2p_request_id = swarm.behaviour_mut().request_response.send_request(&target_peer, msg);
+            println!("[NODE_CONTROL] 📤 Sending command {} to node {} (libp2p request_id: {:?}, command request_id: {})", 
+                p2p_command.command, node_id, _libp2p_request_id, cmd_request_id);
+        }
         
-        // Store channel for response
+        // Store channel for response using command's request_id string
         {
             let mut pending = self.pending_responses.lock().await;
-            pending.insert(request_id_u64, tx);
+            pending.insert(cmd_request_id.clone(), tx);
+            println!("[NODE_CONTROL]   Stored pending response channel for request_id: {}", cmd_request_id);
         }
         
         // Wait for response with timeout
+        println!("[NODE_CONTROL] ⏳ Waiting for response from {} (request_id: {})...", node_id, cmd_request_id);
         let response = tokio::time::timeout(Duration::from_secs(30), rx).await;
         
         // Remove from pending
         {
             let mut pending = self.pending_responses.lock().await;
-            pending.remove(&request_id_u64);
+            pending.remove(&cmd_request_id);
         }
         
         let cmd_response = match response {
