@@ -210,8 +210,10 @@ impl std::fmt::Display for PipelineError {
 
 impl std::error::Error for PipelineError {}
 
+/// Command sender function type for sending commands to nodes
+pub type CommandSender = Box<dyn Fn(String, crate::command_protocol::Command) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::command_protocol::CommandResponse, PipelineError>> + Send>> + Send + Sync>;
+
 /// Dynamic shard loading capability
-#[derive(Clone)]
 pub struct DynamicShardLoader {
     /// Model manager for downloading shards
     model_manager: Arc<RwLock<LlamaModelManager>>,
@@ -219,6 +221,8 @@ pub struct DynamicShardLoader {
     loaded_shards: Arc<RwLock<HashMap<String, Vec<u32>>>>,
     /// Memory usage per node
     memory_usage: Arc<RwLock<HashMap<String, u64>>>,
+    /// Command sender for sending LOAD_SHARD commands (optional)
+    command_sender: Option<Arc<dyn Fn(String, crate::command_protocol::Command) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::command_protocol::CommandResponse, PipelineError>> + Send>> + Send + Sync>>,
 }
 
 impl DynamicShardLoader {
@@ -227,7 +231,17 @@ impl DynamicShardLoader {
             model_manager: Arc::new(RwLock::new(model_manager)),
             loaded_shards: Arc::new(RwLock::new(HashMap::new())),
             memory_usage: Arc::new(RwLock::new(HashMap::new())),
+            command_sender: None,
         }
+    }
+    
+    /// Set command sender for sending LOAD_SHARD commands to nodes
+    pub fn with_command_sender<F>(mut self, sender: F) -> Self
+    where
+        F: Fn(String, crate::command_protocol::Command) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::command_protocol::CommandResponse, PipelineError>> + Send>> + Send + Sync + 'static,
+    {
+        self.command_sender = Some(Arc::new(sender));
+        self
     }
 
     /// Check if a node can load an additional shard
@@ -245,22 +259,61 @@ impl DynamicShardLoader {
     ) -> Result<(), PipelineError> {
         println!("[LOADER] Attempting to load shard {} on node {}", shard_id, node_id);
 
-        // Download shard if not cached
-        let manager = self.model_manager.read().await;
-        let shard_name = format!("{}-shard-{}.safetensors", model_name, shard_id);
-        
-        // Note: In production, this would send a command to the remote node
-        // to load the shard. Here we simulate the process.
-        drop(manager);
+        // Send LOAD_SHARD command to the node
+        if let Some(ref sender) = self.command_sender {
+            use crate::command_protocol::{Command, commands};
+            use serde_json::json;
+            
+            let cmd = Command::new(commands::LOAD_SHARD, "coordinator", Some(node_id))
+                .with_param("shard_id".to_string(), json!(shard_id))
+                .with_param("model_name".to_string(), json!(model_name));
+            
+            println!("[LOADER] Sending LOAD_SHARD command to node {}", node_id);
+            match sender(node_id.to_string(), cmd).await {
+                Ok(response) => {
+                    if response.status == crate::command_protocol::ResponseStatus::Success {
+                        println!("[LOADER] ✓ Node {} confirmed shard {} loaded", node_id, shard_id);
+                        
+                        // Track loaded shard
+                        let mut loaded = self.loaded_shards.write().await;
+                        loaded.entry(node_id.to_string())
+                            .or_insert_with(Vec::new)
+                            .push(shard_id);
+                        
+                        Ok(())
+                    } else {
+                        let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
+                        Err(PipelineError::ShardLoadFailed {
+                            shard_id,
+                            error: format!("Node {} returned error: {}", node_id, error_msg),
+                        })
+                    }
+                }
+                Err(e) => {
+                    Err(PipelineError::ShardLoadFailed {
+                        shard_id,
+                        error: format!("Failed to send command to node {}: {}", node_id, e),
+                    })
+                }
+            }
+        } else {
+            // No command sender configured - fallback to local simulation
+            println!("[LOADER] WARNING: No command sender configured, simulating shard load");
+            
+            // Download shard if not cached (local fallback)
+            let manager = self.model_manager.read().await;
+            let shard_name = format!("{}-shard-{}.safetensors", model_name, shard_id);
+            drop(manager);
 
-        // Track loaded shard
-        let mut loaded = self.loaded_shards.write().await;
-        loaded.entry(node_id.to_string())
-            .or_insert_with(Vec::new)
-            .push(shard_id);
+            // Track loaded shard
+            let mut loaded = self.loaded_shards.write().await;
+            loaded.entry(node_id.to_string())
+                .or_insert_with(Vec::new)
+                .push(shard_id);
 
-        println!("[LOADER] Successfully loaded shard {} on node {}", shard_id, node_id);
-        Ok(())
+            println!("[LOADER] Successfully loaded shard {} on node {} (simulated)", shard_id, node_id);
+            Ok(())
+        }
     }
 
     /// Get nodes that could potentially load a shard
