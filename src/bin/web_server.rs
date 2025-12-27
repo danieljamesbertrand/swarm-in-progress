@@ -143,6 +143,18 @@ impl InferenceEngine {
         })
     }
 
+    /// Spawn nodes for missing shards on startup
+    async fn ensure_minimal_pipeline(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("[SERVER] Checking pipeline status for startup node spawning...");
+        
+        // Use coordinator's method to spawn missing nodes
+        if let Err(e) = self.coordinator.spawn_missing_nodes_on_startup().await {
+            return Err(format!("Failed to spawn startup nodes: {}", e).into());
+        }
+        
+        Ok(())
+    }
+
     async fn process_query(&self, query: &str, update_sender: Option<&tokio::sync::mpsc::Sender<PipelineUpdate>>) -> QueryResponse {
         let start = Instant::now();
 
@@ -457,6 +469,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let engine = Arc::new(InferenceEngine::new(&bootstrap).await?);
     println!("[SERVER] Inference engine initialized with real distributed pipeline");
+    
+    // Spawn nodes for missing shards on startup
+    println!("[SERVER] Ensuring minimal pipeline is ready...");
+    if let Err(e) = engine.ensure_minimal_pipeline().await {
+        eprintln!("[SERVER] ⚠️  Warning: Failed to spawn startup nodes: {}", e);
+        eprintln!("[SERVER] Nodes will be spawned on-demand when requests arrive");
+    }
 
     // Start WebSocket server
     let ws_listener = TcpListener::bind("127.0.0.1:8081").await?;

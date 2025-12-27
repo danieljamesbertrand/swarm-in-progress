@@ -649,6 +649,70 @@ impl PipelineCoordinator {
         self
     }
 
+    /// Spawn nodes for missing shards proactively (for startup)
+    pub async fn spawn_missing_nodes_on_startup(&self) -> Result<(), PipelineError> {
+        let Some(spawner) = &self.node_spawner else {
+            return Err(PipelineError::NoFallback {
+                reason: "Node spawner not configured".to_string(),
+            });
+        };
+
+        // Wait a bit for DHT to populate
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Check pipeline status
+        let discovery = self.discovery.read().await;
+        let status = discovery.status();
+        let missing_shards = discovery.get_missing_shards();
+        drop(discovery);
+
+        if status.is_complete {
+            println!("[COORDINATOR] ✓ Pipeline is complete, no nodes need to be spawned");
+            return Ok(());
+        }
+
+        println!("[COORDINATOR] Pipeline incomplete. Missing shards: {:?}", missing_shards);
+        println!("[COORDINATOR] Spawning nodes for missing shards...");
+
+        // Spawn nodes for each missing shard
+        for shard_id in &missing_shards {
+            println!("[COORDINATOR] Spawning node for shard {}...", shard_id);
+            if let Err(e) = spawner.spawn_node_for_shard(*shard_id).await {
+                eprintln!("[COORDINATOR] Failed to spawn node for shard {}: {}", shard_id, e);
+                // Continue with other shards
+            } else {
+                println!("[COORDINATOR] ✓ Spawned node for shard {}", shard_id);
+            }
+        }
+
+        // Wait for nodes to come online
+        println!("[COORDINATOR] Waiting for spawned nodes to come online...");
+        for shard_id in &missing_shards {
+            println!("[COORDINATOR] Waiting for shard {} node to come online...", shard_id);
+            if let Err(e) = spawner.wait_for_node_online(*shard_id, 30, &self.discovery).await {
+                eprintln!("[COORDINATOR] ⚠️  Shard {} node did not come online in time: {}", shard_id, e);
+                // Continue - node might still be starting
+            } else {
+                println!("[COORDINATOR] ✓ Shard {} node is online", shard_id);
+            }
+        }
+
+        // Final check
+        let discovery = self.discovery.read().await;
+        let status = discovery.status();
+        drop(discovery);
+
+        if status.is_complete {
+            println!("[COORDINATOR] ✓ All nodes are online and pipeline is complete!");
+            Ok(())
+        } else {
+            let still_missing = status.missing_shards;
+            println!("[COORDINATOR] ⚠️  Pipeline still incomplete. Missing: {:?}", still_missing);
+            println!("[COORDINATOR] Nodes may still be starting up. They will be used when ready.");
+            Ok(())
+        }
+    }
+
     /// Set the pipeline strategy
     pub fn set_strategy(&mut self, strategy: PipelineStrategy) {
         self.strategy = strategy;
