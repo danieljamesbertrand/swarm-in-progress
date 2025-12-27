@@ -43,7 +43,9 @@ use std::error::Error;
 use std::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
+use sha2::{Sha256, Digest};
 
 #[derive(Parser, Debug)]
 #[command(name = "shard_listener")]
@@ -80,6 +82,14 @@ struct Args {
     /// Announcement refresh interval in seconds
     #[arg(long, default_value = "60")]
     refresh_interval: u64,
+
+    /// Directory containing GGUF shards to seed via torrent
+    #[arg(long, env = "LLAMA_SHARDS_DIR", default_value = "models_cache/shards")]
+    shards_dir: String,
+
+    /// Enable torrent server to seed all GGUF files
+    #[arg(long, default_value = "true")]
+    enable_torrent: bool,
 }
 
 #[derive(NetworkBehaviour)]
@@ -89,6 +99,14 @@ struct ShardBehaviour {
     request_response: request_response::Behaviour<JsonCodec>,
     metrics_response: request_response::Behaviour<MetricsCodec>,
     relay: relay::Behaviour,
+}
+
+/// Torrent file metadata (simplified from torrent_server)
+#[derive(Clone, Debug)]
+struct TorrentFileInfo {
+    info_hash: String,
+    filename: String,
+    size: u64,
 }
 
 /// Shard node state
@@ -101,10 +119,14 @@ struct ShardNodeState {
     active_requests: u32,
     total_requests: u64,
     successful_requests: u64,
+    // Torrent server state
+    torrent_files: HashMap<String, TorrentFileInfo>, // info_hash -> file info
+    shards_dir: PathBuf,
+    loaded_shards: HashMap<u32, PathBuf>, // shard_id -> path to loaded GGUF file
 }
 
 impl ShardNodeState {
-    fn new(peer_id: PeerId, shard_id: u32, total_shards: u32, total_layers: u32, model_name: &str, cluster: &str) -> Self {
+    fn new(peer_id: PeerId, shard_id: u32, total_shards: u32, total_layers: u32, model_name: &str, cluster: &str, shards_dir: &str) -> Self {
         let announcement = ShardAnnouncement::new(
             &peer_id.to_string(),
             shard_id,
@@ -115,8 +137,9 @@ impl ShardNodeState {
         );
 
         let discovery = KademliaShardDiscovery::with_expected_shards(cluster, total_shards);
-
-        Self {
+        
+        let shards_path = PathBuf::from(shards_dir);
+        let mut state = Self {
             peer_id,
             shard_id,
             announcement,
@@ -125,7 +148,110 @@ impl ShardNodeState {
             active_requests: 0,
             total_requests: 0,
             successful_requests: 0,
+            torrent_files: HashMap::new(),
+            shards_dir: shards_path.clone(),
+            loaded_shards: HashMap::new(),
+        };
+        
+        // Scan for GGUF files to seed
+        state.scan_gguf_files();
+        
+        state
+    }
+    
+    /// Scan shards directory for GGUF files and create torrent metadata
+    fn scan_gguf_files(&mut self) {
+        if !self.shards_dir.exists() {
+            println!("[TORRENT] Shards directory does not exist: {}", self.shards_dir.display());
+            return;
         }
+        
+        match std::fs::read_dir(&self.shards_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().map(|e| e == "gguf").unwrap_or(false) {
+                        if let Some(file_info) = Self::create_torrent_file_info(&path) {
+                            println!("[TORRENT] Found GGUF shard to seed: {} (hash: {})", 
+                                file_info.filename, &file_info.info_hash[..16]);
+                            self.torrent_files.insert(file_info.info_hash.clone(), file_info);
+                        }
+                    }
+                }
+                println!("[TORRENT] Scanning complete: {} GGUF file(s) available for seeding", self.torrent_files.len());
+            }
+            Err(e) => {
+                eprintln!("[TORRENT] Failed to scan shards directory: {}", e);
+            }
+        }
+    }
+    
+    /// Create torrent file info from a GGUF file path
+    fn create_torrent_file_info(path: &Path) -> Option<TorrentFileInfo> {
+        let metadata = std::fs::metadata(path).ok()?;
+        let file_size = metadata.len();
+        let filename = path.file_name()?.to_string_lossy().to_string();
+        
+        // Calculate info hash (SHA256 of filename + size)
+        let mut hasher = Sha256::new();
+        hasher.update(filename.as_bytes());
+        hasher.update(&file_size.to_le_bytes());
+        let info_hash = format!("{:x}", hasher.finalize());
+        
+        Some(TorrentFileInfo {
+            info_hash,
+            filename,
+            size: file_size,
+        })
+    }
+    
+    /// Get list of available GGUF files for torrent
+    fn get_torrent_file_list(&self) -> Vec<&TorrentFileInfo> {
+        self.torrent_files.values().collect()
+    }
+    
+    /// Check if a shard is already loaded
+    fn is_shard_loaded(&self, shard_id: u32) -> bool {
+        self.loaded_shards.contains_key(&shard_id)
+    }
+    
+    /// Load a shard file (if it exists locally)
+    fn load_shard_file(&mut self, shard_id: u32) -> Result<PathBuf, String> {
+        // Check if already loaded
+        if let Some(path) = self.loaded_shards.get(&shard_id) {
+            return Ok(path.clone());
+        }
+        
+        // Try to find the shard file
+        let shard_filename = format!("shard-{}.gguf", shard_id);
+        let shard_path = self.shards_dir.join(&shard_filename);
+        
+        if shard_path.exists() {
+            println!("[SHARD] Loading shard {} from: {}", shard_id, shard_path.display());
+            self.loaded_shards.insert(shard_id, shard_path.clone());
+            Ok(shard_path)
+        } else {
+            Err(format!("Shard file not found: {}", shard_path.display()))
+        }
+    }
+    
+    /// Download a shard via torrent (placeholder - will be implemented with actual torrent client)
+    /// This would query the DHT for peers sharing the shard file and download it
+    async fn download_shard_via_torrent(&mut self, shard_id: u32) -> Result<PathBuf, String> {
+        let shard_filename = format!("shard-{}.gguf", shard_id);
+        let shard_path = self.shards_dir.join(&shard_filename);
+        
+        println!("[TORRENT] Attempting to download shard {} via torrent...", shard_id);
+        
+        // TODO: Implement actual torrent download
+        // 1. Query DHT for peers sharing this shard file
+        // 2. Connect to peers
+        // 3. Request file metadata
+        // 4. Download file pieces
+        // 5. Verify and save file
+        
+        // For now, return error indicating torrent download is needed
+        Err(format!("Torrent download not yet implemented. Shard {} needs to be downloaded from other nodes.", shard_id))
     }
 
     fn update_listen_addr(&mut self, addr: &Multiaddr) {
@@ -209,7 +335,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         args.total_layers,
         &args.model_name,
         &args.cluster,
+        &args.shards_dir,
     )));
+    
+    // Try to load the assigned shard if it exists
+    {
+        let mut s = state.write().await;
+        if let Ok(shard_path) = s.load_shard_file(shard_id) {
+            println!("[SHARD] ✓ Loaded assigned shard {} from: {}", shard_id, shard_path.display());
+        } else {
+            println!("[SHARD] ⚠️  Assigned shard {} not found locally. Will download via torrent when needed.", shard_id);
+        }
+    }
 
     // Transport
     let transport = tcp::tokio::Transport::default()
@@ -394,6 +531,103 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             )
                                         }
                                         
+                                        commands::LOAD_SHARD => {
+                                            // Request to load a specific shard for inference
+                                            let requested_shard_id = cmd.params.get("shard_id")
+                                                .and_then(|v| v.as_u64())
+                                                .map(|v| v as u32);
+                                            
+                                            match requested_shard_id {
+                                                Some(shard_id) => {
+                                                    println!("[LOAD_SHARD] Request to load shard {}", shard_id);
+                                                    
+                                                    // Check if already loaded
+                                                    if s.is_shard_loaded(shard_id) {
+                                                        let mut result = HashMap::new();
+                                                        result.insert("shard_id".to_string(), serde_json::json!(shard_id));
+                                                        result.insert("status".to_string(), serde_json::json!("already_loaded"));
+                                                        if let Some(path) = s.loaded_shards.get(&shard_id) {
+                                                            result.insert("path".to_string(), serde_json::json!(path.to_string_lossy()));
+                                                        }
+                                                        
+                                                        CommandResponse::success(
+                                                            &cmd.command,
+                                                            &cmd.request_id,
+                                                            &peer_id.to_string(),
+                                                            &cmd.from,
+                                                            result,
+                                                        )
+                                                    } else {
+                                                        // Try to load from local directory first
+                                                        match s.load_shard_file(shard_id) {
+                                                            Ok(shard_path) => {
+                                                                println!("[LOAD_SHARD] ✓ Loaded shard {} from local directory", shard_id);
+                                                                let mut result = HashMap::new();
+                                                                result.insert("shard_id".to_string(), serde_json::json!(shard_id));
+                                                                result.insert("status".to_string(), serde_json::json!("loaded"));
+                                                                result.insert("path".to_string(), serde_json::json!(shard_path.to_string_lossy()));
+                                                                
+                                                                CommandResponse::success(
+                                                                    &cmd.command,
+                                                                    &cmd.request_id,
+                                                                    &peer_id.to_string(),
+                                                                    &cmd.from,
+                                                                    result,
+                                                                )
+                                                            }
+                                                            Err(e) => {
+                                                                // Shard not found locally - need to download via torrent
+                                                                println!("[LOAD_SHARD] Shard {} not found locally: {}", shard_id, e);
+                                                                println!("[LOAD_SHARD] TODO: Download shard {} via torrent from other nodes", shard_id);
+                                                                
+                                                                // For now, return error indicating torrent download needed
+                                                                // In production, this would trigger torrent download
+                                                                CommandResponse::error(
+                                                                    &cmd.command,
+                                                                    &cmd.request_id,
+                                                                    &peer_id.to_string(),
+                                                                    &cmd.from,
+                                                                    &format!("Shard {} not found. Torrent download required.", shard_id),
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                None => {
+                                                    CommandResponse::error(
+                                                        &cmd.command,
+                                                        &cmd.request_id,
+                                                        &peer_id.to_string(),
+                                                        &cmd.from,
+                                                        "Missing shard_id parameter",
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        
+                                        commands::LIST_FILES => {
+                                            // List available GGUF files for torrent
+                                            let file_list: Vec<serde_json::Value> = s.get_torrent_file_list()
+                                                .iter()
+                                                .map(|f| serde_json::json!({
+                                                    "info_hash": f.info_hash,
+                                                    "filename": f.filename,
+                                                    "size": f.size,
+                                                }))
+                                                .collect();
+                                            
+                                            let mut result = HashMap::new();
+                                            result.insert("files".to_string(), serde_json::json!(file_list));
+                                            
+                                            CommandResponse::success(
+                                                &cmd.command,
+                                                &cmd.request_id,
+                                                &peer_id.to_string(),
+                                                &cmd.from,
+                                                result,
+                                            )
+                                        }
+                                        
                                         commands::EXECUTE_TASK => {
                                             s.handle_inference_request();
                                             
@@ -403,8 +637,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                 .unwrap_or("unknown");
                                             
                                             if task_type == "llama_fragment" || task_type == "ai_inference" {
+                                                // Ensure shard is loaded before processing
+                                                if !s.is_shard_loaded(s.shard_id) {
+                                                    match s.load_shard_file(s.shard_id) {
+                                                        Ok(shard_path) => {
+                                                            println!("[INFERENCE] Loaded shard {} from: {}", s.shard_id, shard_path.display());
+                                                        }
+                                                        Err(e) => {
+                                                            s.complete_request(false);
+                                                            return CommandResponse::error(
+                                                                &cmd.command,
+                                                                &cmd.request_id,
+                                                                &peer_id.to_string(),
+                                                                &cmd.from,
+                                                                &format!("Shard {} not loaded: {}. Use LOAD_SHARD command first.", s.shard_id, e),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                
                                                 // Process the fragment/inference request
-                                                // In production, this would run actual model inference
+                                                // In production, this would run actual model inference using the loaded shard
                                                 
                                                 let mut result = HashMap::new();
                                                 result.insert("output".to_string(), serde_json::json!(
