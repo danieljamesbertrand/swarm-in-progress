@@ -4,6 +4,8 @@
 
 The pipeline coordinator can now **spawn new shard_listener nodes on demand** when shards are missing, enabling true auto-scaling for distributed AI inference.
 
+**Startup Node Spawning**: The web server now automatically spawns nodes for missing shards on startup, ensuring the system is ready for inference immediately.
+
 ## Architecture
 
 ### Current Capabilities
@@ -24,6 +26,32 @@ The pipeline coordinator can now **spawn new shard_listener nodes on demand** wh
    - Step 4: Fallback to single-node full model
 
 ## Usage
+
+### Startup Node Spawning (Automatic)
+
+The web server automatically spawns nodes for missing shards on startup:
+
+```bash
+cargo run --bin web_server
+```
+
+The server will:
+1. Check pipeline status after initialization
+2. Spawn nodes for any missing shards (typically all 4 shards)
+3. Wait for nodes to come online and join the DHT
+4. Be ready for inference requests
+
+You'll see output like:
+```
+[SERVER] Ensuring minimal pipeline is ready...
+[COORDINATOR] Pipeline incomplete. Missing shards: [0, 1, 2, 3]
+[COORDINATOR] Spawning nodes for missing shards...
+[COORDINATOR] ✓ Spawned node for shard 0
+[COORDINATOR] ✓ Spawned node for shard 1
+[COORDINATOR] ✓ Spawned node for shard 2
+[COORDINATOR] ✓ Spawned node for shard 3
+[COORDINATOR] ✓ All nodes are online and pipeline is complete!
+```
 
 ### Basic Setup
 
