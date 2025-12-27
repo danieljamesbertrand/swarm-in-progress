@@ -414,23 +414,31 @@ impl ShardNodeState {
                 }
                 
                 // Save file
-                std::fs::create_dir_all(&download.target_path.parent().unwrap())?;
+                std::fs::create_dir_all(&download.target_path.parent().unwrap())
+                    .map_err(|e| format!("Failed to create directory: {}", e))?;
                 std::fs::write(&download.target_path, &file_data)
                     .map_err(|e| format!("Failed to write file: {}", e))?;
                 
                 println!("[TORRENT] ✓ File saved: {}", download.target_path.display());
                 
-                // Extract shard_id from filename
-                if let Some(shard_id_str) = download.filename.strip_prefix("shard-").and_then(|s| s.strip_suffix(".gguf")) {
-                    if let Ok(shard_id) = shard_id_str.parse::<u32>() {
-                        self.loaded_shards.insert(shard_id, download.target_path.clone());
-                    }
+                // Extract shard_id from filename and get path before removing download
+                let target_path = download.target_path.clone();
+                let shard_id_opt = download.filename.strip_prefix("shard-")
+                    .and_then(|s| s.strip_suffix(".gguf"))
+                    .and_then(|s| s.parse::<u32>().ok());
+                
+                // Drop the mutable borrow of download
+                drop(download);
+                
+                // Now we can modify self.active_downloads and self.loaded_shards
+                if let Some(shard_id) = shard_id_opt {
+                    self.loaded_shards.insert(shard_id, target_path.clone());
                 }
                 
                 // Remove from active downloads
                 self.active_downloads.remove(info_hash);
                 
-                return Ok(Some(download.target_path.clone()));
+                return Ok(Some(target_path));
             }
         }
         
@@ -527,7 +535,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if let Ok(shard_path) = s.load_shard_file(shard_id) {
             println!("[SHARD] ✓ Loaded assigned shard {} from: {}", shard_id, shard_path.display());
         } else {
-            println!("[SHARD] ⚠️  Assigned shard {} not found locally. Will download via torrent when needed.", shard_id);
+            println!("[SHARD] ⚠️  Assigned shard {} not found locally.", shard_id);
+            println!("[SHARD]   Shard will be downloaded via torrent when LOAD_SHARD command is received.");
+            println!("[SHARD]   Or it can be pre-downloaded by querying DHT for available peers.");
         }
     }
 
@@ -623,8 +633,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         swarm.add_external_address(address);
                     }
 
-                    SwarmEvent::ConnectionEstablished { peer_id: connected_peer, .. } => {
-                        println!("[CONNECT] ✓ Connected to: {}", connected_peer);
+                    SwarmEvent::ConnectionEstablished { peer_id: connected_peer, endpoint, .. } => {
+                        let direction = if endpoint.is_dialer() { "outbound" } else { "inbound" };
+                        println!("\n[CONNECT] ═══════════════════════════════════════════════════════════════════════════");
+                        println!("[CONNECT] ✓ Connection established!");
+                        println!("[CONNECT]   Peer ID: {}", connected_peer);
+                        println!("[CONNECT]   Direction: {}", direction);
+                        println!("[CONNECT]   Endpoint: {:?}", endpoint);
+                        println!("[CONNECT] ═══════════════════════════════════════════════════════════════════════════\n");
 
                         if !bootstrapped {
                             // Start Kademlia bootstrap
@@ -637,23 +653,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         
                         // Check if we have pending downloads for this peer
-                        let s = state.read().await;
-                        for (info_hash, download) in &s.active_downloads {
-                            if download.metadata.is_none() {
-                                if let Some(peer_id) = download.peer_id {
-                                    if peer_id == connected_peer {
-                                        drop(s);
-                                        let _ = swarm.behaviour_mut().torrent_response.send_request(
-                                            &connected_peer,
-                                            TorrentMessage::RequestMetadata {
-                                                info_hash: info_hash.clone(),
-                                            }
-                                        );
-                                        println!("[TORRENT] Requested metadata for {} from {}", &info_hash[..16], connected_peer);
-                                        break;
+                        let info_hash_opt = {
+                            let s = state.read().await;
+                            let mut found_info_hash = None;
+                            for (info_hash, download) in &s.active_downloads {
+                                if download.metadata.is_none() {
+                                    if let Some(peer_id) = download.peer_id {
+                                        if peer_id == connected_peer {
+                                            found_info_hash = Some(info_hash.clone());
+                                            break;
+                                        }
                                     }
                                 }
                             }
+                            found_info_hash
+                        };
+                        
+                        if let Some(info_hash) = info_hash_opt {
+                            let _ = swarm.behaviour_mut().torrent_response.send_request(
+                                &connected_peer,
+                                TorrentMessage::RequestMetadata {
+                                    info_hash: info_hash.clone(),
+                                }
+                            );
+                            println!("[TORRENT] Requested metadata for {} from {}", &info_hash[..16], connected_peer);
                         }
                     }
 
@@ -673,9 +696,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     drop(s);
 
                                     if let Err(e) = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
-                                        eprintln!("[DHT] Failed to announce shard: {:?}", e);
+                                        eprintln!("[DHT] ❌ Failed to announce shard: {:?}", e);
                                     } else {
-                                        println!("[DHT] ✓ Announced shard {} to DHT", shard_id);
+                                        println!("\n[DHT] ═══════════════════════════════════════════════════════════════════════════");
+                                        println!("[DHT] ✓✓✓ ANNOUNCED SHARD {} TO DHT ✓✓✓", shard_id);
+                                        println!("[DHT]   Cluster: {}", cluster_name);
+                                        println!("[DHT]   Shard ID: {}", shard_id);
+                                        println!("[DHT]   Peer ID: {}", peer_id);
+                                        println!("[DHT]   Layers: {}-{}", 
+                                            shard_id * (args.total_layers / args.total_shards),
+                                            if shard_id == args.total_shards - 1 { args.total_layers } 
+                                            else { (shard_id + 1) * (args.total_layers / args.total_shards) }
+                                        );
+                                        println!("[DHT] ═══════════════════════════════════════════════════════════════════════════\n");
                                         announced = true;
                                     }
 
@@ -693,14 +726,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 result: kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_record))),
                                 ..
                             }) => {
+                                println!("\n[DISCOVERY] ═══════════════════════════════════════════════════════════════════════════");
+                                println!("[DISCOVERY] 🔍 Found shard record in DHT!");
+                                
                                 // Process discovered shard
                                 let mut s = state.write().await;
                                 if let Some(ann) = s.discovery.process_shard_record(&peer_record.record) {
-                                    println!("[DISCOVERY] Found shard {} at {}", ann.shard_id, ann.peer_id);
+                                    println!("[DISCOVERY] ✓ Processed shard announcement:");
+                                    println!("[DISCOVERY]   Shard ID: {}", ann.shard_id);
+                                    println!("[DISCOVERY]   Peer ID: {}", ann.peer_id);
+                                    println!("[DISCOVERY]   Layers: {}-{}", ann.layer_start, ann.layer_end);
+                                    println!("[DISCOVERY]   Model: {}", ann.model_name);
+                                    println!("[DISCOVERY]   Multiaddr: {}", ann.multiaddr);
                                 }
 
                                 let status = s.discovery.status();
-                                println!("[PIPELINE] {}", status);
+                                println!("[PIPELINE] Status: {}", status);
+                                println!("[DISCOVERY] ═══════════════════════════════════════════════════════════════════════════\n");
                             }
 
                             ShardBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
@@ -715,10 +757,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 message: request_response::Message::Request { request, channel, .. },
                                 ..
                             }) => {
-                                println!("[REQUEST] Received from {}: {}", peer, request.message);
+                                println!("\n[REQUEST] ═══════════════════════════════════════════════════════════════════════════");
+                                println!("[REQUEST] 📥 Received message from peer: {}", peer);
+                                println!("[REQUEST] Message: {}", request.message);
+                                println!("[REQUEST] ═══════════════════════════════════════════════════════════════════════════\n");
                                 
                                 // Parse command from message
                                 if let Ok(cmd) = serde_json::from_str::<Command>(&request.message) {
+                                    println!("[COMMAND] ✓ Parsed command: {}", cmd.command);
+                                    println!("[COMMAND]   Request ID: {}", cmd.request_id);
+                                    println!("[COMMAND]   From: {} → To: {}", cmd.from, peer);
+                                    println!("[COMMAND]   Params: {:?}", cmd.params);
                                     let mut s = state.write().await;
                                     
                                     let response = match cmd.command.as_str() {
@@ -800,7 +849,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                                         
                                                                         // Request metadata will be sent in event loop
                                                                         // Store pending request
-                                                                        drop(s);
                                                                         
                                                                         CommandResponse::success(
                                                                             &cmd.command,
@@ -860,6 +908,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         }
                                         
                                         commands::EXECUTE_TASK => {
+                                            println!("\n[EXECUTE_TASK] ═══════════════════════════════════════════════════════════════════════════");
+                                            println!("[EXECUTE_TASK] Processing inference task...");
+                                            
                                             s.handle_inference_request();
                                             
                                             // Check task type
@@ -867,47 +918,117 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or("unknown");
                                             
+                                            println!("[EXECUTE_TASK]   Task type: {}", task_type);
+                                            
                                             if task_type == "llama_fragment" || task_type == "ai_inference" {
+                                                let input_data = cmd.params.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
+                                                let max_tokens = cmd.params.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(256);
+                                                let temperature = cmd.params.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7);
+                                                let current_shard_id = cmd.params.get("shard_id").and_then(|v| v.as_u64()).unwrap_or(s.shard_id as u64) as u32;
+                                                let layer_start = cmd.params.get("layer_start").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                                let layer_end = cmd.params.get("layer_end").and_then(|v| v.as_u64()).unwrap_or(32) as u32;
+                                                
+                                                println!("[EXECUTE_TASK]   Shard ID: {}", current_shard_id);
+                                                println!("[EXECUTE_TASK]   Layers: {}-{}", layer_start, layer_end);
+                                                println!("[EXECUTE_TASK]   Input data length: {} chars", input_data.len());
+                                                println!("[EXECUTE_TASK]   Max tokens: {}, Temperature: {:.2}", max_tokens, temperature);
+                                                println!("[EXECUTE_TASK]   Processing inference through shard {}...", current_shard_id);
                                                 // Ensure shard is loaded before processing
-                                                if !s.is_shard_loaded(s.shard_id) {
-                                                    match s.load_shard_file(s.shard_id) {
+                                                let current_shard_id = s.shard_id;
+                                                let shard_load_error = if !s.is_shard_loaded(current_shard_id) {
+                                                    match s.load_shard_file(current_shard_id) {
                                                         Ok(shard_path) => {
-                                                            println!("[INFERENCE] Loaded shard {} from: {}", s.shard_id, shard_path.display());
+                                                            println!("[INFERENCE] Loaded shard {} from: {}", current_shard_id, shard_path.display());
+                                                            None
                                                         }
                                                         Err(e) => {
                                                             s.complete_request(false);
-                                                            return CommandResponse::error(
+                                                            Some(CommandResponse::error(
                                                                 &cmd.command,
                                                                 &cmd.request_id,
                                                                 &peer_id.to_string(),
                                                                 &cmd.from,
-                                                                &format!("Shard {} not loaded: {}. Use LOAD_SHARD command first.", s.shard_id, e),
-                                                            );
+                                                                &format!("Shard {} not loaded: {}. Use LOAD_SHARD command first.", current_shard_id, e),
+                                                            ))
                                                         }
                                                     }
+                                                } else {
+                                                    None
+                                                };
+                                                
+                                                if let Some(error_response) = shard_load_error {
+                                                    error_response
+                                                } else {
+                                                    // Process the fragment/inference request
+                                                    // Extract input data from command
+                                                    let input_data = cmd.params.get("input_data")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string();
+                                                    
+                                                    // Get inference parameters
+                                                    let max_tokens = cmd.params.get("max_tokens")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(100) as u32;
+                                                    let temperature = cmd.params.get("temperature")
+                                                        .and_then(|v| v.as_f64())
+                                                        .unwrap_or(0.7) as f32;
+                                                    
+                                                    println!("[EXECUTE_TASK] Processing on shard {} (layers {}-{}): {}",
+                                                        s.shard_id,
+                                                        s.announcement.layer_start,
+                                                        s.announcement.layer_end,
+                                                        if input_data.len() > 50 {
+                                                            format!("{}...", &input_data[..50])
+                                                        } else {
+                                                            input_data.clone()
+                                                        }
+                                                    );
+                                                    
+                                                    // In production, this would:
+                                                    // 1. Load the .gguf shard file using llama.cpp or candle
+                                                    // 2. Process the input through the shard's layers
+                                                    // 3. Return the processed activations/output
+                                                    
+                                                    // For now, simulate processing with the loaded shard
+                                                    // The shard file is loaded and ready at: s.loaded_shards.get(&s.shard_id)
+                                                    let shard_path = s.loaded_shards.get(&s.shard_id)
+                                                        .map(|p| p.to_string_lossy().to_string())
+                                                        .unwrap_or_else(|| "unknown".to_string());
+                                                    
+                                                    // Simulate processing time based on input length
+                                                    let processing_time = 50.0 + (input_data.len() as f64 * 0.1);
+                                                    
+                                                    // Create output that shows the question was processed through this shard
+                                                    // In pipeline parallelism, each shard processes the activations from the previous shard
+                                                    let output = if s.shard_id == 0 {
+                                                        // First shard: process the input question
+                                                        format!("[Shard {} processed input: '{}' through layers {}-{} using {}]",
+                                                            s.shard_id, input_data, s.announcement.layer_start, s.announcement.layer_end, shard_path)
+                                                    } else {
+                                                        // Subsequent shards: process activations from previous shard
+                                                        format!("[Shard {} processed activations through layers {}-{} using {}]",
+                                                            s.shard_id, s.announcement.layer_start, s.announcement.layer_end, shard_path)
+                                                    };
+                                                    
+                                                    let mut result = HashMap::new();
+                                                    result.insert("output".to_string(), serde_json::json!(output));
+                                                    result.insert("shard_id".to_string(), serde_json::json!(s.shard_id));
+                                                    result.insert("layer_start".to_string(), serde_json::json!(s.announcement.layer_start));
+                                                    result.insert("layer_end".to_string(), serde_json::json!(s.announcement.layer_end));
+                                                    result.insert("tokens_generated".to_string(), serde_json::json!(max_tokens.min(50)));
+                                                    result.insert("processing_time_ms".to_string(), serde_json::json!(processing_time));
+                                                    
+                                                    s.complete_request(true);
+                                                    
+                                                    CommandResponse::success(
+                                                        &cmd.command,
+                                                        &cmd.request_id,
+                                                        &peer_id.to_string(),
+                                                        &cmd.from,
+                                                        result,
+                                                    )
                                                 }
-                                                
-                                                // Process the fragment/inference request
-                                                // In production, this would run actual model inference using the loaded shard
-                                                
-                                                let mut result = HashMap::new();
-                                                result.insert("output".to_string(), serde_json::json!(
-                                                    format!("[Shard {} processed layers {}-{}]", 
-                                                        s.shard_id, s.announcement.layer_start, s.announcement.layer_end)
-                                                ));
-                                                result.insert("shard_id".to_string(), serde_json::json!(s.shard_id));
-                                                result.insert("tokens_generated".to_string(), serde_json::json!(50));
-                                                result.insert("processing_time_ms".to_string(), serde_json::json!(100.0));
-                                                
-                                                s.complete_request(true);
-                                                
-                                                CommandResponse::success(
-                                                    &cmd.command,
-                                                    &cmd.request_id,
-                                                    &peer_id.to_string(),
-                                                    &cmd.from,
-                                                    result,
-                                                )
                                             } else {
                                                 s.complete_request(false);
                                                 CommandResponse::error(
@@ -918,7 +1039,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     &format!("Unknown task type: {}", task_type),
                                                 )
                                             }
-                                        }
                                         
                                         _ => {
                                             CommandResponse::error(
@@ -929,17 +1049,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                 &format!("Unknown command: {}", cmd.command),
                                             )
                                         }
+                                        };
+                                        
+                                        // Get status string before dropping s
+                                        let status_string = s.get_status_string();
+                                        
+                                        println!("\n[RESPONSE] ═══════════════════════════════════════════════════════════════════════════");
+                                        println!("[RESPONSE] 📤 Sending response to peer: {}", peer);
+                                        println!("[RESPONSE]   Command: {}", cmd.command);
+                                        println!("[RESPONSE]   Request ID: {}", cmd.request_id);
+                                        println!("[RESPONSE]   Status: {:?}", response.status);
+                                        if let Some(ref result) = response.result {
+                                            println!("[RESPONSE]   Result keys: {:?}", result.keys().collect::<Vec<_>>());
+                                            if let Some(output) = result.get("output").and_then(|v| v.as_str()) {
+                                                println!("[RESPONSE]   Output (first 200 chars): {}", 
+                                                    if output.len() > 200 { &output[..200] } else { output });
+                                            }
+                                        }
+                                        if let Some(ref error) = response.error {
+                                            println!("[RESPONSE]   Error: {}", error);
+                                        }
+                                        
+                                        // Send response as JsonMessage
+                                        let response_json = serde_json::to_string(&response).unwrap_or_default();
+                                        let response_msg = JsonMessage::new(peer_id.to_string(), response_json);
+                                        if let Err(e) = swarm.behaviour_mut().request_response.send_response(
+                                            channel,
+                                            response_msg,
+                                        ) {
+                                            eprintln!("[RESPONSE] ❌ Failed to send response: {:?}", e);
+                                        } else {
+                                            println!("[RESPONSE] ✓ Response sent successfully");
+                                        }
+                                        println!("[RESPONSE] ═══════════════════════════════════════════════════════════════════════════\n");
+                                        
+                                        println!("[STATUS] {}", status_string);
+                                        response
                                     };
-                                    
-                                    // Send response as JsonMessage
-                                    let response_json = serde_json::to_string(&response).unwrap_or_default();
-                                    let response_msg = JsonMessage::new(peer_id.to_string(), response_json);
-                                    let _ = swarm.behaviour_mut().request_response.send_response(
-                                        channel,
-                                        response_msg,
-                                    );
-                                    
-                                    println!("[STATUS] {}", s.get_status_string());
+                                } else {
+                                    eprintln!("[REQUEST] ❌ Failed to parse command JSON: {}", request.message);
                                 }
                             }
 
@@ -950,7 +1098,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             // Handle torrent protocol messages
                             ShardBehaviourEvent::TorrentResponse(request_response::Event::Message {
                                 peer,
-                                message: request_response::Message::Request { request, channel },
+                                message: request_response::Message::Request { request, channel, request_id: _ },
                                 ..
                             }) => {
                                 // Handle incoming torrent requests (serving files)
@@ -959,7 +1107,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 match request {
                                     TorrentMessage::ListFiles => {
                                         let files: Vec<TorrentFileInfo> = s.get_torrent_file_list()
-                                            .iter()
+                                            .into_iter()
                                             .cloned()
                                             .collect();
                                         

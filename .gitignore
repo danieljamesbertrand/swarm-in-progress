@@ -17,3 +17,10 @@ Thumbs.db
 # Logs
 *.log
 
+# Model files (too large for GitHub)
+models_cache/
+*.gguf
+*.safetensors
+
+# Embedded git repositories
+llama.cpp/

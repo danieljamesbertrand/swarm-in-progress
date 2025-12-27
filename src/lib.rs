@@ -49,7 +49,7 @@ pub use kademlia_shard_discovery::{
 pub use pipeline_coordinator::{
     PipelineCoordinator, PipelineStrategy, PipelineError,
     InferenceRequest, InferenceResponse, CoordinatorState, CoordinatorStats,
-    DynamicShardLoader, SingleNodeFallback,
+    DynamicShardLoader, SingleNodeFallback, NodeSpawner,
 };
 pub use quic_transport::{
     create_quic_transport, create_tcp_transport, create_dual_transport,

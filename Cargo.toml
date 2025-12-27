@@ -2,7 +2,6 @@
 name = "punch-simple"
 version = "0.1.0"
 edition = "2021"
-authors = ["punch-simple"]
 description = "Simple libp2p rendezvous client and server"
 
 [dependencies]
@@ -28,7 +27,6 @@ hex = "0.4"
 tokio-process = "0.2"
 uuid = { version = "1.10", features = ["v4"] }
 tokio-tungstenite = "0.21"
-
 [features]
 default = []
 candle = ["candle-core", "candle-transformers", "candle-nn"]
@@ -83,3 +81,7 @@ path = "examples/download_shards.rs"
 [[example]]
 name = "split_gguf_rust"
 path = "examples/split_gguf_rust.rs"
+
+[[example]]
+name = "rust_real_inference"
+path = "examples/rust_real_inference.rs"

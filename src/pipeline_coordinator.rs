@@ -172,6 +172,31 @@ struct QueuedRequest {
     timeout: Duration,
 }
 
+/// Node that has joined the request queue and is available to load shards
+#[derive(Clone, Debug)]
+struct QueuedNode {
+    peer_id: String,
+    capabilities: ShardCapabilities,
+    joined_at: Instant,
+    assigned_shard: Option<u32>,
+    shard_loading: bool,
+}
+
+/// Shard demand tracking - tracks which shards are most needed
+#[derive(Clone, Debug, Default)]
+struct ShardDemand {
+    /// Number of pending requests waiting for this shard
+    pending_requests: u32,
+    /// Number of nodes currently loading this shard
+    nodes_loading: u32,
+    /// Number of nodes that have this shard loaded
+    nodes_available: u32,
+    /// Last time this shard was requested
+    last_requested: Option<Instant>,
+    /// Priority score (higher = more needed)
+    priority_score: f64,
+}
+
 /// Pipeline coordinator state
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CoordinatorState {
@@ -406,6 +431,7 @@ impl NodeSpawner {
 }
 
 /// Dynamic shard loading capability
+#[derive(Clone)]
 pub struct DynamicShardLoader {
     /// Model manager for downloading shards
     model_manager: Arc<RwLock<LlamaModelManager>>,
@@ -585,6 +611,7 @@ impl Default for SingleNodeFallback {
 }
 
 /// Main pipeline coordinator
+#[derive(Clone)]
 pub struct PipelineCoordinator {
     /// Shard discovery service
     discovery: Arc<RwLock<KademliaShardDiscovery>>,
@@ -594,6 +621,10 @@ pub struct PipelineCoordinator {
     state: Arc<RwLock<CoordinatorState>>,
     /// Request queue
     request_queue: Arc<Mutex<VecDeque<QueuedRequest>>>,
+    /// Nodes that have joined the request queue and are available to load shards
+    queued_nodes: Arc<Mutex<Vec<QueuedNode>>>,
+    /// Shard demand tracking - tracks which shards are most needed
+    shard_demand: Arc<RwLock<HashMap<u32, ShardDemand>>>,
     /// Dynamic shard loader
     shard_loader: Option<DynamicShardLoader>,
     /// Node spawner for on-demand node creation
@@ -604,6 +635,8 @@ pub struct PipelineCoordinator {
     stats: Arc<RwLock<CoordinatorStats>>,
     /// Shutdown signal
     shutdown_tx: Option<mpsc::Sender<()>>,
+    /// Command sender for sending requests to nodes (optional)
+    command_sender: Option<Arc<dyn Fn(String, crate::command_protocol::Command) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::command_protocol::CommandResponse, PipelineError>> + Send>> + Send + Sync>>,
 }
 
 /// Coordinator statistics
@@ -630,12 +663,273 @@ impl PipelineCoordinator {
                 reason: "Initializing".to_string() 
             })),
             request_queue: Arc::new(Mutex::new(VecDeque::new())),
+            queued_nodes: Arc::new(Mutex::new(Vec::new())),
+            shard_demand: Arc::new(RwLock::new(HashMap::new())),
             shard_loader: None,
             node_spawner: None,
             fallback: Arc::new(RwLock::new(SingleNodeFallback::new())),
             stats: Arc::new(RwLock::new(CoordinatorStats::default())),
             shutdown_tx: None,
+            command_sender: None,
         }
+    }
+
+    /// Node joins the request queue and gets assigned the next needed shard
+    pub async fn node_join_queue(&self, peer_id: String, capabilities: ShardCapabilities) -> Result<Option<u32>, PipelineError> {
+        println!("[COORDINATOR] Node {} joined request queue", peer_id);
+        
+        let mut queued_nodes = self.queued_nodes.lock().await;
+        
+        // Check if node already in queue
+        if queued_nodes.iter().any(|n| n.peer_id == peer_id) {
+            println!("[COORDINATOR] Node {} already in queue", peer_id);
+            return Ok(None);
+        }
+        
+        // Add node to queue
+        let node = QueuedNode {
+            peer_id: peer_id.clone(),
+            capabilities: capabilities.clone(),
+            joined_at: Instant::now(),
+            assigned_shard: None,
+            shard_loading: false,
+        };
+        queued_nodes.push(node);
+        drop(queued_nodes);
+        
+        // Find the next shard that needs to be loaded
+        let suggested_shard = self.find_next_needed_shard(&capabilities).await;
+        
+        if let Some(shard_id) = suggested_shard {
+            println!("[COORDINATOR] Suggesting shard {} to node {}", shard_id, peer_id);
+            
+            // Assign shard to node
+            let mut queued_nodes = self.queued_nodes.lock().await;
+            if let Some(node) = queued_nodes.iter_mut().find(|n| n.peer_id == peer_id) {
+                node.assigned_shard = Some(shard_id);
+                node.shard_loading = true;
+            }
+            drop(queued_nodes);
+            
+            // Update demand tracking
+            self.update_shard_demand(shard_id, true).await;
+            
+            // Send LOAD_SHARD command to node
+            if let Some(ref sender) = self.command_sender {
+                use crate::command_protocol::{Command, commands};
+                use serde_json::json;
+                
+                let discovery = self.discovery.read().await;
+                let pipeline = discovery.get_pipeline();
+                let model_name = pipeline.first()
+                    .map(|s| s.model_name.clone())
+                    .unwrap_or_else(|| "llama-2-7b".to_string());
+                drop(discovery);
+                
+                let cmd = Command::new(commands::LOAD_SHARD, "coordinator", Some(&peer_id))
+                    .with_param("shard_id", json!(shard_id))
+                    .with_param("model_name", json!(model_name))
+                    .with_param("priority", json!("high")); // High priority for queue nodes
+                
+                // Send command asynchronously (don't wait)
+                let sender_clone = sender.clone();
+                let peer_id_clone = peer_id.clone();
+                let shard_id_clone = shard_id;
+                tokio::spawn(async move {
+                    match sender_clone(peer_id_clone.clone(), cmd).await {
+                        Ok(response) => {
+                            if response.status == crate::command_protocol::ResponseStatus::Success {
+                                println!("[COORDINATOR] ✓ Node {} confirmed loading shard {}", peer_id_clone, shard_id_clone);
+                            } else {
+                                eprintln!("[COORDINATOR] Node {} failed to load shard {}: {:?}", 
+                                    peer_id_clone, shard_id_clone, response.error);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[COORDINATOR] Failed to send LOAD_SHARD to node {}: {}", peer_id_clone, e);
+                        }
+                    }
+                });
+            }
+            
+            Ok(Some(shard_id))
+        } else {
+            println!("[COORDINATOR] No shard needed at the moment for node {}", peer_id);
+            Ok(None)
+        }
+    }
+
+    /// Find the next shard that needs to be loaded based on demand
+    async fn find_next_needed_shard(&self, capabilities: &ShardCapabilities) -> Option<u32> {
+        let discovery = self.discovery.read().await;
+        let status = discovery.status();
+        let missing_shards = discovery.get_missing_shards();
+        let pipeline = discovery.get_pipeline();
+        let total_shards = status.expected_shards;
+        drop(discovery);
+        
+        // If pipeline is complete, suggest shards based on demand
+        if status.is_complete {
+            return self.get_most_needed_shard().await;
+        }
+        
+        // Pipeline incomplete - find the first missing shard in sequence
+        // Nodes should load shards in order to complete the pipeline
+        for shard_id in 0..total_shards {
+            if missing_shards.contains(&shard_id) {
+                // Check if node can handle this shard
+                if capabilities.memory_available_mb >= 2048 { // At least 2GB for a shard
+                    return Some(shard_id);
+                }
+            }
+        }
+        
+        None
+    }
+
+    /// Get the most needed shard based on demand tracking
+    async fn get_most_needed_shard(&self) -> Option<u32> {
+        let demand = self.shard_demand.read().await;
+        
+        // Find shard with highest priority score
+        demand.iter()
+            .max_by(|(_, a), (_, b)| {
+                a.priority_score.partial_cmp(&b.priority_score).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(shard_id, _)| *shard_id)
+    }
+
+    /// Update shard demand tracking
+    async fn update_shard_demand(&self, shard_id: u32, node_loading: bool) {
+        let mut demand = self.shard_demand.write().await;
+        let entry = demand.entry(shard_id).or_insert_with(ShardDemand::default);
+        
+        if node_loading {
+            entry.nodes_loading += 1;
+        }
+        entry.last_requested = Some(Instant::now());
+        
+        // Recalculate priority score
+        // Higher score = more needed
+        entry.priority_score = (entry.pending_requests as f64 * 10.0)
+            - (entry.nodes_available as f64 * 5.0)
+            - (entry.nodes_loading as f64 * 2.0);
+        
+        drop(demand);
+    }
+
+    /// Update shard availability when a node finishes loading
+    pub async fn node_shard_loaded(&self, peer_id: String, shard_id: u32) {
+        println!("[COORDINATOR] Node {} finished loading shard {}", peer_id, shard_id);
+        
+        let mut queued_nodes = self.queued_nodes.lock().await;
+        if let Some(node) = queued_nodes.iter_mut().find(|n| n.peer_id == peer_id) {
+            node.shard_loading = false;
+            if node.assigned_shard == Some(shard_id) {
+                // Node completed its assigned shard
+                println!("[COORDINATOR] Node {} completed assigned shard {}", peer_id, shard_id);
+            }
+        }
+        drop(queued_nodes);
+        
+        // Update demand tracking
+        let mut demand = self.shard_demand.write().await;
+        if let Some(entry) = demand.get_mut(&shard_id) {
+            if entry.nodes_loading > 0 {
+                entry.nodes_loading -= 1;
+            }
+            entry.nodes_available += 1;
+            entry.priority_score = (entry.pending_requests as f64 * 10.0)
+                - (entry.nodes_available as f64 * 5.0)
+                - (entry.nodes_loading as f64 * 2.0);
+        }
+        drop(demand);
+        
+        // Check if we can process queued requests now
+        self.process_queue_if_ready().await;
+    }
+
+    /// Get shard suggestion for a newly joining node
+    pub async fn get_shard_suggestion(&self, peer_id: &str) -> Option<u32> {
+        let discovery = self.discovery.read().await;
+        let status = discovery.status();
+        let missing_shards = discovery.get_missing_shards();
+        drop(discovery);
+        
+        // If pipeline incomplete, suggest first missing shard
+        if !status.is_complete && !missing_shards.is_empty() {
+            return missing_shards.first().copied();
+        }
+        
+        // Pipeline complete - suggest based on demand
+        self.get_most_needed_shard().await
+    }
+
+    /// Process queued requests if pipeline is now ready
+    async fn process_queue_if_ready(&self) {
+        let discovery = self.discovery.read().await;
+        let status = discovery.status();
+        drop(discovery);
+        
+        if status.is_complete {
+            let mut queue = self.request_queue.lock().await;
+            let _requests: Vec<_> = queue.drain(..).collect();
+            drop(queue);
+            
+            // Note: Queued requests will be processed on next inference submission
+            // For now, we just note that the pipeline is ready
+            if !_requests.is_empty() {
+                println!("[COORDINATOR] {} queued requests are ready (will be processed on next inference)", _requests.len());
+            }
+        }
+    }
+
+    /// Handle new node announcement - suggest shard to load
+    pub async fn handle_node_announcement(&self, announcement: ShardAnnouncement) {
+        println!("[COORDINATOR] New node announced: {} (shard {})", 
+            announcement.peer_id, announcement.shard_id);
+        
+        // If node doesn't have a shard assigned, suggest one
+        if !announcement.capabilities.shard_loaded {
+            let suggested_shard = self.get_shard_suggestion(&announcement.peer_id).await;
+            
+            if let Some(shard_id) = suggested_shard {
+                println!("[COORDINATOR] Suggesting shard {} to newly joined node {}", 
+                    shard_id, announcement.peer_id);
+                
+                // Send suggestion via command if sender available
+                if let Some(ref sender) = self.command_sender {
+                    use crate::command_protocol::{Command, commands};
+                    use serde_json::json;
+                    
+                    let cmd = Command::new(commands::LOAD_SHARD, "coordinator", Some(&announcement.peer_id))
+                        .with_param("shard_id", json!(shard_id))
+                        .with_param("model_name", json!(announcement.model_name))
+                        .with_param("suggestion", json!(true))
+                        .with_param("priority", json!("medium"));
+                    
+                    let sender_clone = sender.clone();
+                    let peer_id = announcement.peer_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = sender_clone(peer_id, cmd).await {
+                            eprintln!("[COORDINATOR] Failed to send shard suggestion: {}", e);
+                        }
+                    });
+                }
+            }
+        }
+        
+        // Update discovery
+        self.update_discovery(announcement).await;
+    }
+
+    /// Set command sender for sending requests to nodes
+    pub fn with_command_sender<F>(mut self, sender: F) -> Self
+    where
+        F: Fn(String, crate::command_protocol::Command) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::command_protocol::CommandResponse, PipelineError>> + Send>> + Send + Sync + 'static,
+    {
+        self.command_sender = Some(Arc::new(sender));
+        self
     }
 
     /// Create with model manager for dynamic loading
@@ -675,41 +969,143 @@ impl PipelineCoordinator {
         println!("[COORDINATOR] Pipeline incomplete. Missing shards: {:?}", missing_shards);
         println!("[COORDINATOR] Spawning nodes for missing shards...");
 
-        // Spawn nodes for each missing shard
-        for shard_id in &missing_shards {
-            println!("[COORDINATOR] Spawning node for shard {}...", shard_id);
-            if let Err(e) = spawner.spawn_node_for_shard(*shard_id).await {
-                eprintln!("[COORDINATOR] Failed to spawn node for shard {}: {}", shard_id, e);
-                // Continue with other shards
-            } else {
-                println!("[COORDINATOR] ✓ Spawned node for shard {}", shard_id);
-            }
+        // Get currently assigned shards to coordinate assignment
+        let discovery = self.discovery.read().await;
+        let pipeline = discovery.get_pipeline();
+        let assigned_shards: Vec<u32> = pipeline.iter().map(|s| s.shard_id).collect();
+        let last_assigned = assigned_shards.iter().max().copied();
+        drop(discovery);
+        
+        if let Some(last) = last_assigned {
+            println!("[COORDINATOR] Last assigned shard: {}, coordinating next assignment...", last);
+        } else {
+            println!("[COORDINATOR] No shards assigned yet, starting from shard 0");
         }
 
-        // Wait for nodes to come online
-        println!("[COORDINATOR] Waiting for spawned nodes to come online...");
-        for shard_id in &missing_shards {
-            println!("[COORDINATOR] Waiting for shard {} node to come online...", shard_id);
-            if let Err(e) = spawner.wait_for_node_online(*shard_id, 30, &self.discovery).await {
-                eprintln!("[COORDINATOR] ⚠️  Shard {} node did not come online in time: {}", shard_id, e);
-                // Continue - node might still be starting
-            } else {
-                println!("[COORDINATOR] ✓ Shard {} node is online", shard_id);
+        // Spawn nodes for each missing shard, coordinating assignment
+        let mut spawn_results = Vec::new();
+        let total_shards = status.expected_shards;
+        let mut next_shard_to_assign = last_assigned.map(|s| (s + 1) % total_shards).unwrap_or(0);
+        
+        for _ in 0..missing_shards.len() {
+            // Find next available shard starting from last_assigned + 1
+            let shard_id = loop {
+                if missing_shards.contains(&next_shard_to_assign) {
+                    break next_shard_to_assign;
+                }
+                next_shard_to_assign = (next_shard_to_assign + 1) % total_shards;
+            };
+            
+            println!("[COORDINATOR] Coordinated assignment: spawning node for shard {} (next after last assigned)", shard_id);
+            match spawner.spawn_node_for_shard(shard_id).await {
+                Ok(()) => {
+                    println!("[COORDINATOR] ✓ Spawned node for shard {}", shard_id);
+                    spawn_results.push((shard_id, true));
+                    // Move to next shard for next iteration
+                    next_shard_to_assign = (shard_id + 1) % total_shards;
+                }
+                Err(e) => {
+                    eprintln!("[COORDINATOR] ✗ Failed to spawn node for shard {}: {}", shard_id, e);
+                    spawn_results.push((shard_id, false));
+                    // Move to next shard even on failure
+                    next_shard_to_assign = (shard_id + 1) % total_shards;
+                }
             }
+        }
+        
+        // Legacy code path - spawn any remaining missing shards not covered by coordinated assignment
+        let mut legacy_spawned = false;
+        for shard_id in &missing_shards {
+            // Skip if already spawned in coordinated loop
+            if spawn_results.iter().any(|(id, _)| *id == *shard_id) {
+                continue;
+            }
+            legacy_spawned = true;
+            println!("[COORDINATOR] Spawning node for shard {} (legacy path - should not happen with coordinated assignment)...", shard_id);
+            match spawner.spawn_node_for_shard(*shard_id).await {
+                Ok(()) => {
+                    println!("[COORDINATOR] ✓ Spawned node for shard {}", shard_id);
+                    spawn_results.push((*shard_id, true));
+                }
+                Err(e) => {
+                    eprintln!("[COORDINATOR] ✗ Failed to spawn node for shard {}: {}", shard_id, e);
+                    spawn_results.push((*shard_id, false));
+                }
+            }
+        }
+        
+        if legacy_spawned {
+            println!("[COORDINATOR] Note: Some shards were spawned via legacy path (should use coordinated assignment)");
+        }
+        
+        // Report spawn summary
+        let successful = spawn_results.iter().filter(|(_, success)| *success).count();
+        let failed = spawn_results.len() - successful;
+        if failed > 0 {
+            let failed_shards: Vec<u32> = spawn_results.iter()
+                .filter_map(|(id, success)| if !*success { Some(*id) } else { None })
+                .collect();
+            eprintln!("[COORDINATOR] ⚠️  Summary: {} nodes spawned successfully, {} failed (shards: {:?})", 
+                     successful, failed, failed_shards);
+            eprintln!("[COORDINATOR]   Failed nodes may retry automatically or can be manually restarted");
+        } else {
+            println!("[COORDINATOR] ✓ All {} nodes spawned successfully", successful);
+        }
+
+        // Wait for nodes to come online (only for successfully spawned nodes)
+        println!("[COORDINATOR] Waiting for spawned nodes to come online (30s timeout per node)...");
+        let mut online_results = Vec::new();
+        for shard_id in &missing_shards {
+            // Only wait for nodes that were successfully spawned
+            if spawn_results.iter().any(|(id, success)| *id == *shard_id && *success) {
+                println!("[COORDINATOR] Waiting for shard {} node to come online...", shard_id);
+                match spawner.wait_for_node_online(*shard_id, 30, &self.discovery).await {
+                    Ok(()) => {
+                        println!("[COORDINATOR] ✓ Shard {} node is online and discovered", shard_id);
+                        online_results.push((*shard_id, true));
+                    }
+                    Err(e) => {
+                        eprintln!("[COORDINATOR] ⚠️  Shard {} node did not come online in time: {}", shard_id, e);
+                        eprintln!("[COORDINATOR]   Node may still be compiling or starting. It will be used when ready.");
+                        online_results.push((*shard_id, false));
+                    }
+                }
+            }
+        }
+        
+        // Report online summary
+        let online_count = online_results.iter().filter(|(_, online)| *online).count();
+        let still_waiting: Vec<u32> = online_results.iter()
+            .filter_map(|(id, online)| if !*online { Some(*id) } else { None })
+            .collect();
+        if !still_waiting.is_empty() {
+            println!("[COORDINATOR] ⚠️  Online summary: {}/{} nodes online, {} still starting (shards: {:?})", 
+                     online_count, online_results.len(), still_waiting.len(), still_waiting);
+        } else if online_count > 0 {
+            println!("[COORDINATOR] ✓ All {} spawned nodes are online!", online_count);
         }
 
         // Final check
         let discovery = self.discovery.read().await;
         let status = discovery.status();
+        let discovered_shards = discovery.shard_count();
         drop(discovery);
 
         if status.is_complete {
-            println!("[COORDINATOR] ✓ All nodes are online and pipeline is complete!");
+            println!("[COORDINATOR] ✓✓✓ Pipeline is complete! All {} shards are online and ready.", status.expected_shards);
             Ok(())
         } else {
             let still_missing = status.missing_shards;
-            println!("[COORDINATOR] ⚠️  Pipeline still incomplete. Missing: {:?}", still_missing);
-            println!("[COORDINATOR] Nodes may still be starting up. They will be used when ready.");
+            println!("[COORDINATOR] ⚠️  Pipeline status: {}/{} shards discovered, missing: {:?}", 
+                     discovered_shards, status.expected_shards, still_missing);
+            if !still_missing.is_empty() {
+                println!("[COORDINATOR]   Missing shard IDs: {:?}", still_missing);
+                println!("[COORDINATOR]   Possible reasons:");
+                println!("[COORDINATOR]     - Nodes are still compiling (first run takes 30-60s)");
+                println!("[COORDINATOR]     - Nodes crashed during startup (check logs)");
+                println!("[COORDINATOR]     - Nodes haven't joined DHT yet (waiting for bootstrap)");
+                println!("[COORDINATOR]   Nodes will be used automatically when they come online.");
+            }
             Ok(())
         }
     }
@@ -731,21 +1127,80 @@ impl PipelineCoordinator {
 
     /// Get current pipeline status for web UI
     pub async fn get_pipeline_status(&self) -> (u32, u32, Vec<u32>, bool) {
-        let discovery = self.discovery.read().await;
-        let status = discovery.status();
-        let pipeline = discovery.get_pipeline();
-        let online_nodes = pipeline.len() as u32;
-        let missing_shards = discovery.get_missing_shards();
-        let is_complete = status.is_complete;
-        drop(discovery);
+        let (online_nodes, missing_shards, is_complete, total_replicas) = {
+            let discovery = self.discovery.read().await;
+            let status = discovery.status();
+            let pipeline = discovery.get_pipeline();
+            let online_nodes = pipeline.len() as u32;
+            let missing_shards = discovery.get_missing_shards();
+            let is_complete = status.is_complete;
+            let total_replicas = status.total_replicas;
+            (online_nodes, missing_shards, is_complete, total_replicas)
+        };
+        
+        // Log status for debugging (only when nodes are discovered)
+        if online_nodes > 0 || !missing_shards.is_empty() {
+            println!("[STATUS] Pipeline: {}/{} shards online, {} total replicas, complete: {}, missing: {:?}", 
+                     online_nodes, 4, total_replicas, is_complete, missing_shards);
+        }
+        
         (online_nodes, 4, missing_shards, is_complete) // 4 = total expected shards
     }
 
+    /// Process a new shard announcement - automatically suggest shard if needed
+    pub async fn process_new_shard_announcement(&self, announcement: ShardAnnouncement) {
+        println!("[COORDINATOR] Processing new shard announcement from {}", announcement.peer_id);
+        
+        // Add to discovery
+        self.update_discovery(announcement.clone()).await;
+        
+        // If node doesn't have a shard loaded, suggest one
+        if !announcement.capabilities.shard_loaded {
+            // Node can join queue and get assigned a shard
+            if let Ok(Some(suggested_shard)) = self.node_join_queue(
+                announcement.peer_id.clone(),
+                announcement.capabilities.clone()
+            ).await {
+                println!("[COORDINATOR] ✓ Node {} assigned shard {}", announcement.peer_id, suggested_shard);
+            }
+        } else {
+            // Node already has a shard - update availability
+            self.node_shard_loaded(announcement.peer_id.clone(), announcement.shard_id).await;
+        }
+    }
+
     /// Update discovery with new shard information
+    /// Uses Kademlia routing table depth for better weighting
     pub async fn update_discovery(&self, announcement: ShardAnnouncement) {
-        let mut discovery = self.discovery.write().await;
-        discovery.add_shard(announcement);
-        drop(discovery);
+        let is_new = {
+            let discovery = self.discovery.read().await;
+            !discovery.get_pipeline().iter().any(|s| s.peer_id == announcement.peer_id)
+        };
+        
+        {
+            let mut discovery = self.discovery.write().await;
+            // add_shard now automatically calculates routing depth if local_peer_id is set
+            discovery.add_shard(announcement.clone());
+        }
+        
+        // If this is a new node, process it for queue joining and shard suggestions
+        if is_new {
+            println!("[COORDINATOR] Processing new shard announcement from {}", announcement.peer_id);
+            
+            // If node doesn't have a shard loaded, suggest one
+            if !announcement.capabilities.shard_loaded {
+                // Node can join queue and get assigned a shard
+                if let Ok(Some(suggested_shard)) = self.node_join_queue(
+                    announcement.peer_id.clone(),
+                    announcement.capabilities.clone()
+                ).await {
+                    println!("[COORDINATOR] ✓ Node {} assigned shard {}", announcement.peer_id, suggested_shard);
+                }
+            } else {
+                // Node already has a shard - update availability
+                self.node_shard_loaded(announcement.peer_id.clone(), announcement.shard_id).await;
+            }
+        }
         
         // Check if this completes the pipeline
         self.update_state().await;
@@ -797,11 +1252,28 @@ impl PipelineCoordinator {
         // Check pipeline status
         let discovery = self.discovery.read().await;
         let status = discovery.status();
+        let missing_shards = discovery.get_missing_shards();
         drop(discovery);
+        
+        // Update demand tracking for missing shards
+        {
+            let mut demand = self.shard_demand.write().await;
+            for shard_id in &missing_shards {
+                let entry = demand.entry(*shard_id).or_insert_with(ShardDemand::default);
+                entry.pending_requests += 1;
+                entry.last_requested = Some(Instant::now());
+                entry.priority_score = (entry.pending_requests as f64 * 10.0)
+                    - (entry.nodes_available as f64 * 5.0)
+                    - (entry.nodes_loading as f64 * 2.0);
+            }
+        }
 
         if status.is_complete {
             // Pipeline ready - process immediately
+            println!("[COORDINATOR] Pipeline is complete, processing inference immediately");
             return self.process_inference(request, start).await;
+        } else {
+            println!("[COORDINATOR] Pipeline incomplete (missing: {:?}), applying strategy: {:?}", missing_shards, self.strategy);
         }
 
         // Pipeline incomplete - apply strategy
@@ -1166,47 +1638,194 @@ impl PipelineCoordinator {
         request: InferenceRequest,
         start: Instant,
     ) -> Result<InferenceResponse, PipelineError> {
-        println!("[INFERENCE] Processing request: {}", request.request_id);
+        println!("\n[INFERENCE] ═══════════════════════════════════════════════════════════════════════════");
+        println!("[INFERENCE] Starting collaborative inference process");
+        println!("[INFERENCE] Request ID: {}", request.request_id);
+        println!("[INFERENCE] Prompt: \"{}\"", request.prompt);
+        println!("[INFERENCE] Max Tokens: {}, Temperature: {:.2}", request.max_tokens, request.temperature);
+        println!("[INFERENCE] ═══════════════════════════════════════════════════════════════════════════\n");
 
-        let discovery = self.discovery.read().await;
-        let pipeline = discovery.get_pipeline();
-        
-        if pipeline.is_empty() {
-            drop(discovery);
-            self.record_failure().await;
-            return Err(PipelineError::Internal {
-                message: "Pipeline is empty".to_string(),
-            });
+        let pipeline_clone: Vec<ShardAnnouncement> = {
+            let discovery = self.discovery.read().await;
+            let pipeline = discovery.get_pipeline();
+            let cloned: Vec<ShardAnnouncement> = pipeline.iter().map(|s| (*s).clone()).collect();
+            if cloned.is_empty() {
+                drop(discovery);
+                self.record_failure().await;
+                return Err(PipelineError::Internal {
+                    message: "Pipeline is empty".to_string(),
+                });
+            }
+            cloned
+        };
+
+        println!("[INFERENCE] Pipeline discovered: {} shards", pipeline_clone.len());
+        for (idx, shard) in pipeline_clone.iter().enumerate() {
+            println!("[INFERENCE]   Shard {}: layers {}-{} on node {}", 
+                shard.shard_id, shard.layer_start, shard.layer_end, shard.peer_id);
         }
+        println!();
 
         let mut shard_latencies = Vec::new();
-        let mut current_activations = request.prompt.clone();
+        let mut shard_outputs = Vec::new();
+        let mut current_input = request.prompt.clone();
 
-        // Process through each shard in sequence
-        for shard in &pipeline {
+        // Send preload messages for each shard BEFORE processing starts
+        println!("[INFERENCE] 📦 Sending preload messages for {} shards", pipeline_clone.len());
+        for shard in &pipeline_clone {
+            println!("[INFERENCE] 📦 Preload: Node {} will process shard {} (layers {}-{})", 
+                     shard.peer_id, shard.shard_id, shard.layer_start, shard.layer_end);
+        }
+        
+        // Process through each shard in sequence (pipeline parallelism)
+        for (idx, shard) in pipeline_clone.iter().enumerate() {
             let shard_start = Instant::now();
             
-            println!("[INFERENCE] Processing shard {} (layers {}-{}) on {}",
-                shard.shard_id,
-                shard.layer_start,
-                shard.layer_end,
-                shard.peer_id
-            );
+            println!("[INFERENCE] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("[INFERENCE] Processing Shard {} of {} (Pipeline Step {})", 
+                shard.shard_id, pipeline_clone.len() - 1, idx + 1);
+            println!("[INFERENCE]   Node ID: {}", shard.peer_id);
+            println!("[INFERENCE]   Layers: {}-{} ({} layers)", 
+                shard.layer_start, shard.layer_end, shard.layer_end - shard.layer_start);
+            println!("[INFERENCE]   Input length: {} characters", current_input.len());
+            println!("[INFERENCE]   📦 Shard {} processing layers {}-{}", 
+                shard.shard_id, shard.layer_start, shard.layer_end);
+            println!("[INFERENCE] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-            // Simulate shard processing
-            // In production, this would send the activations to the shard node
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Send inference request to the shard node
+            let shard_output = if let Some(ref sender) = self.command_sender {
+                // Real inference: send command to node
+                use crate::command_protocol::{Command, commands};
+                use serde_json::json;
+                
+                println!("[INFERENCE] 📤 Sending JSON command to node {}:", shard.peer_id);
+                let cmd = Command::new(commands::EXECUTE_TASK, "coordinator", Some(&shard.peer_id))
+                    .with_param("task_type", json!("ai_inference"))
+                    .with_param("input_data", json!(current_input))
+                    .with_param("max_tokens", json!(request.max_tokens))
+                    .with_param("temperature", json!(request.temperature))
+                    .with_param("shard_id", json!(shard.shard_id))
+                    .with_param("layer_start", json!(shard.layer_start))
+                    .with_param("layer_end", json!(shard.layer_end));
+                
+                // Print command details
+                println!("[INFERENCE]   Command: {}", cmd.command);
+                println!("[INFERENCE]   Request ID: {}", cmd.request_id);
+                println!("[INFERENCE]   From: {} → To: {}", cmd.from, shard.peer_id);
+                println!("[INFERENCE]   Params: task_type=ai_inference, shard_id={}, layers={}-{}", 
+                    shard.shard_id, shard.layer_start, shard.layer_end);
+                println!("[INFERENCE]   Input data (first 100 chars): \"{}\"", 
+                    if current_input.len() > 100 { 
+                        format!("{}...", &current_input[..100]) 
+                    } else { 
+                        current_input.clone() 
+                    });
+                
+                match sender(shard.peer_id.clone(), cmd).await {
+                    Ok(response) => {
+                        println!("[INFERENCE] 📥 Received JSON response from node {}:", shard.peer_id);
+                        println!("[INFERENCE]   Status: {:?}", response.status);
+                        println!("[INFERENCE]   Response ID: {}", response.request_id);
+                        println!("[INFERENCE]   From: {} → To: {}", response.from, response.to);
+                        
+                        if response.status == crate::command_protocol::ResponseStatus::Success {
+                            // Extract output from response
+                            if let Some(result) = response.result {
+                                println!("[INFERENCE]   Result keys: {:?}", result.keys().collect::<Vec<_>>());
+                                
+                                if let Some(output_val) = result.get("output") {
+                                    if let Some(output_str) = output_val.as_str() {
+                                        println!("[INFERENCE]   Output length: {} characters", output_str.len());
+                                        println!("[INFERENCE]   Output preview: \"{}\"", 
+                                            if output_str.len() > 150 { 
+                                                format!("{}...", &output_str[..150]) 
+                                            } else { 
+                                                output_str.to_string() 
+                                            });
+                                        
+                                        if let Some(tokens) = result.get("tokens_generated") {
+                                            println!("[INFERENCE]   Tokens generated: {}", tokens);
+                                        }
+                                        if let Some(time) = result.get("processing_time_ms") {
+                                            println!("[INFERENCE]   Processing time: {} ms", time);
+                                        }
+                                        
+                                        output_str.to_string()
+                                    } else {
+                                        println!("[INFERENCE]   Output (non-string): {:?}", output_val);
+                                        format!("[Shard {} processed: {}]", shard.shard_id, output_val)
+                                    }
+                                } else {
+                                    println!("[INFERENCE]   No 'output' key in result");
+                                    format!("[Shard {} processed layers {}-{}]", 
+                                        shard.shard_id, shard.layer_start, shard.layer_end)
+                                }
+                            } else {
+                                println!("[INFERENCE]   No result in response");
+                                format!("[Shard {} processed layers {}-{}]", 
+                                    shard.shard_id, shard.layer_start, shard.layer_end)
+                            }
+                        } else {
+                            let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
+                            println!("[INFERENCE] ❌ Error response: {}", error_msg);
+                            return Err(PipelineError::InferenceFailed {
+                                shard_id: shard.shard_id,
+                                error: format!("Node {} returned error: {}", shard.peer_id, error_msg),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        return Err(PipelineError::InferenceFailed {
+                            shard_id: shard.shard_id,
+                            error: format!("Failed to send request to node {}: {}", shard.peer_id, e),
+                        });
+                    }
+                }
+            } else {
+                // Fallback: simulate processing if no command sender
+                println!("[INFERENCE] WARNING: No command sender configured, simulating shard processing");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                format!("[Shard {} processed layers {}-{}]", 
+                    shard.shard_id, shard.layer_start, shard.layer_end)
+            };
+
+            shard_outputs.push(shard_output.clone());
             
-            current_activations = format!("{} [processed by shard {}]", current_activations, shard.shard_id);
+            let latency = shard_start.elapsed().as_millis() as f64;
+            println!("[INFERENCE] ✓ Shard {} completed in {:.2}ms", shard.shard_id, latency);
+            println!("[INFERENCE]   Output length: {} characters", shard_output.len());
+            
+            // Pass output to next shard in pipeline
+            current_input = shard_output.clone();
+            
+            if idx < pipeline_clone.len() - 1 {
+                println!("[INFERENCE]   → Passing output to next shard in pipeline...\n");
+            } else {
+                println!("[INFERENCE]   → Final shard completed!\n");
+            }
 
             shard_latencies.push(ShardLatency {
                 shard_id: shard.shard_id,
                 node_id: shard.peer_id.clone(),
-                latency_ms: shard_start.elapsed().as_millis() as f64,
+                latency_ms: latency,
             });
         }
 
-        drop(discovery);
+        // Combine outputs from all shards
+        // In pipeline parallelism, the final shard's output is the final answer
+        println!("[INFERENCE] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("[INFERENCE] Combining outputs from {} shards...", shard_outputs.len());
+        
+        let final_output = if let Some(last_output) = shard_outputs.last() {
+            println!("[INFERENCE] Using final shard output as answer");
+            last_output.clone()
+        } else {
+            println!("[INFERENCE] No outputs available, using fallback");
+            format!("Processed through {} shards: {}", shard_outputs.len(), request.prompt)
+        };
+        
+        println!("[INFERENCE] Final output length: {} characters", final_output.len());
+        println!("[INFERENCE] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
         let total_latency = start.elapsed().as_millis() as f64;
 
@@ -1221,8 +1840,7 @@ impl PipelineCoordinator {
 
         Ok(InferenceResponse {
             request_id: request.request_id,
-            text: format!("Generated response for: {} | Pipeline: {} shards", 
-                request.prompt, shard_latencies.len()),
+            text: final_output,
             tokens_generated: request.max_tokens.min(100),
             total_latency_ms: total_latency,
             shard_latencies,

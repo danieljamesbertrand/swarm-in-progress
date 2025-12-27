@@ -364,6 +364,10 @@ pub struct KademliaShardDiscovery {
     ttl_seconds: u64,
     /// Node selection weights
     weights: NodeWeights,
+    /// Local peer ID for distance calculations
+    local_peer_id: Option<String>,
+    /// Routing table depth information (bucket indices for nodes)
+    routing_depths: HashMap<String, u32>, // peer_id -> bucket_depth
 }
 
 impl KademliaShardDiscovery {
@@ -377,6 +381,8 @@ impl KademliaShardDiscovery {
             metadata: None,
             ttl_seconds: 300, // 5 minute TTL
             weights: NodeWeights::default(),
+            local_peer_id: None,
+            routing_depths: HashMap::new(),
         }
     }
 
@@ -455,6 +461,12 @@ impl KademliaShardDiscovery {
 
     /// Manually add a shard announcement
     pub fn add_shard(&mut self, announcement: ShardAnnouncement) {
+        // Calculate routing depth if local peer ID is set
+        if self.local_peer_id.is_some() {
+            let depth = self.calculate_routing_depth(&announcement.peer_id);
+            self.update_routing_depth(announcement.peer_id.clone(), depth);
+        }
+        
         let replicas = self
             .known_shards
             .entry(announcement.shard_id)
@@ -559,6 +571,102 @@ impl KademliaShardDiscovery {
                     / announcement.capabilities.memory_total_mb.max(1) as f64;
                 base_score * 0.3 + memory_factor * 0.4 + available_memory * 0.3
             }
+        }
+    }
+    
+    /// Calculate priority score incorporating Kademlia routing table information
+    /// Uses depth tree (bucket position) and queue ordering (distance) for weighting
+    fn calculate_priority_score_with_routing(
+        &self,
+        announcement: &ShardAnnouncement,
+        priority: OptimizationPriority,
+    ) -> f64 {
+        let base_score = self.calculate_priority_score(announcement, priority);
+        
+        // Get routing depth (bucket index) for this node
+        // Lower depth = closer in routing table = better for routing
+        let routing_depth = self.routing_depths.get(&announcement.peer_id)
+            .copied()
+            .unwrap_or(160); // Default to max depth if unknown (far away)
+        
+        // Calculate distance-based weight using XOR metric
+        // Closer nodes (lower depth) get higher weight
+        // Depth 0 = same bucket (very close), Depth 160 = opposite end (very far)
+        let depth_weight = if routing_depth < 160 {
+            // Normalize depth to 0-1 range, invert so lower depth = higher weight
+            1.0 - (routing_depth as f64 / 160.0)
+        } else {
+            0.1 // Unknown or very far nodes get low weight
+        };
+        
+        // Queue ordering weight: nodes in earlier buckets (closer) are queried first
+        // This reflects Kademlia's queue behavior where closer nodes are prioritized
+        let queue_weight = if routing_depth < 20 {
+            1.0 // Very close nodes (top of queue)
+        } else if routing_depth < 40 {
+            0.8 // Close nodes
+        } else if routing_depth < 80 {
+            0.6 // Medium distance
+        } else if routing_depth < 120 {
+            0.4 // Far nodes
+        } else {
+            0.2 // Very far nodes (bottom of queue)
+        };
+        
+        // Combine base score with routing-based weights
+        // 70% base capabilities, 20% routing depth, 10% queue position
+        base_score * 0.70 + depth_weight * 0.20 + queue_weight * 0.10
+    }
+    
+    /// Update routing table depth information for a node
+    /// Called when routing table is updated to track bucket positions
+    pub fn update_routing_depth(&mut self, peer_id: String, depth: u32) {
+        self.routing_depths.insert(peer_id, depth);
+    }
+    
+    /// Set local peer ID for distance calculations
+    pub fn set_local_peer_id(&mut self, peer_id: String) {
+        self.local_peer_id = Some(peer_id);
+    }
+    
+    /// Calculate XOR distance between two peer IDs
+    /// Used for Kademlia distance metric
+    pub fn xor_distance(peer_id1: &str, peer_id2: &str) -> u32 {
+        // Parse peer IDs and calculate XOR distance
+        // In Kademlia, distance = XOR(peer_id1, peer_id2)
+        // The depth is the number of leading zero bits in the XOR result
+        
+        // For simplicity, we'll use a hash-based approach
+        // In production, parse actual PeerId bytes and compute XOR
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+        
+        let mut hasher1 = DefaultHasher::new();
+        peer_id1.hash(&mut hasher1);
+        let hash1 = hasher1.finish();
+        
+        let mut hasher2 = DefaultHasher::new();
+        peer_id2.hash(&mut hasher2);
+        let hash2 = hasher2.finish();
+        
+        let xor = hash1 ^ hash2;
+        
+        // Count leading zeros = depth in routing table
+        // More leading zeros = closer nodes = lower depth
+        xor.leading_zeros() as u32
+    }
+    
+    /// Calculate routing depth for a peer relative to local peer
+    /// Returns bucket depth (0-160) where 0 is closest
+    pub fn calculate_routing_depth(&self, peer_id: &str) -> u32 {
+        if let Some(ref local_id) = self.local_peer_id {
+            let distance = Self::xor_distance(local_id, peer_id);
+            // Convert distance to depth: closer = lower depth
+            // In Kademlia, depth is typically the bucket index
+            // We use leading zeros as a proxy for bucket position
+            160u32.saturating_sub(distance.min(160))
+        } else {
+            80 // Default middle depth if no local peer ID
         }
     }
     

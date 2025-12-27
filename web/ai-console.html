@@ -143,6 +143,8 @@
         .input-section {
             padding: 32px;
             border-bottom: 1px solid var(--border-subtle);
+            display: block !important;
+            visibility: visible !important;
         }
 
         .input-modes {
@@ -202,6 +204,9 @@
             line-height: 1.6;
             resize: vertical;
             transition: all 0.3s ease;
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
         }
 
         .query-input::placeholder {
@@ -549,6 +554,104 @@
             font-family: 'JetBrains Mono', monospace;
         }
 
+        /* Metrics Panel */
+        .metrics-panel {
+            margin-top: 24px;
+            padding: 24px;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: 16px;
+        }
+
+        .metrics-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .metrics-title::before {
+            content: '';
+            display: block;
+            width: 4px;
+            height: 16px;
+            background: var(--accent-gold);
+            border-radius: 2px;
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+
+        .metric-card {
+            background: var(--bg-deep);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            padding: 16px;
+        }
+
+        .metric-card-title {
+            font-size: 11px;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+
+        .metric-card-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--accent-cyan);
+            font-family: 'JetBrains Mono', monospace;
+            margin-bottom: 4px;
+        }
+
+        .metric-card-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .metrics-events {
+            margin-top: 20px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .event-item {
+            padding: 8px 12px;
+            background: var(--bg-deep);
+            border-left: 3px solid var(--accent-cyan);
+            border-radius: 4px;
+            margin-bottom: 8px;
+            font-size: 12px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .event-item.node-join {
+            border-left-color: var(--green-glow);
+        }
+
+        .event-item.shard-load {
+            border-left-color: var(--orange-glow);
+        }
+
+        .event-item.command {
+            border-left-color: var(--accent-cyan);
+        }
+
+        .event-time {
+            color: var(--text-dim);
+            font-size: 10px;
+        }
+        }
+
         /* Accessibility panel */
         .accessibility-panel {
             position: fixed;
@@ -719,6 +822,17 @@
                 </div>
             </section>
 
+            <!-- Node Inference Log -->
+            <section class="node-log-section">
+                <div class="node-log-header">
+                    <h3 class="node-log-title">Node Inference Requests</h3>
+                    <button class="clear-log-btn" id="clearLogBtn" title="Clear log">Clear</button>
+                </div>
+                <div class="node-log-container" id="nodeLogContainer">
+                    <div class="node-log-placeholder">Waiting for inference requests...</div>
+                </div>
+            </section>
+
             <!-- Pipeline Tracker -->
             <section class="pipeline-tracker">
                 <h2 class="tracker-title">Pipeline Status</h2>
@@ -854,39 +968,76 @@
         const WS_URL = 'ws://localhost:8081';
 
         function connectWebSocket() {
-            if (ws && ws.readyState === WebSocket.OPEN) return;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                console.log('[WS] Already connected');
+                return;
+            }
             
+            console.log('[WS] Attempting to connect to', WS_URL);
             ws = new WebSocket(WS_URL);
             
             ws.onopen = () => {
                 wsConnected = true;
-                console.log('[WS] Connected to Promethos backend');
-                // Status will be updated when server sends pipeline_status message
-                // Don't set default value here - wait for real status
+                console.log('[WS] ✓ Connected to Promethos backend');
+                // Update connection status in UI if there's an indicator
+                const statusIndicator = document.querySelector('.connection-status');
+                if (statusIndicator) {
+                    statusIndicator.textContent = 'Connected';
+                    statusIndicator.style.color = 'var(--green-glow)';
+                }
             };
             
-            ws.onclose = () => {
+            ws.onclose = (event) => {
                 wsConnected = false;
-                console.log('[WS] Disconnected');
+                console.log('[WS] Disconnected (code:', event.code, 'reason:', event.reason || 'none', ')');
                 document.getElementById('nodesOnline').textContent = '0';
-                // Retry connection
+                
+                // Update connection status in UI
+                const statusIndicator = document.querySelector('.connection-status');
+                if (statusIndicator) {
+                    statusIndicator.textContent = 'Disconnected';
+                    statusIndicator.style.color = 'var(--red-glow)';
+                }
+                
+                // Retry connection after delay
+                console.log('[WS] Retrying connection in 3 seconds...');
                 setTimeout(connectWebSocket, 3000);
             };
             
             ws.onerror = (err) => {
-                console.error('[WS] Error:', err);
+                console.error('[WS] Connection error:', err);
                 wsConnected = false;
+                
+                // Update connection status in UI
+                const statusIndicator = document.querySelector('.connection-status');
+                if (statusIndicator) {
+                    statusIndicator.textContent = 'Connection Error';
+                    statusIndicator.style.color = 'var(--red-glow)';
+                }
             };
             
-            ws.onmessage = handleServerMessage;
+            ws.onmessage = (event) => {
+                console.log('[WS] Received message:', event.data.substring(0, 100) + (event.data.length > 100 ? '...' : ''));
+                handleServerMessage(event);
+            };
         }
 
         function handleServerMessage(event) {
             try {
+                console.log('[WS] Raw message:', event.data);
                 const data = JSON.parse(event.data);
+                console.log('[WS] Parsed data:', data);
+                
+                // Metrics update
+                if (data.type === 'metrics') {
+                    console.log('[WS] Received metrics update');
+                    updateMetrics(data.metrics);
+                    return;
+                }
                 
                 // Pipeline status update
                 if (data.type === 'pipeline_status') {
+                    console.log('[WS] Received pipeline_status:', data);
                     const nodesOnline = data.online_nodes || 0;
                     const totalNodes = data.total_nodes || 4;
                     const isComplete = data.is_complete || false;
@@ -927,7 +1078,46 @@
                 }
                 
                 if (data.stage) {
-                    // Pipeline update
+                    // Pipeline update - real-time stage progress
+                    console.log('[WS] Stage update:', data.stage, data.status);
+                    
+                    // Handle preload messages (shard loading notifications)
+                    if (data.stage && data.stage.startsWith('preload')) {
+                        const shardId = data.shard_id !== undefined ? data.shard_id : parseInt(data.stage.replace('preload', ''));
+                        console.log(`[WS] 📦 Preload: Node loading shard ${shardId}`);
+                        
+                        // Display preload message in response area
+                        const responseContent = document.getElementById('responseContent');
+                        if (responseContent) {
+                            // Remove placeholder if it exists
+                            const placeholder = responseContent.querySelector('.response-placeholder');
+                            if (placeholder) {
+                                placeholder.remove();
+                            }
+                            
+                            // Create or update preload container
+                            let preloadContainer = responseContent.querySelector('.preload-container');
+                            if (!preloadContainer) {
+                                preloadContainer = document.createElement('div');
+                                preloadContainer.className = 'preload-container';
+                                preloadContainer.style.cssText = 'margin-bottom: 16px; padding: 12px; background: rgba(0, 245, 212, 0.05); border-radius: 8px; border: 1px solid rgba(0, 245, 212, 0.2);';
+                                const preloadTitle = document.createElement('div');
+                                preloadTitle.style.cssText = 'font-weight: 600; color: var(--accent-cyan); margin-bottom: 8px; font-size: 14px;';
+                                preloadTitle.textContent = '📦 Shard Preloading Status:';
+                                preloadContainer.appendChild(preloadTitle);
+                                responseContent.insertBefore(preloadContainer, responseContent.firstChild);
+                            }
+                            
+                            // Add preload message
+                            const preloadMsg = document.createElement('div');
+                            preloadMsg.className = 'preload-message';
+                            preloadMsg.style.cssText = 'padding: 8px 12px; margin: 4px 0; background: rgba(0, 245, 212, 0.1); border-left: 3px solid var(--accent-cyan); border-radius: 4px; font-size: 13px; font-family: monospace; color: var(--accent-cyan);';
+                            preloadMsg.textContent = `✓ Node loading shard ${shardId} (will process layers for this shard)`;
+                            preloadContainer.appendChild(preloadMsg);
+                        }
+                        return;
+                    }
+                    
                     const stageMap = {
                         'input': 0, 'discovery': 1, 
                         'shard0': 2, 'shard1': 3, 'shard2': 4, 'shard3': 5,
@@ -938,7 +1128,15 @@
                         const status = data.status === 'processing' ? 'active' : 
                                       data.status === 'complete' ? 'complete' : 
                                       data.status === 'error' ? 'error' : 'waiting';
+                        console.log(`[WS] Setting stage ${stageIndex} (${data.stage}) to ${status}`);
                         setStageStatus(stageIndex, status);
+                        
+                        // Update latency if provided
+                        if (data.latency_ms && stageIndex >= 2 && stageIndex <= 5) {
+                            console.log(`[WS] Shard ${data.shard_id} latency: ${data.latency_ms}ms`);
+                        }
+                    } else {
+                        console.warn('[WS] Unknown stage:', data.stage);
                     }
                 } else if (data.response) {
                     // Final response
@@ -996,6 +1194,51 @@
                 submitBtn.click();
             }
         });
+        
+        // Clear log button
+        if (clearLogBtn) {
+            clearLogBtn.addEventListener('click', () => {
+                if (nodeLogContainer) {
+                    nodeLogContainer.innerHTML = '<div class="node-log-placeholder">Waiting for inference requests...</div>';
+                }
+            });
+        }
+        
+        // Add node inference request to log
+        function addNodeInferenceRequest(data) {
+            if (!nodeLogContainer) return;
+            
+            // Remove placeholder if it exists
+            const placeholder = nodeLogContainer.querySelector('.node-log-placeholder');
+            if (placeholder) {
+                placeholder.remove();
+            }
+            
+            // Create log entry
+            const entry = document.createElement('div');
+            entry.className = 'node-log-entry';
+            
+            const timestamp = new Date(data.timestamp * 1000).toLocaleTimeString();
+            const shortNodeId = data.node_id.length > 12 ? data.node_id.substring(0, 12) + '...' : data.node_id;
+            
+            entry.innerHTML = `
+                <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+                    <span class="node-id">Node: ${shortNodeId}</span>
+                    <span class="shard-id">Shard ${data.shard_id}</span>
+                    <span class="layers">Layers ${data.layers}</span>
+                    <span class="timestamp">${timestamp}</span>
+                </div>
+                <div class="input-preview">Input: "${data.input_preview}"</div>
+                <div style="font-size: 11px; color: var(--text-dim); margin-top: 2px;">Request ID: ${data.request_id.substring(0, 16)}...</div>
+            `;
+            
+            nodeLogContainer.appendChild(entry);
+            
+            // Auto-scroll to bottom
+            nodeLogContainer.scrollTop = nodeLogContainer.scrollHeight;
+            
+            console.log('[WS] Added node inference request to log:', data);
+        }
 
         // Pipeline stage animation
         function setStageStatus(stageIndex, status) {
@@ -1078,11 +1321,29 @@
 
             try {
                 // Send query to backend
+                console.log('[WS] Sending query:', query);
                 const request = {
                     query: query,
                     request_id: Date.now().toString()
                 };
-                ws.send(JSON.stringify(request));
+                const requestJson = JSON.stringify(request);
+                console.log('[WS] Request JSON:', requestJson);
+                
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(requestJson);
+                    console.log('[WS] ✓ Query sent successfully, waiting for response...');
+                } else {
+                    console.error('[WS] ✗ WebSocket not open! ReadyState:', ws ? ws.readyState : 'null');
+                    responseContent.innerHTML = `<div style="color: var(--red-glow); padding: 16px;">
+                        ❌ WebSocket not connected<br>
+                        ReadyState: ${ws ? ws.readyState : 'null'}<br>
+                        <small>Try refreshing the page or check if the server is running.</small>
+                    </div>`;
+                    isProcessing = false;
+                    submitBtn.classList.remove('loading');
+                    submitBtn.disabled = false;
+                    return;
+                }
                 
             } catch (error) {
                 setStageStatus(currentStage >= 0 ? currentStage : 0, 'error');
@@ -1090,6 +1351,75 @@
                 isProcessing = false;
                 submitBtn.classList.remove('loading');
                 submitBtn.disabled = false;
+            }
+        }
+
+        // Update metrics display
+        function updateMetrics(metrics) {
+            // Update metric cards
+            document.getElementById('metric-nodes-joined').textContent = metrics.total_nodes_joined || 0;
+            document.getElementById('metric-nodes-online').textContent = metrics.nodes_online || 0;
+            document.getElementById('metric-shards-loaded').textContent = metrics.total_shards_loaded || 0;
+            document.getElementById('metric-shards-available').textContent = metrics.shards_available || 0;
+            document.getElementById('metric-commands-sent').textContent = metrics.commands_sent || 0;
+            document.getElementById('metric-commands-received').textContent = metrics.commands_received || 0;
+            document.getElementById('metric-command-errors').textContent = metrics.command_errors || 0;
+            document.getElementById('metric-inference-requests').textContent = metrics.inference_requests || 0;
+            document.getElementById('metric-inference-success').textContent = metrics.inference_successes || 0;
+            
+            // Format average latency
+            const avgLatency = metrics.avg_command_latency_ms || 0;
+            document.getElementById('metric-avg-latency').textContent = avgLatency.toFixed(1);
+            
+            // Format bytes
+            const bytesSent = metrics.bytes_sent || 0;
+            const bytesReceived = metrics.bytes_received || 0;
+            const formatBytes = (bytes) => {
+                if (bytes < 1024) return bytes + ' B';
+                if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+                return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+            };
+            document.getElementById('metric-bytes-sent').textContent = formatBytes(bytesSent);
+            
+            // Update events list
+            const eventsContainer = document.getElementById('metrics-events');
+            const events = [];
+            
+            // Add recent node join events
+            if (metrics.node_join_events && metrics.node_join_events.length > 0) {
+                const recentJoins = metrics.node_join_events.slice(-5).reverse();
+                recentJoins.forEach(event => {
+                    events.push({
+                        type: 'node-join',
+                        time: new Date(event.timestamp * 1000).toLocaleTimeString(),
+                        text: `Node joined: ${event.peer_id.substring(0, 12)}...${event.shard_id ? ` (Shard ${event.shard_id})` : ''}`
+                    });
+                });
+            }
+            
+            // Add recent shard load events
+            if (metrics.shard_load_events && metrics.shard_load_events.length > 0) {
+                const recentLoads = metrics.shard_load_events.slice(-5).reverse();
+                recentLoads.forEach(event => {
+                    events.push({
+                        type: 'shard-load',
+                        time: new Date(event.timestamp * 1000).toLocaleTimeString(),
+                        text: `Shard ${event.shard_id} ${event.status}: ${event.peer_id.substring(0, 12)}...${event.duration_ms ? ` (${event.duration_ms}ms)` : ''}`
+                    });
+                });
+            }
+            
+            // Sort events by time (most recent first) and display
+            events.sort((a, b) => b.time.localeCompare(a.time));
+            if (events.length === 0) {
+                eventsContainer.innerHTML = '<div style="color: var(--text-dim); text-align: center; padding: 20px;">No events yet</div>';
+            } else {
+                eventsContainer.innerHTML = events.slice(0, 10).map(event => `
+                    <div class="event-item ${event.type}">
+                        <div class="event-time">${event.time}</div>
+                        <div>${event.text}</div>
+                    </div>
+                `).join('');
             }
         }
 

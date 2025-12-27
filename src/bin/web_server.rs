@@ -1,3 +1,4 @@
+
 //! Promethos-AI Web Server
 //! 
 //! WebSocket server that connects the web console to the Llama inference engine.
@@ -7,31 +8,28 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::collections::HashMap;
+use tokio::sync::{RwLock, Mutex, oneshot};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{Duration, Instant};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures_util::{StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
 use punch_simple::pipeline_coordinator::{PipelineCoordinator, InferenceRequest, PipelineStrategy, NodeSpawner};
 use punch_simple::kademlia_shard_discovery::{KademliaShardDiscovery, dht_keys};
-use punch_simple::llama_model_loader::LlamaModelManager;
-use punch_simple::message::{JsonMessage, JsonCodec};
-use punch_simple::command_protocol::{Command, CommandResponse, commands};
+use punch_simple::message::{JsonCodec, JsonMessage};
 use libp2p::{
     identity,
     tcp,
     noise,
     yamux,
     kad,
-    relay,
     request_response::{self, ProtocolSupport},
-    swarm::{NetworkBehaviour, Swarm, SwarmEvent},
+    swarm::{Swarm, SwarmEvent},
     core::transport::Transport,
     PeerId, Multiaddr, StreamProtocol,
 };
 use libp2p::swarm::Config as SwarmConfig;
-use libp2p::futures::StreamExt as Libp2pStreamExt;
 
 /// Query request from web client
 #[derive(Deserialize)]
@@ -61,6 +59,19 @@ struct PipelineUpdate {
     latency_ms: Option<u64>,
 }
 
+/// Node inference request message (for scrolling log)
+#[derive(Serialize)]
+struct NodeInferenceRequestMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    node_id: String,
+    shard_id: u32,
+    request_id: String,
+    timestamp: u64,
+    input_preview: String, // First 100 chars of input
+    layers: String, // "0-7" format
+}
+
 /// Pipeline status message sent to web client
 #[derive(Serialize)]
 struct PipelineStatusMessage {
@@ -70,6 +81,14 @@ struct PipelineStatusMessage {
     online_nodes: u32,
     missing_shards: Vec<u32>,
     is_complete: bool,
+}
+
+/// Metrics message sent to web client
+#[derive(Serialize)]
+struct MetricsMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    metrics: SystemMetrics,
 }
 
 /// Shard info for response
@@ -110,21 +129,89 @@ impl ShardNode {
     }
 }
 
+/// Metrics for tracking node events and communications
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+struct SystemMetrics {
+    // Node metrics
+    total_nodes_joined: u64,
+    nodes_online: u32,
+    nodes_offline: u32,
+    node_join_events: Vec<NodeJoinEvent>,
+    
+    // Shard metrics
+    total_shards_loaded: u64,
+    shards_loading: u32,
+    shards_available: u32,
+    shard_load_events: Vec<ShardLoadEvent>,
+    
+    // Communication metrics
+    commands_sent: u64,
+    commands_received: u64,
+    command_errors: u64,
+    avg_command_latency_ms: f64,
+    command_latency_samples: Vec<f64>,
+    bytes_sent: u64,
+    bytes_received: u64,
+    
+    // Inference metrics
+    inference_requests: u64,
+    inference_successes: u64,
+    inference_failures: u64,
+    avg_inference_latency_ms: f64,
+    
+    // Timestamp
+    last_updated: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct NodeJoinEvent {
+    timestamp: u64,
+    peer_id: String,
+    shard_id: Option<u32>,
+    multiaddr: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct ShardLoadEvent {
+    timestamp: u64,
+    peer_id: String,
+    shard_id: u32,
+    status: String, // "loading", "loaded", "failed"
+    duration_ms: Option<u64>,
+}
+
+// Define DiscoveryBehaviour outside so it can be used in struct
+#[derive(libp2p::swarm::NetworkBehaviour)]
+struct DiscoveryBehaviour {
+    kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    identify: libp2p::identify::Behaviour,
+    request_response: request_response::Behaviour<JsonCodec>,
+}
+
 /// The inference engine - uses real distributed pipeline
 struct InferenceEngine {
     coordinator: Arc<PipelineCoordinator>,
     peer_id: PeerId,
+    swarm: Arc<Mutex<Swarm<DiscoveryBehaviour>>>,
+    // Store pending responses - RequestId type is inferred from Behaviour
+    pending_responses: Arc<Mutex<HashMap<u64, oneshot::Sender<punch_simple::command_protocol::CommandResponse>>>>,
     discovery_task: Arc<tokio::task::JoinHandle<()>>,
+    metrics: Arc<RwLock<SystemMetrics>>,
 }
 
 impl InferenceEngine {
-    async fn new(bootstrap: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(bootstrap: &str, node_request_tx: Option<tokio::sync::broadcast::Sender<NodeInferenceRequestMessage>>) -> Result<Self, Box<dyn std::error::Error>> {
         // Generate peer identity
         let key = identity::Keypair::generate_ed25519();
         let peer_id = PeerId::from(key.public());
         
+        // Create metrics first
+        let metrics = Arc::new(RwLock::new(SystemMetrics::default()));
+        
         // Create discovery
-        let discovery = KademliaShardDiscovery::with_expected_shards("llama-cluster", 4);
+        let mut discovery = KademliaShardDiscovery::with_expected_shards("llama-cluster", 4);
+        // Set local peer ID for distance calculations
+        discovery.set_local_peer_id(peer_id.to_string());
         
         // Create node spawner for on-demand node creation
         let spawner = NodeSpawner::new(
@@ -144,31 +231,8 @@ impl InferenceEngine {
             min_memory_for_shard_mb: 4096,
             min_memory_for_full_mb: 16384,
         });
-        let coordinator = Arc::new(coordinator);
         
-        // Start background DHT discovery task
-        let coordinator_clone = Arc::clone(&coordinator);
-        let bootstrap_clone = bootstrap.to_string();
-        let discovery_task = tokio::spawn(async move {
-            Self::run_dht_discovery(bootstrap_clone, coordinator_clone).await;
-        });
-        
-        Ok(Self {
-            coordinator,
-            peer_id,
-            discovery_task: Arc::new(discovery_task),
-        })
-    }
-
-    /// Run DHT discovery in background to find shard nodes
-    async fn run_dht_discovery(bootstrap: String, coordinator: Arc<PipelineCoordinator>) {
-        println!("[DHT] Starting background DHT discovery...");
-        
-        // Generate keys
-        let key = identity::Keypair::generate_ed25519();
-        let peer_id = PeerId::from(key.public());
-        
-        // Transport
+        // Create P2P swarm for command sending and discovery
         let transport = tcp::tokio::Transport::default()
             .upgrade(libp2p::core::upgrade::Version::V1)
             .authenticate(noise::Config::new(&key).unwrap())
@@ -193,13 +257,6 @@ impl InferenceEngine {
             request_response::Config::default(),
         );
 
-        #[derive(libp2p::swarm::NetworkBehaviour)]
-        struct DiscoveryBehaviour {
-            kademlia: kad::Behaviour<kad::store::MemoryStore>,
-            identify: libp2p::identify::Behaviour,
-            request_response: request_response::Behaviour<JsonCodec>,
-        }
-
         let behaviour = DiscoveryBehaviour {
             kademlia,
             identify,
@@ -209,14 +266,286 @@ impl InferenceEngine {
         // Swarm
         let swarm_config = SwarmConfig::with_tokio_executor()
             .with_idle_connection_timeout(Duration::from_secs(60));
-        let mut swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
-
+        let swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
+        
         // Listen on ephemeral port
-        if let Err(e) = swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()) {
-            eprintln!("[DHT] Failed to listen: {}", e);
-            return;
+        let swarm_arc = Arc::new(Mutex::new(swarm));
+        {
+            let mut swarm = swarm_arc.lock().await;
+            if let Err(e) = swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()) {
+                eprintln!("[SERVER] Failed to listen: {}", e);
+            }
         }
+        
+        // Create pending responses map
+        let pending_responses = Arc::new(Mutex::new(HashMap::new()));
+        
+        // Create P2P command sender with real P2P communication
+        let metrics_for_sender = Arc::clone(&metrics);
+        let swarm_for_sender = Arc::clone(&swarm_arc);
+        let pending_for_sender = Arc::clone(&pending_responses);
+        let sender_peer_id = peer_id;
+        let node_request_tx_for_sender = node_request_tx.clone();
+        let command_sender = move |peer_id_str: String, cmd: punch_simple::command_protocol::Command| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<punch_simple::command_protocol::CommandResponse, punch_simple::PipelineError>> + Send>> {
+            let metrics_clone = Arc::clone(&metrics_for_sender);
+            let swarm_clone = Arc::clone(&swarm_for_sender);
+            let pending_clone = Arc::clone(&pending_for_sender);
+            let sender_peer_id_clone = sender_peer_id;
+            let node_request_tx_clone = node_request_tx_for_sender.clone();
+            Box::pin(async move {
+                let cmd_start = Instant::now();
+                let is_load_shard = cmd.command == punch_simple::command_protocol::commands::LOAD_SHARD;
+                let is_execute_task = cmd.command == punch_simple::command_protocol::commands::EXECUTE_TASK;
+                let shard_id = cmd.params.get("shard_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                
+                // Send node inference request message for EXECUTE_TASK commands
+                if is_execute_task {
+                    if let Some(ref tx) = node_request_tx_clone {
+                        let input_data = cmd.params.get("input_data")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let input_preview = if input_data.len() > 100 {
+                            format!("{}...", &input_data[..100])
+                        } else {
+                            input_data.to_string()
+                        };
+                        let layer_start = cmd.params.get("layer_start").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let layer_end = cmd.params.get("layer_end").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let layers = format!("{}-{}", layer_start, layer_end);
+                        
+                        let node_request_msg = NodeInferenceRequestMessage {
+                            message_type: "node_inference_request".to_string(),
+                            node_id: peer_id_str.clone(),
+                            shard_id,
+                            request_id: cmd.request_id.clone(),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            input_preview,
+                            layers,
+                        };
+                        
+                        // Use broadcast send (non-blocking, doesn't need await)
+                        if let Err(e) = tx.send(node_request_msg) {
+                            eprintln!("[P2P] Failed to send node inference request message: {}", e);
+                        } else {
+                            println!("[P2P] 📤 Sent node inference request message for node {} (shard {})", peer_id_str, shard_id);
+                        }
+                    }
+                }
+                
+                // Record command sent
+                {
+                    let mut m = metrics_clone.write().await;
+                    m.commands_sent += 1;
+                    let cmd_size = serde_json::to_string(&cmd).map(|s| s.len() as u64).unwrap_or(0);
+                    m.bytes_sent += cmd_size;
+                    
+                    // Record shard loading start
+                    if is_load_shard {
+                        m.shards_loading += 1;
+                        m.shard_load_events.push(ShardLoadEvent {
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            peer_id: peer_id_str.clone(),
+                            shard_id,
+                            status: "loading".to_string(),
+                            duration_ms: None,
+                        });
+                    }
+                }
+                
+                // Parse peer ID
+                let target_peer: PeerId = match peer_id_str.parse() {
+                    Ok(pid) => pid,
+                    Err(e) => {
+                        eprintln!("[P2P] Failed to parse peer ID {}: {}", peer_id_str, e);
+                        return Err(punch_simple::PipelineError::Internal { 
+                            message: format!("Invalid peer ID: {}", peer_id_str) 
+                        });
+                    }
+                };
+                
+                // Serialize command to JSON
+                let cmd_json = match serde_json::to_string(&cmd) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        eprintln!("[P2P] Failed to serialize command: {}", e);
+                        return Err(punch_simple::PipelineError::Internal { 
+                            message: format!("Serialization error: {}", e) 
+                        });
+                    }
+                };
+                
+                // Create JsonMessage
+                let msg = JsonMessage::new(sender_peer_id_clone.to_string(), cmd_json);
+                
+                // Send request via P2P
+                let (tx, rx) = oneshot::channel();
+                let request_id_u64 = {
+                    let mut swarm = swarm_clone.lock().await;
+                    let request_id = swarm.behaviour_mut().request_response.send_request(&target_peer, msg);
+                    // Convert RequestId to u64 for storage (RequestId implements Debug, we'll use a hash)
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    format!("{:?}", request_id).hash(&mut hasher);
+                    hasher.finish()
+                };
+                
+                // Store channel for response using request_id from command as key
+                let cmd_request_id = cmd.request_id.clone();
+                {
+                    let mut pending = pending_clone.lock().await;
+                    // Use command's request_id string as key instead
+                    pending.insert(request_id_u64, tx);
+                }
+                
+                println!("[P2P] 📤 Sending command {} to node {} (request_id: {})", cmd.command, peer_id_str, cmd_request_id);
+                println!("[P2P]   Command details: {:?}", serde_json::to_string(&cmd).unwrap_or_default());
+                
+                // Wait for response with timeout
+                println!("[P2P] ⏳ Waiting for response from {}...", peer_id_str);
+                let response = tokio::time::timeout(Duration::from_secs(30), rx).await;
+                
+                // Remove from pending
+                {
+                    let mut pending = pending_clone.lock().await;
+                    pending.remove(&request_id_u64);
+                }
+                
+                let latency_ms = cmd_start.elapsed().as_millis() as f64;
+                let duration_ms = latency_ms as u64;
+                
+                match response {
+                    Ok(Ok(cmd_response)) => {
+                        println!("[P2P] ✅ Received response from {}", peer_id_str);
+                        
+                        // Record command received
+                        {
+                            let mut m = metrics_clone.write().await;
+                            m.commands_received += 1;
+                            m.command_latency_samples.push(latency_ms);
+                            let resp_size = serde_json::to_string(&cmd_response).map(|s| s.len() as u64).unwrap_or(0);
+                            m.bytes_received += resp_size;
+                            
+                            // Record shard loaded
+                            if is_load_shard {
+                                if m.shards_loading > 0 {
+                                    m.shards_loading -= 1;
+                                }
+                                m.shard_load_events.push(ShardLoadEvent {
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    peer_id: peer_id_str.clone(),
+                                    shard_id,
+                                    status: "loaded".to_string(),
+                                    duration_ms: Some(duration_ms),
+                                });
+                            }
+                        }
+                        
+                        Ok(cmd_response)
+                    }
+                    Ok(Err(_)) => {
+                        eprintln!("[P2P] ❌ Channel error waiting for response from {}", peer_id_str);
+                        Err(punch_simple::PipelineError::Internal { 
+                            message: format!("Channel error from {}", peer_id_str) 
+                        })
+                    }
+                    Err(_) => {
+                        eprintln!("[P2P] ❌ Timeout waiting for response from {}", peer_id_str);
+                        {
+                            let mut m = metrics_clone.write().await;
+                            m.command_errors += 1;
+                        }
+                        Err(punch_simple::PipelineError::Internal { 
+                            message: format!("Timeout from {}", peer_id_str) 
+                        })
+                    }
+                }
+            })
+        };
+        
+        coordinator = coordinator.with_command_sender(command_sender);
+        let coordinator = Arc::new(coordinator);
+        
+        // Start background DHT discovery task with shared swarm
+        let coordinator_clone = Arc::clone(&coordinator);
+        let bootstrap_clone = bootstrap.to_string();
+        let metrics_clone = Arc::clone(&metrics);
+        let swarm_for_discovery = Arc::clone(&swarm_arc);
+        let pending_for_discovery = Arc::clone(&pending_responses);
+        let discovery_task = tokio::spawn(async move {
+            Self::run_dht_discovery_with_swarm(
+                bootstrap_clone, 
+                coordinator_clone, 
+                metrics_clone,
+                swarm_for_discovery,
+                pending_for_discovery,
+            ).await;
+        });
+        
+        // Start metrics update task
+        let metrics_clone = Arc::clone(&metrics);
+        let coordinator_clone = Arc::clone(&coordinator);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let mut m = metrics_clone.write().await;
+                let (online, total, _, _) = coordinator_clone.get_pipeline_status().await;
+                m.nodes_online = online;
+                m.nodes_offline = total.saturating_sub(online);
+                m.last_updated = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                
+                // Keep only last 100 events
+                if m.node_join_events.len() > 100 {
+                    m.node_join_events.remove(0);
+                }
+                if m.shard_load_events.len() > 100 {
+                    m.shard_load_events.remove(0);
+                }
+                let latency_len = m.command_latency_samples.len();
+                if latency_len > 1000 {
+                    let remove_count = latency_len - 1000;
+                    m.command_latency_samples.drain(0..remove_count);
+                }
+                
+                // Calculate average latency
+                if !m.command_latency_samples.is_empty() {
+                    m.avg_command_latency_ms = m.command_latency_samples.iter().sum::<f64>() / m.command_latency_samples.len() as f64;
+                }
+            }
+        });
+        
+        Ok(Self {
+            coordinator,
+            peer_id,
+            swarm: swarm_arc,
+            pending_responses,
+            discovery_task: Arc::new(discovery_task),
+            metrics,
+        })
+    }
 
+    /// Run DHT discovery in background to find shard nodes (using shared swarm)
+    async fn run_dht_discovery_with_swarm(
+        bootstrap: String, 
+        coordinator: Arc<PipelineCoordinator>, 
+        metrics: Arc<RwLock<SystemMetrics>>,
+        swarm: Arc<Mutex<Swarm<DiscoveryBehaviour>>>,
+        pending_responses: Arc<Mutex<HashMap<u64, oneshot::Sender<punch_simple::command_protocol::CommandResponse>>>>,
+    ) {
+        println!("[DHT] Starting background DHT discovery with shared swarm...");
+        
         // Connect to bootstrap
         let bootstrap_addr: Multiaddr = match bootstrap.parse() {
             Ok(addr) => addr,
@@ -226,82 +555,199 @@ impl InferenceEngine {
             }
         };
         
-        println!("[DHT] Connecting to bootstrap: {}", bootstrap);
-        if let Err(e) = swarm.dial(bootstrap_addr) {
-            eprintln!("[DHT] Failed to dial bootstrap: {}", e);
-            return;
+        {
+            let mut swarm = swarm.lock().await;
+            println!("[DHT] Connecting to bootstrap: {}", bootstrap);
+            if let Err(e) = swarm.dial(bootstrap_addr) {
+                eprintln!("[DHT] Failed to dial bootstrap: {}", e);
+                return;
+            }
         }
 
-        let mut bootstrapped = false;
-        let mut queries_sent = false;
         let cluster_name = "llama-cluster".to_string();
         let total_shards = 4;
+        let bootstrapped = Arc::new(Mutex::new(false));
+        let queries_sent = Arc::new(Mutex::new(false));
 
         println!("[DHT] Background discovery task started");
 
-        // Use select! to handle both swarm events and periodic queries
-        let mut queries_sent = false;
-        let mut next_query = tokio::time::Instant::now() + Duration::from_secs(2);
-        
-        loop {
-            tokio::select! {
-                event = swarm.select_next_some() => {
-                    match event {
-                        SwarmEvent::ConnectionEstablished { .. } => {
-                            if !bootstrapped {
-                                if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
-                                    eprintln!("[DHT] Bootstrap failed: {:?}", e);
-                                } else {
-                                    println!("[DHT] ✓ Started Kademlia bootstrap");
-                                    bootstrapped = true;
-                                    next_query = tokio::time::Instant::now() + Duration::from_secs(2);
-                                }
+        // Spawn task to handle swarm events
+        let swarm_for_events = Arc::clone(&swarm);
+        let pending_for_events = Arc::clone(&pending_responses);
+        let coordinator_for_events = Arc::clone(&coordinator);
+        let metrics_for_events = Arc::clone(&metrics);
+        let bootstrapped_for_events = Arc::clone(&bootstrapped);
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            loop {
+                let event = {
+                    let mut swarm_guard = swarm_for_events.lock().await;
+                    swarm_guard.select_next_some().await
+                };
+                
+                match event {
+                    SwarmEvent::ConnectionEstablished { .. } => {
+                        let mut boot = bootstrapped_for_events.lock().await;
+                        if !*boot {
+                            let mut swarm_guard = swarm_for_events.lock().await;
+                            if let Err(e) = swarm_guard.behaviour_mut().kademlia.bootstrap() {
+                                eprintln!("[DHT] Bootstrap failed: {:?}", e);
+                            } else {
+                                println!("[DHT] ✓ Started Kademlia bootstrap");
+                                *boot = true;
                             }
                         }
-                        SwarmEvent::Behaviour(behaviour_event) => {
-                            // The NetworkBehaviour macro generates DiscoveryBehaviourEvent enum
-                            // Match on Kademlia events to process discovered shards
-                            // The enum name is auto-generated as {StructName}Event = DiscoveryBehaviourEvent
-                            match behaviour_event {
-                                DiscoveryBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
-                                    result: kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_record))),
-                                    ..
-                                }) => {
-                                    // Process discovered shard
-                                    if let Some(announcement) = coordinator.process_dht_record(&peer_record.record).await {
-                                        println!("[DHT] ✓ Discovered shard {} from {}", announcement.shard_id, announcement.peer_id);
+                    }
+                    SwarmEvent::Behaviour(behaviour_event) => {
+                        // Handle request-response protocol responses
+                        if let DiscoveryBehaviourEvent::RequestResponse(request_response::Event::Message { message, .. }) = &behaviour_event {
+                            match message {
+                                request_response::Message::Response { response, request_id, .. } => {
+                                    // Parse response and send to waiting channel
+                                    // The response.message contains the serialized CommandResponse
+                                    println!("[P2P] 📥 Received response (request_id: {:?}): {}", request_id, response.message);
+                                    
+                                    if let Ok(cmd_response) = serde_json::from_str::<punch_simple::command_protocol::CommandResponse>(&response.message) {
+                                        println!("[P2P] ✓ Parsed CommandResponse: status={:?}, command={}", cmd_response.status, cmd_response.command);
+                                        
+                                        // Convert RequestId to u64 to match storage
+                                        use std::hash::{Hash, Hasher};
+                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                        format!("{:?}", request_id).hash(&mut hasher);
+                                        let request_id_u64 = hasher.finish();
+                                        
+                                        let mut pending = pending_for_events.lock().await;
+                                        if let Some(tx) = pending.remove(&request_id_u64) {
+                                            println!("[P2P] ✓ Sending response to waiting channel");
+                                            let _ = tx.send(cmd_response);
+                                        } else {
+                                            println!("[P2P] ⚠️  No waiting channel found for request_id {:?}", request_id);
+                                        }
+                                    } else {
+                                        eprintln!("[P2P] ❌ Failed to parse CommandResponse from: {}", response.message);
                                     }
                                 }
-                                DiscoveryBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { .. }) => {
-                                    // Routing table updated - queries will be sent by periodic task
+                                request_response::Message::Request { .. } => {
+                                    // We don't handle incoming requests in the web server
                                 }
-                                _ => {}
                             }
                         }
-                        _ => {}
+                        
+                        // The NetworkBehaviour macro generates DiscoveryBehaviourEvent enum
+                        // Match on Kademlia events to process discovered shards
+                        match behaviour_event {
+                            DiscoveryBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+                                result: kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_record))),
+                                ..
+                            }) => {
+                                // Process discovered shard
+                                // This query result came from Kademlia's queue - closer nodes queried first
+                                if let Some(announcement) = coordinator_for_events.process_dht_record(&peer_record.record).await {
+                                    // Calculate routing depth for this node based on query result
+                                    // Nodes returned earlier in queries are typically closer (queue ordering)
+                                    let local_peer_id = {
+                                        let swarm_guard = swarm_for_events.lock().await;
+                                        *swarm_guard.local_peer_id()
+                                    };
+                                    if let Ok(peer_id) = announcement.peer_id.parse::<PeerId>() {
+                                        let distance = calculate_xor_distance(&local_peer_id, &peer_id);
+                                        let depth = estimate_bucket_depth(distance);
+                                        
+                                        // Update discovery with routing information
+                                        {
+                                            let mut discovery = coordinator_for_events.discovery.write().await;
+                                            discovery.update_routing_depth(announcement.peer_id.clone(), depth);
+                                        }
+                                    }
+                                    
+                                    println!("[DHT] ✓ Discovered shard {} from {} (using queue/depth tree for routing)", 
+                                             announcement.shard_id, announcement.peer_id);
+                                    
+                                    // Record node join event
+                                    {
+                                        let mut m = metrics_for_events.write().await;
+                                        m.total_nodes_joined += 1;
+                                        m.node_join_events.push(NodeJoinEvent {
+                                            timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_secs(),
+                                            peer_id: announcement.peer_id.clone(),
+                                            shard_id: Some(announcement.shard_id),
+                                            multiaddr: Some(announcement.multiaddr.clone()),
+                                        });
+                                    }
+                                    
+                                    // Immediately update pipeline status after discovering a node
+                                    let (online_nodes, total_nodes, missing_shards, is_complete) = coordinator_for_events.get_pipeline_status().await;
+                                    println!("[DHT] Pipeline status after discovery: {}/{} nodes online, complete: {}", 
+                                             online_nodes, total_nodes, is_complete);
+                                }
+                            }
+                            DiscoveryBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { 
+                                peer,
+                                ..
+                            }) => {
+                                // Routing table updated - update depth information for weighting
+                                // This reflects Kademlia's queue (k-buckets) and depth tree structure
+                                let peer_id_str = peer.to_string();
+                                
+                                // Calculate routing depth based on XOR distance
+                                // In Kademlia, nodes are organized in buckets by distance
+                                // We can estimate bucket depth from the routing update
+                                let local_peer_id = {
+                                    let swarm_guard = swarm_for_events.lock().await;
+                                    *swarm_guard.local_peer_id()
+                                };
+                                let distance = calculate_xor_distance(&local_peer_id, &peer);
+                                let depth = estimate_bucket_depth(distance);
+                                
+                                // Update discovery with routing depth for better node selection
+                                {
+                                    let mut discovery = coordinator_for_events.discovery.write().await;
+                                    discovery.update_routing_depth(peer_id_str.clone(), depth);
+                                }
+                                
+                                println!("[DHT] Routing updated: peer={}, depth={} (using Kademlia queue/depth tree for weighting)", 
+                                         peer, depth);
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        
+        // Periodic query task
+        let mut next_query = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            tokio::time::sleep_until(next_query).await;
+            
+            let is_bootstrapped = *bootstrapped.lock().await;
+            if is_bootstrapped {
+                let mut sent = queries_sent.lock().await;
+                if !*sent {
+                    println!("[DHT] Querying for {} shards...", total_shards);
+                    *sent = true;
+                } else {
+                    println!("[DHT] Re-querying shards...");
+                }
+                drop(sent);
+                
+                {
+                    let mut swarm_guard = swarm.lock().await;
+                    for shard_id in 0..total_shards {
+                        let key = kad::RecordKey::new(&dht_keys::shard_key(&cluster_name, shard_id));
+                        swarm_guard.behaviour_mut().kademlia.get_record(key);
                     }
                 }
-                _ = tokio::time::sleep_until(next_query) => {
-                    if bootstrapped {
-                        if !queries_sent {
-                            println!("[DHT] Querying for {} shards...", total_shards);
-                            queries_sent = true;
-                        } else {
-                            println!("[DHT] Re-querying shards...");
-                        }
-                        
-                        for shard_id in 0..total_shards {
-                            let key = kad::RecordKey::new(&dht_keys::shard_key(&cluster_name, shard_id));
-                            swarm.behaviour_mut().kademlia.get_record(key);
-                        }
-                        
-                        // Schedule next query in 10 seconds
-                        next_query = tokio::time::Instant::now() + Duration::from_secs(10);
-                    } else {
-                        // Check again in 100ms if not bootstrapped
-                        next_query = tokio::time::Instant::now() + Duration::from_millis(100);
-                    }
-                }
+                
+                // Schedule next query in 10 seconds
+                next_query = tokio::time::Instant::now() + Duration::from_secs(10);
+            } else {
+                // Check again in 100ms if not bootstrapped
+                next_query = tokio::time::Instant::now() + Duration::from_millis(100);
             }
         }
     }
@@ -318,8 +764,71 @@ impl InferenceEngine {
         Ok(())
     }
 
+    /// Record a node join event
+    async fn record_node_join(&self, peer_id: String, shard_id: Option<u32>, multiaddr: Option<String>) {
+        let mut metrics = self.metrics.write().await;
+        metrics.total_nodes_joined += 1;
+        metrics.node_join_events.push(NodeJoinEvent {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            peer_id,
+            shard_id,
+            multiaddr,
+        });
+    }
+    
+    /// Record a shard load event
+    async fn record_shard_load(&self, peer_id: String, shard_id: u32, status: String, duration_ms: Option<u64>) {
+        let mut metrics = self.metrics.write().await;
+        if status == "loaded" {
+            metrics.total_shards_loaded += 1;
+            metrics.shards_available += 1;
+        } else if status == "loading" {
+            metrics.shards_loading += 1;
+        }
+        metrics.shard_load_events.push(ShardLoadEvent {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            peer_id,
+            shard_id,
+            status,
+            duration_ms,
+        });
+    }
+    
+    /// Record a command sent
+    async fn record_command_sent(&self, latency_ms: f64, bytes: u64) {
+        let mut metrics = self.metrics.write().await;
+        metrics.commands_sent += 1;
+        metrics.bytes_sent += bytes;
+        metrics.command_latency_samples.push(latency_ms);
+    }
+    
+    /// Record a command received
+    async fn record_command_received(&self, bytes: u64) {
+        let mut metrics = self.metrics.write().await;
+        metrics.commands_received += 1;
+        metrics.bytes_received += bytes;
+    }
+    
+    /// Record a command error
+    async fn record_command_error(&self) {
+        let mut metrics = self.metrics.write().await;
+        metrics.command_errors += 1;
+    }
+
     async fn process_query(&self, query: &str, update_sender: Option<&tokio::sync::mpsc::Sender<PipelineUpdate>>) -> QueryResponse {
         let start = Instant::now();
+        
+        // Record inference request
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.inference_requests += 1;
+        }
 
         // Send initial status
         if let Some(sender) = update_sender {
@@ -330,6 +839,11 @@ impl InferenceEngine {
                 latency_ms: None,
             }).await;
         }
+        
+        // Note: Preload messages will be sent during actual inference processing
+        // when we have access to the pipeline from the coordinator
+        let (online_nodes, _, missing_shards, is_complete) = self.coordinator.get_pipeline_status().await;
+        println!("[INFERENCE] Starting query processing, pipeline status: {} nodes, complete: {}", online_nodes, is_complete);
 
         // Create inference request
         let inference_request = InferenceRequest::new(query)
@@ -353,10 +867,24 @@ impl InferenceEngine {
         println!("[INFERENCE] Pipeline status: {}/{} nodes online, complete: {}, missing: {:?}", 
                  online_nodes, total_nodes, is_complete, missing_shards);
         
+        if online_nodes == 0 {
+            eprintln!("[INFERENCE] ⚠️  No nodes online! Cannot process inference.");
+            eprintln!("[INFERENCE]   Missing shards: {:?}", missing_shards);
+            eprintln!("[INFERENCE]   Nodes may still be starting up. Please wait...");
+        }
+        
         let result = self.coordinator.submit_inference(inference_request).await;
         match &result {
-            Ok(_) => println!("[INFERENCE] ✓ Inference request succeeded"),
-            Err(e) => eprintln!("[INFERENCE] ✗ Inference request failed: {}", e),
+            Ok(_) => {
+                println!("[INFERENCE] ✓ Inference request succeeded");
+                let mut metrics = self.metrics.write().await;
+                metrics.inference_successes += 1;
+            }
+            Err(e) => {
+                eprintln!("[INFERENCE] ✗ Inference request failed: {}", e);
+                let mut metrics = self.metrics.write().await;
+                metrics.inference_failures += 1;
+            }
         }
 
         if let Some(sender) = update_sender {
@@ -368,26 +896,66 @@ impl InferenceEngine {
             }).await;
         }
 
+        let latency_ms = start.elapsed().as_millis() as u64;
+        
+        // Record inference latency
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.avg_inference_latency_ms = (metrics.avg_inference_latency_ms * (metrics.inference_successes as f64 - 1.0) + latency_ms as f64) / metrics.inference_successes as f64;
+        }
+        
         match result {
             Ok(response) => {
-                // Send shard processing updates
+                // Send preload messages first (before processing updates)
+                let (online_nodes, _, _, is_complete) = self.coordinator.get_pipeline_status().await;
+                if is_complete && online_nodes > 0 {
+                    // Get pipeline info from response shard latencies
+                    println!("[INFERENCE] 📦 Sending preload messages for {} shards", response.shard_latencies.len());
+                    for shard_latency in &response.shard_latencies {
+                        if let Some(sender) = update_sender {
+                            println!("[INFERENCE] 📦 Preload: Node {} loading shard {}", 
+                                     shard_latency.node_id, shard_latency.shard_id);
+                            let _ = sender.send(PipelineUpdate {
+                                stage: format!("preload{}", shard_latency.shard_id),
+                                status: "loading".to_string(),
+                                shard_id: Some(shard_latency.shard_id),
+                                latency_ms: None,
+                            }).await;
+                        }
+                    }
+                    // Small delay to show preload messages
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                
+                // Send shard processing updates in real-time
+                println!("[INFERENCE] Sending real-time updates for {} shards", response.shard_latencies.len());
                 for (_idx, shard_latency) in response.shard_latencies.iter().enumerate() {
                     if let Some(sender) = update_sender {
-                        let _ = sender.send(PipelineUpdate {
-                            stage: format!("shard{}", shard_latency.shard_id),
+                        // Send "processing" update
+                        let stage_name = format!("shard{}", shard_latency.shard_id);
+                        println!("[INFERENCE] 📡 Sending update: {} -> processing", stage_name);
+                        if let Err(e) = sender.send(PipelineUpdate {
+                            stage: stage_name.clone(),
                             status: "processing".to_string(),
                             shard_id: Some(shard_latency.shard_id),
                             latency_ms: None,
-                        }).await;
+                        }).await {
+                            eprintln!("[INFERENCE] Failed to send processing update: {}", e);
+                        }
                         
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        // Small delay to show processing state
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                         
-                        let _ = sender.send(PipelineUpdate {
-                            stage: format!("shard{}", shard_latency.shard_id),
+                        // Send "complete" update with latency
+                        println!("[INFERENCE] 📡 Sending update: {} -> complete ({}ms)", stage_name, shard_latency.latency_ms);
+                        if let Err(e) = sender.send(PipelineUpdate {
+                            stage: stage_name,
                             status: "complete".to_string(),
                             shard_id: Some(shard_latency.shard_id),
                             latency_ms: Some(shard_latency.latency_ms as u64),
-                        }).await;
+                        }).await {
+                            eprintln!("[INFERENCE] Failed to send complete update: {}", e);
+                        }
                     }
                 }
 
@@ -545,22 +1113,44 @@ fn generate_response(query: &str) -> String {
 }
 
 /// Handle a WebSocket connection
-async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<InferenceEngine>) {
-    println!("[WS] New connection from: {}", addr);
+async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<InferenceEngine>, mut node_request_rx: tokio::sync::mpsc::Receiver<NodeInferenceRequestMessage>) {
+    println!("[WS] New TCP connection from: {}", addr);
     
     let ws_stream = match accept_async(stream).await {
-        Ok(ws) => ws,
+        Ok(ws) => {
+            println!("[WS] ✓ WebSocket upgrade successful from: {}", addr);
+            ws
+        }
         Err(e) => {
-            eprintln!("[WS] Failed to accept connection: {}", e);
+            eprintln!("[WS] ✗ Failed to upgrade WebSocket connection from {}: {}", addr, e);
             return;
         }
     };
 
-    let (mut write, mut read) = ws_stream.split();
+    let (write, mut read) = ws_stream.split();
     
-    // Send initial pipeline status
-    {
-        let (online_nodes, total_nodes, missing_shards, is_complete) = engine.coordinator.get_pipeline_status().await;
+    // Create channel for all outgoing messages
+    let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    
+    // Spawn task to send all outgoing messages
+    let mut write_sink = write;
+    tokio::spawn(async move {
+        while let Some(msg) = outgoing_rx.recv().await {
+            if let Err(e) = write_sink.send(msg).await {
+                eprintln!("[WS] Failed to send message: {}", e);
+                break;
+            }
+        }
+    });
+    
+    // Wait a moment for WebSocket to be fully ready, then send initial pipeline status
+    let engine_for_init = Arc::clone(&engine);
+    let outgoing_tx_for_init = outgoing_tx.clone();
+    let addr_for_init = addr;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        
+        let (online_nodes, total_nodes, missing_shards, is_complete) = engine_for_init.coordinator.get_pipeline_status().await;
         
         let status_msg = PipelineStatusMessage {
             message_type: "pipeline_status".to_string(),
@@ -571,15 +1161,76 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<Infe
         };
         
         let status_json = serde_json::to_string(&status_msg).unwrap();
-        if let Err(e) = write.send(Message::Text(status_json)).await {
-            eprintln!("[WS] Failed to send initial status: {}", e);
-        } else {
-            println!("[WS] Sent initial pipeline status: {} nodes online, complete: {}", online_nodes, is_complete);
-        }
-    }
+        let _ = outgoing_tx_for_init.send(Message::Text(status_json));
+        println!("[WS] Sent initial pipeline status to {}: {} nodes online, complete: {}", addr_for_init, online_nodes, is_complete);
+    });
     
     // Create channel for pipeline updates
     let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<PipelineUpdate>(32);
+    
+    // Get a receiver for node inference request messages from the engine
+    // The engine has access to the broadcast sender, we need to get a receiver
+    // For now, we'll get it from a shared location - actually, we need to pass it differently
+    // Let's store it in the engine or pass it through a different mechanism
+    // For simplicity, we'll create a new receiver from the broadcast channel
+    // But we need access to the original tx - let's store it in the engine or use a different approach
+    // Actually, let's just not handle it in handle_connection for now - we'll send it from the command sender directly
+    
+    // Spawn task to send periodic metrics updates
+    let metrics_engine = Arc::clone(&engine);
+    let metrics_tx = outgoing_tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            let metrics = metrics_engine.metrics.read().await.clone();
+            let metrics_msg = MetricsMessage {
+                message_type: "metrics".to_string(),
+                metrics,
+            };
+            if let Ok(json) = serde_json::to_string(&metrics_msg) {
+                if let Err(e) = metrics_tx.send(Message::Text(json)) {
+                    eprintln!("[WS] Failed to send metrics update: {}", e);
+                }
+            } else {
+                eprintln!("[WS] Failed to serialize metrics message");
+            }
+        }
+    });
+    
+    // Spawn task to send periodic pipeline status updates
+    let status_engine = Arc::clone(&engine);
+    let status_tx = outgoing_tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2)); // More frequent updates
+        let mut last_status: Option<(u32, u32, Vec<u32>, bool)> = None;
+        loop {
+            interval.tick().await;
+            let (online_nodes, total_nodes, missing_shards, is_complete) = status_engine.coordinator.get_pipeline_status().await;
+            
+            // Always send update (removed change detection for now to ensure UI updates)
+            let current_status = (online_nodes, total_nodes, missing_shards.clone(), is_complete);
+            let missing_shards_clone = missing_shards.clone();
+            let status_msg = PipelineStatusMessage {
+                message_type: "pipeline_status".to_string(),
+                total_nodes,
+                online_nodes,
+                missing_shards,
+                is_complete,
+            };
+            if let Ok(json) = serde_json::to_string(&status_msg) {
+                if let Err(e) = status_tx.send(Message::Text(json)) {
+                    eprintln!("[WS] Failed to send status update: {}", e);
+                } else if last_status.as_ref() != Some(&current_status) {
+                    println!("[WS] Pipeline status update: {}/{} nodes online, complete: {}, missing: {:?}", 
+                             online_nodes, total_nodes, is_complete, missing_shards_clone);
+                }
+            } else {
+                eprintln!("[WS] Failed to serialize status message");
+            }
+            last_status = Some(current_status);
+        }
+    });
     
     // Use select to handle both incoming messages and updates
     loop {
@@ -596,15 +1247,14 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<Infe
                         };
                         
                         // Process query
+                        println!("[WS] Processing query: {}", request.query);
                         let mut response = engine.process_query(&request.query, Some(&update_tx)).await;
                         response.request_id = request.request_id;
+                        println!("[WS] Query processed, sending response");
                         
                         // Send final response
                         let response_json = serde_json::to_string(&response).unwrap();
-                        if let Err(e) = write.send(Message::Text(response_json)).await {
-                            eprintln!("[WS] Failed to send response: {}", e);
-                            break;
-                        }
+                        let _ = outgoing_tx.send(Message::Text(response_json));
                         
                         // Send updated pipeline status after query
                         {
@@ -619,7 +1269,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<Infe
                             };
                             
                             let status_json = serde_json::to_string(&status_msg).unwrap();
-                            let _ = write.send(Message::Text(status_json)).await;
+                            let _ = outgoing_tx.send(Message::Text(status_json));
                         }
                     }
                     Some(Ok(Message::Close(_))) => {
@@ -638,10 +1288,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<Infe
                 match update {
                     Some(update) => {
                         let update_json = serde_json::to_string(&update).unwrap();
-                        if let Err(e) = write.send(Message::Text(update_json)).await {
-                            eprintln!("[WS] Failed to send update: {}", e);
-                            break;
-                        }
+                        let _ = outgoing_tx.send(Message::Text(update_json));
                     }
                     None => {
                         // Channel closed
@@ -649,19 +1296,92 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<Infe
                     }
                 }
             }
+            node_request = node_request_rx.recv() => {
+                // Handle node inference request messages from broadcast channel
+                match node_request {
+                    Ok(msg) => {
+                        println!("[WS] Sending node inference request message: node={}, shard={}", msg.node_id, msg.shard_id);
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if let Err(e) = outgoing_tx.send(Message::Text(json)) {
+                                eprintln!("[WS] Failed to send node inference request message: {}", e);
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Messages were dropped, continue
+                    }
+                    Err(e) => {
+                        eprintln!("[WS] Error receiving node inference request: {}", e);
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Calculate XOR distance between two peer IDs (Kademlia distance metric)
+/// Returns the XOR result as u64 for distance comparison
+/// Uses Kademlia's queue ordering: closer nodes queried first
+fn calculate_xor_distance(peer1: &PeerId, peer2: &PeerId) -> u64 {
+    let bytes1 = peer1.to_bytes();
+    let bytes2 = peer2.to_bytes();
+    
+    // XOR the peer ID bytes
+    let min_len = bytes1.len().min(bytes2.len());
+    let mut distance = 0u64;
+    
+    for i in 0..min_len {
+        let xor_byte = bytes1[i] ^ bytes2[i];
+        distance = (distance << 8) | (xor_byte as u64);
+    }
+    
+    distance
+}
+
+/// Estimate bucket depth from XOR distance
+/// In Kademlia, nodes are organized in k-buckets by distance (depth tree)
+/// Lower distance = closer nodes = lower bucket index (depth)
+/// Returns depth 0-160 where 0 is closest (top of queue)
+fn estimate_bucket_depth(distance: u64) -> u32 {
+    if distance == 0 {
+        return 0; // Same node
+    }
+    
+    // Count leading zeros in distance
+    // More leading zeros = closer = lower depth
+    let leading_zeros = distance.leading_zeros();
+    
+    // Convert to depth: 0-160 range
+    // Closer nodes (more leading zeros) have lower depth
+    // This reflects the depth tree structure where nodes are organized by prefix
+    if leading_zeros >= 56 {
+        0u32.saturating_add((leading_zeros as u32).saturating_sub(56) % 20)  // Very close (same bucket, top of queue)
+    } else if leading_zeros >= 48 {
+        20u32.saturating_add((leading_zeros as u32).saturating_sub(48) % 20)  // Close (early in queue)
+    } else if leading_zeros >= 40 {
+        40u32.saturating_add((leading_zeros as u32).saturating_sub(40) % 40)  // Medium (middle of queue)
+    } else if leading_zeros >= 32 {
+        80u32.saturating_add((leading_zeros as u32).saturating_sub(32) % 40)  // Far (later in queue)
+    } else {
+        120u32.saturating_add((leading_zeros as u32) % 40)  // Very far (bottom of queue)
     }
 }
 
 /// Serve static files
 async fn serve_static(path: &str) -> Option<(String, Vec<u8>)> {
     let file_path = if path == "/" || path.is_empty() {
-        "web/ai-console.html"
+        "web/ai-console.html".to_string()
     } else {
-        path.trim_start_matches('/')
+        // Remove leading slash and prepend web/ directory
+        let clean_path = path.trim_start_matches('/');
+        if clean_path.starts_with("web/") {
+            clean_path.to_string()
+        } else {
+            format!("web/{}", clean_path)
+        }
     };
 
-    let full_path = std::path::Path::new(file_path);
+    let full_path = std::path::Path::new(&file_path);
     
     match tokio::fs::read(full_path).await {
         Ok(content) => {
@@ -691,11 +1411,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║  WebSocket:   ws://localhost:8081                            ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
+    // Create channel for node inference request messages (for scrolling log) - BEFORE creating engine
+    let (node_request_tx, mut node_request_rx) = tokio::sync::mpsc::channel::<NodeInferenceRequestMessage>(64);
+    
     // Initialize real inference engine with DHT discovery
     let bootstrap = std::env::var("BOOTSTRAP").unwrap_or_else(|_| "/ip4/127.0.0.1/tcp/51820".to_string());
     println!("[SERVER] Connecting to DHT bootstrap: {}", bootstrap);
     
-    let engine = Arc::new(InferenceEngine::new(&bootstrap).await?);
+    let engine = Arc::new(InferenceEngine::new(&bootstrap, Some(node_request_tx.clone())).await?);
     println!("[SERVER] Inference engine initialized with real distributed pipeline");
     
     // Spawn nodes for missing shards on startup
@@ -747,10 +1470,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Accept WebSocket connections
+    println!("[SERVER] Waiting for WebSocket connections...");
     loop {
-        let (stream, addr) = ws_listener.accept().await?;
-        let engine_clone = Arc::clone(&engine);
-        tokio::spawn(handle_connection(stream, addr, engine_clone));
+        match ws_listener.accept().await {
+            Ok((stream, addr)) => {
+                let engine_clone = Arc::clone(&engine);
+                let mut node_request_rx_clone = node_request_rx.resubscribe();
+                tokio::spawn(handle_connection(stream, addr, engine_clone, node_request_rx_clone));
+            }
+            Err(e) => {
+                eprintln!("[SERVER] Error accepting WebSocket connection: {}", e);
+                // Continue accepting connections even if one fails
+            }
+        }
     }
 }
 
