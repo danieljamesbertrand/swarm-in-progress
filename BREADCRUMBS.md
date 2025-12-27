@@ -50,12 +50,13 @@ This file tracks progress on protocol fixes implementation. If an agent loses co
 - [ ] Test with malformed inputs (manual testing required)
 - [ ] Commit and push
 
-### ⏳ Step 5: Piece Verification (Torrent)
-- [ ] Add SHA256 verification to piece assembly
-- [ ] Update `src/shard_listener.rs` torrent download code
-- [ ] Add piece hash verification before assembly
-- [ ] Add error handling for corrupted pieces
-- [ ] Test with corrupted piece data
+### ✅ Step 5: Piece Verification (Torrent)
+- [x] Add SHA256 verification when pieces are received
+- [x] Add SHA256 verification before file assembly
+- [x] Reject corrupted pieces and log errors
+- [x] Update `src/shard_listener.rs` torrent download code
+- [x] Verify no lint errors
+- [ ] Test with corrupted piece data (manual testing required)
 - [ ] Commit and push
 
 ### ⏳ Step 6: Comprehensive Logging

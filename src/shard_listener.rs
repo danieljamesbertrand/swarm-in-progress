@@ -449,8 +449,36 @@ impl ShardNodeState {
         
         if let Some(metadata) = &download.metadata {
             if download.downloaded_pieces >= metadata.pieces.len() {
-                // All pieces downloaded - assemble file
-                println!("[TORRENT] All pieces downloaded, assembling file: {}", download.filename);
+                // All pieces downloaded - verify all pieces before assembly
+                println!("[TORRENT] All pieces downloaded, verifying hashes before assembly: {}", download.filename);
+                
+                // Verify all pieces have correct hashes
+                let mut all_pieces_valid = true;
+                for (piece_index, piece_data) in &download.pieces {
+                    if *piece_index as usize >= metadata.pieces.len() {
+                        eprintln!("[TORRENT] ✗ Invalid piece_index {} in download", piece_index);
+                        all_pieces_valid = false;
+                        break;
+                    }
+                    
+                    let expected_hash = &metadata.pieces[*piece_index as usize];
+                    let mut hasher = Sha256::new();
+                    hasher.update(piece_data);
+                    let computed_hash = format!("{:x}", hasher.finalize());
+                    
+                    if computed_hash != *expected_hash {
+                        eprintln!("[TORRENT] ✗ Piece {} hash mismatch during assembly! Expected: {}, Got: {}", 
+                            piece_index, &expected_hash[..16], &computed_hash[..16]);
+                        all_pieces_valid = false;
+                        break;
+                    }
+                }
+                
+                if !all_pieces_valid {
+                    return Err("Piece verification failed during assembly - corrupted pieces detected".to_string());
+                }
+                
+                println!("[TORRENT] ✓ All pieces verified, assembling file: {}", download.filename);
                 
                 // Sort pieces by index
                 let mut sorted_pieces: Vec<_> = download.pieces.iter().collect();
@@ -1420,6 +1448,29 @@ pub async fn run_shard_listener(
                                     
                                     TorrentMessage::PieceData { info_hash, piece_index, data } => {
                                         if let Some(download) = s.active_downloads.get_mut(&info_hash) {
+                                            // Verify piece hash before storing
+                                            if let Some(metadata) = &download.metadata {
+                                                if piece_index as usize >= metadata.pieces.len() {
+                                                    eprintln!("[TORRENT] ✗ Invalid piece_index {} (max: {})", piece_index, metadata.pieces.len());
+                                                    continue;
+                                                }
+                                                
+                                                let expected_hash = &metadata.pieces[piece_index as usize];
+                                                let mut hasher = Sha256::new();
+                                                hasher.update(&data);
+                                                let computed_hash = format!("{:x}", hasher.finalize());
+                                                
+                                                if computed_hash != *expected_hash {
+                                                    eprintln!("[TORRENT] ✗ Piece {} hash mismatch! Expected: {}, Got: {}", 
+                                                        piece_index, &expected_hash[..16], &computed_hash[..16]);
+                                                    eprintln!("[TORRENT]   Discarding corrupted piece, will re-request");
+                                                    // Don't increment downloaded_pieces, will re-request
+                                                    continue;
+                                                }
+                                                
+                                                println!("[TORRENT] ✓ Piece {} verified (hash: {})", piece_index, &computed_hash[..16]);
+                                            }
+                                            
                                             download.pieces.insert(piece_index, data);
                                             download.downloaded_pieces += 1;
                                             
