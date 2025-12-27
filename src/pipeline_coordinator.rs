@@ -33,6 +33,7 @@ use crate::kademlia_shard_discovery::{
     KademliaShardDiscovery, ShardAnnouncement, ShardCapabilities, PipelineStatus,
 };
 use crate::llama_model_loader::{LlamaModelManager, RsyncConfig};
+use libp2p::kad;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -748,6 +749,18 @@ impl PipelineCoordinator {
         
         // Check if this completes the pipeline
         self.update_state().await;
+    }
+
+    /// Process a DHT record and add to discovery if valid
+    pub async fn process_dht_record(&self, record: &kad::Record) -> Option<ShardAnnouncement> {
+        let mut discovery = self.discovery.write().await;
+        let announcement = discovery.process_shard_record(record)?;
+        drop(discovery);
+        
+        // Update state
+        self.update_state().await;
+        
+        Some(announcement)
     }
 
     /// Update coordinator state based on current discovery

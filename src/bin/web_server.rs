@@ -14,7 +14,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures_util::{StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
 use punch_simple::pipeline_coordinator::{PipelineCoordinator, InferenceRequest, PipelineStrategy, NodeSpawner};
-use punch_simple::kademlia_shard_discovery::KademliaShardDiscovery;
+use punch_simple::kademlia_shard_discovery::{KademliaShardDiscovery, dht_keys};
 use punch_simple::llama_model_loader::LlamaModelManager;
 use punch_simple::message::{JsonMessage, JsonCodec};
 use punch_simple::command_protocol::{Command, CommandResponse, commands};
@@ -114,14 +114,7 @@ impl ShardNode {
 struct InferenceEngine {
     coordinator: Arc<PipelineCoordinator>,
     peer_id: PeerId,
-    swarm: Arc<tokio::sync::Mutex<Option<libp2p::swarm::Swarm<ClientBehaviour>>>>,
-}
-
-#[derive(libp2p::swarm::NetworkBehaviour)]
-struct ClientBehaviour {
-    kademlia: kad::Behaviour<kad::store::MemoryStore>,
-    identify: libp2p::identify::Behaviour,
-    request_response: request_response::Behaviour<JsonCodec>,
+    discovery_task: Arc<tokio::task::JoinHandle<()>>,
 }
 
 impl InferenceEngine {
@@ -153,13 +146,175 @@ impl InferenceEngine {
         });
         let coordinator = Arc::new(coordinator);
         
-        // Note: DHT discovery will happen when shard listeners connect
-        // The coordinator will discover shards as they announce themselves
+        // Start background DHT discovery task
+        let coordinator_clone = Arc::clone(&coordinator);
+        let bootstrap_clone = bootstrap.to_string();
+        let discovery_task = tokio::spawn(async move {
+            Self::run_dht_discovery(bootstrap_clone, coordinator_clone).await;
+        });
         
         Ok(Self {
             coordinator,
             peer_id,
+            discovery_task: Arc::new(discovery_task),
         })
+    }
+
+    /// Run DHT discovery in background to find shard nodes
+    async fn run_dht_discovery(bootstrap: String, coordinator: Arc<PipelineCoordinator>) {
+        println!("[DHT] Starting background DHT discovery...");
+        
+        // Generate keys
+        let key = identity::Keypair::generate_ed25519();
+        let peer_id = PeerId::from(key.public());
+        
+        // Transport
+        let transport = tcp::tokio::Transport::default()
+            .upgrade(libp2p::core::upgrade::Version::V1)
+            .authenticate(noise::Config::new(&key).unwrap())
+            .multiplex(yamux::Config::default())
+            .boxed();
+
+        // Kademlia
+        let store = kad::store::MemoryStore::new(peer_id);
+        let mut kademlia_config = kad::Config::default();
+        kademlia_config.set_query_timeout(Duration::from_secs(30));
+        let kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
+
+        // Identify
+        let identify = libp2p::identify::Behaviour::new(
+            libp2p::identify::Config::new("web-server/1.0".to_string(), key.public())
+        );
+
+        // Request-Response
+        let request_response = request_response::Behaviour::with_codec(
+            JsonCodec,
+            [(StreamProtocol::new("/json-message/1.0"), ProtocolSupport::Full)],
+            request_response::Config::default(),
+        );
+
+        #[derive(libp2p::swarm::NetworkBehaviour)]
+        struct DiscoveryBehaviour {
+            kademlia: kad::Behaviour<kad::store::MemoryStore>,
+            identify: libp2p::identify::Behaviour,
+            request_response: request_response::Behaviour<JsonCodec>,
+        }
+
+        let behaviour = DiscoveryBehaviour {
+            kademlia,
+            identify,
+            request_response,
+        };
+
+        // Swarm
+        let swarm_config = SwarmConfig::with_tokio_executor()
+            .with_idle_connection_timeout(Duration::from_secs(60));
+        let mut swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
+
+        // Listen on ephemeral port
+        if let Err(e) = swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()) {
+            eprintln!("[DHT] Failed to listen: {}", e);
+            return;
+        }
+
+        // Connect to bootstrap
+        let bootstrap_addr: Multiaddr = match bootstrap.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                eprintln!("[DHT] Invalid bootstrap address: {}", e);
+                return;
+            }
+        };
+        
+        println!("[DHT] Connecting to bootstrap: {}", bootstrap);
+        if let Err(e) = swarm.dial(bootstrap_addr) {
+            eprintln!("[DHT] Failed to dial bootstrap: {}", e);
+            return;
+        }
+
+        let mut bootstrapped = false;
+        let mut queries_sent = false;
+        let cluster_name = "llama-cluster".to_string();
+        let total_shards = 4;
+
+        println!("[DHT] Background discovery task started");
+
+        loop {
+            tokio::select! {
+                event = swarm.select_next_some() => {
+                    match event {
+                        SwarmEvent::ConnectionEstablished { .. } => {
+                            if !bootstrapped {
+                                if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
+                                    eprintln!("[DHT] Bootstrap failed: {:?}", e);
+                                } else {
+                                    println!("[DHT] ✓ Started Kademlia bootstrap");
+                                    bootstrapped = true;
+                                }
+                            }
+                        }
+
+                        SwarmEvent::Behaviour(behaviour_event) => {
+                            match behaviour_event {
+                                DiscoveryBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { .. }) => {
+                                    if !queries_sent && bootstrapped {
+                                        println!("[DHT] Routing table updated, querying for {} shards...", total_shards);
+                                        for shard_id in 0..total_shards {
+                                            let key = kad::RecordKey::new(&dht_keys::shard_key(&cluster_name, shard_id));
+                                            swarm.behaviour_mut().kademlia.get_record(key);
+                                        }
+                                        queries_sent = true;
+                                    }
+                                }
+                                DiscoveryBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+                                    result: kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_record))),
+                                    ..
+                                }) => {
+                                    // Process discovered shard
+                                    if let Some(announcement) = coordinator.process_dht_record(&peer_record.record).await {
+                                        println!("[DHT] ✓ Discovered shard {} from {}", announcement.shard_id, announcement.peer_id);
+                                    }
+                                }
+                                DiscoveryBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+                                    result: kad::QueryResult::GetRecord(Err(err)),
+                                    ..
+                                }) => {
+                                    // Query failed - shard not found (this is normal for missing shards)
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            
+        }
+        
+        // Periodic query loop (separate from event loop)
+        loop {
+            if bootstrapped {
+                if !queries_sent {
+                    tokio::time::sleep(Duration::from_secs(2)).await; // Wait for routing table
+                    println!("[DHT] Querying for {} shards...", total_shards);
+                    for shard_id in 0..total_shards {
+                        let key = kad::RecordKey::new(&dht_keys::shard_key(&cluster_name, shard_id));
+                        swarm.behaviour_mut().kademlia.get_record(key);
+                    }
+                    queries_sent = true;
+                }
+                
+                // Re-query every 10 seconds to discover new shards
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                println!("[DHT] Re-querying shards...");
+                for shard_id in 0..total_shards {
+                    let key = kad::RecordKey::new(&dht_keys::shard_key(&cluster_name, shard_id));
+                    swarm.behaviour_mut().kademlia.get_record(key);
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
     }
 
     /// Spawn nodes for missing shards on startup
