@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use punch_simple::pipeline_coordinator::{PipelineCoordinator, InferenceRequest, PipelineStrategy, NodeSpawner};
 use punch_simple::kademlia_shard_discovery::{KademliaShardDiscovery, dht_keys};
 use punch_simple::message::{JsonCodec, JsonMessage};
+use punch_simple::command_validation::validate_command;
 use libp2p::{
     identity,
     tcp,
@@ -1474,6 +1475,11 @@ impl InferenceEngine {
             timestamp: control_cmd.timestamp,
             params,
         };
+
+        // Validate command before sending
+        if let Err(validation_error) = validate_command(&p2p_command) {
+            return Err(format!("Command validation failed: {}", validation_error));
+        }
 
         // Send via P2P directly using swarm
         let target_peer: PeerId = node_id.parse()

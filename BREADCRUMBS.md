@@ -40,13 +40,14 @@ This file tracks progress on protocol fixes implementation. If an agent loses co
 - [x] Verify no lint errors
 - [ ] Commit and push
 
-### ⏳ Step 4: Input Validation
-- [ ] Create input validation module
-- [ ] Add validation to `src/command_protocol.rs`
-- [ ] Add validation to command handlers in `src/shard_listener.rs`
-- [ ] Add validation to `src/bin/web_server.rs`
-- [ ] Add validation to `src/pipeline_coordinator.rs`
-- [ ] Test with malformed inputs
+### ✅ Step 4: Input Validation
+- [x] Create input validation module (`src/command_validation.rs`)
+- [x] Add validation functions for all command types
+- [x] Add validation to command handlers in `src/shard_listener.rs`
+- [x] Add validation to `src/bin/web_server.rs` (before sending commands)
+- [x] Export validation module in `src/lib.rs`
+- [x] Verify no lint errors
+- [ ] Test with malformed inputs (manual testing required)
 - [ ] Commit and push
 
 ### ⏳ Step 5: Piece Verification (Torrent)

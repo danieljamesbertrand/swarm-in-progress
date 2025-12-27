@@ -19,6 +19,7 @@
 mod message;
 mod metrics;
 mod command_protocol;
+mod command_validation;
 mod shard_optimization;
 mod kademlia_shard_discovery;
 
@@ -26,6 +27,7 @@ use message::{JsonMessage, JsonCodec};
 use metrics::{MetricsCodec, PeerMetrics};
 use kademlia_shard_discovery::{KademliaShardDiscovery, ShardAnnouncement, dht_keys, PipelineStatus};
 use command_protocol::{Command, CommandResponse, ResponseStatus, commands};
+use command_validation::{validate_command, ValidationError};
 
 use clap::Parser;
 use libp2p::{
@@ -958,6 +960,25 @@ pub async fn run_shard_listener(
                                     println!("[COMMAND]   Request ID: {}", cmd.request_id);
                                     println!("[COMMAND]   From: {} → To: {}", cmd.from, peer);
                                     println!("[COMMAND]   Params: {:?}", cmd.params);
+                                    
+                                    // Validate command input before processing
+                                    let validation_result = validate_command(&cmd);
+                                    if let Err(validation_error) = validation_result {
+                                        eprintln!("[COMMAND] ✗ Validation failed: {}", validation_error);
+                                        let error_response = CommandResponse::error(
+                                            &cmd.command,
+                                            &cmd.request_id,
+                                            &peer_id.to_string(),
+                                            &cmd.from,
+                                            &format!("Input validation failed: {}", validation_error)
+                                        );
+                                        if let Err(e) = channel.send_response(serde_json::to_string(&error_response).unwrap().into()) {
+                                            eprintln!("[COMMAND] Failed to send validation error response: {}", e);
+                                        }
+                                        continue;
+                                    }
+                                    
+                                    println!("[COMMAND] ✓ Validation passed");
                                     let mut s = state.write().await;
                                     
                                     let response = match cmd.command.as_str() {
