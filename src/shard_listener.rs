@@ -12,6 +12,9 @@
 //!
 //! Or via environment variables:
 //!   LLAMA_SHARD_ID=0 LLAMA_TOTAL_SHARDS=4 cargo run --bin shard_listener
+//!
+//! Also available via unified node binary:
+//!   cargo run --bin node -- shard-listener --shard-id 0 --total-shards 4
 
 mod message;
 mod metrics;
@@ -202,6 +205,7 @@ struct ShardNodeState {
     peer_id: PeerId,
     shard_id: u32,
     announcement: ShardAnnouncement,
+    needs_reannounce: bool, // Flag to trigger immediate re-announcement
     discovery: KademliaShardDiscovery,
     listen_addrs: Vec<Multiaddr>,
     active_requests: u32,
@@ -246,6 +250,7 @@ impl ShardNodeState {
             peer_id,
             shard_id,
             announcement,
+            needs_reannounce: false,
             discovery,
             listen_addrs: Vec::new(),
             active_requests: 0,
@@ -264,25 +269,70 @@ impl ShardNodeState {
     }
     
     /// Scan shards directory for GGUF files and create torrent metadata
+    /// Specifically seeds the 4 shard files (shard-0.gguf through shard-3.gguf)
     fn scan_gguf_files(&mut self) {
         if !self.shards_dir.exists() {
             println!("[TORRENT] Shards directory does not exist: {}", self.shards_dir.display());
             return;
         }
         
+        // First, explicitly seed the 4 primary shard files (shard-0 through shard-3)
+        let mut primary_shards_seeded = 0;
+        for shard_id in 0..4 {
+            let shard_filename = format!("shard-{}.gguf", shard_id);
+            let shard_path = self.shards_dir.join(&shard_filename);
+            
+            if shard_path.exists() {
+                if let Some(file_info) = Self::create_torrent_file_info(&shard_path) {
+                    println!("[TORRENT] ✓ Seeding primary shard: {} (hash: {})", 
+                        file_info.filename, &file_info.info_hash[..16]);
+                    self.torrent_files.insert(file_info.info_hash.clone(), file_info);
+                    primary_shards_seeded += 1;
+                }
+            } else {
+                println!("[TORRENT] ⚠️  Primary shard file not found: {}", shard_path.display());
+            }
+        }
+        
+        // Also scan for any other GGUF files in the directory (for backward compatibility)
         match std::fs::read_dir(&self.shards_dir) {
             Ok(entries) => {
+                let mut other_files_seeded = 0;
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_file() && path.extension().map(|e| e == "gguf").unwrap_or(false) {
+                        // Skip primary shards (already processed above)
+                        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                            if filename.starts_with("shard-") && filename.len() == 13 && filename.ends_with(".gguf") {
+                                // Check if it's shard-0 through shard-3 (already processed)
+                                if let Some(id_str) = filename.strip_prefix("shard-").and_then(|s| s.strip_suffix(".gguf")) {
+                                    if let Ok(id) = id_str.parse::<u32>() {
+                                        if id < 4 {
+                                            continue; // Already processed
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Process other GGUF files
                         if let Some(file_info) = Self::create_torrent_file_info(&path) {
-                            println!("[TORRENT] Found GGUF shard to seed: {} (hash: {})", 
-                                file_info.filename, &file_info.info_hash[..16]);
-                            self.torrent_files.insert(file_info.info_hash.clone(), file_info);
+                            if !self.torrent_files.contains_key(&file_info.info_hash) {
+                                println!("[TORRENT] Found additional GGUF file to seed: {} (hash: {})", 
+                                    file_info.filename, &file_info.info_hash[..16]);
+                                self.torrent_files.insert(file_info.info_hash.clone(), file_info);
+                                other_files_seeded += 1;
+                            }
                         }
                     }
                 }
-                println!("[TORRENT] Scanning complete: {} GGUF file(s) available for seeding", self.torrent_files.len());
+                
+                println!("[TORRENT] ═══════════════════════════════════════════════════════════════════════════");
+                println!("[TORRENT] Torrent seeding complete:");
+                println!("[TORRENT]   Primary shards (0-3): {}/4 seeded", primary_shards_seeded);
+                println!("[TORRENT]   Additional files: {} seeded", other_files_seeded);
+                println!("[TORRENT]   Total files available for seeding: {}", self.torrent_files.len());
+                println!("[TORRENT] ═══════════════════════════════════════════════════════════════════════════");
             }
             Err(e) => {
                 eprintln!("[TORRENT] Failed to scan shards directory: {}", e);
@@ -487,12 +537,21 @@ impl ShardNodeState {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-
+/// Run shard listener node (extracted for unified binary)
+pub async fn run_shard_listener(
+    bootstrap: String,
+    cluster: String,
+    shard_id: Option<u32>,
+    total_shards: u32,
+    total_layers: u32,
+    model_name: String,
+    port: u16,
+    refresh_interval: u64,
+    shards_dir: String,
+    enable_torrent: bool,
+) -> Result<(), Box<dyn Error>> {
     // Determine shard ID
-    let shard_id = args.shard_id.unwrap_or_else(|| {
+    let shard_id = shard_id.unwrap_or_else(|| {
         eprintln!("Error: --shard-id or LLAMA_SHARD_ID environment variable required");
         std::process::exit(1);
     });
@@ -502,15 +561,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("Configuration:");
-    println!("  Cluster: {}", args.cluster);
-    println!("  Shard ID: {} / {}", shard_id, args.total_shards - 1);
-    println!("  Model: {}", args.model_name);
+    println!("  Cluster: {}", cluster);
+    println!("  Shard ID: {} / {}", shard_id, total_shards - 1);
+    println!("  Model: {}", model_name);
     println!("  Layers: {}-{}", 
-        shard_id * (args.total_layers / args.total_shards),
-        if shard_id == args.total_shards - 1 { args.total_layers } 
-        else { (shard_id + 1) * (args.total_layers / args.total_shards) }
+        shard_id * (total_layers / total_shards),
+        if shard_id == total_shards - 1 { total_layers } 
+        else { (shard_id + 1) * (total_layers / total_shards) }
     );
-    println!("  Bootstrap: {}", args.bootstrap);
+    println!("  Bootstrap: {}", bootstrap);
     println!();
 
     // Generate keys
@@ -522,22 +581,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = Arc::new(RwLock::new(ShardNodeState::new(
         peer_id,
         shard_id,
-        args.total_shards,
-        args.total_layers,
-        &args.model_name,
-        &args.cluster,
-        &args.shards_dir,
+        total_shards,
+        total_layers,
+        &model_name,
+        &cluster,
+        &shards_dir,
     )));
     
-    // Try to load the assigned shard if it exists
+    // Try to load the assigned shard BEFORE joining the network
+    // If shard doesn't exist, node will still join and download it when LOAD_SHARD command is received
     {
         let mut s = state.write().await;
-        if let Ok(shard_path) = s.load_shard_file(shard_id) {
-            println!("[SHARD] ✓ Loaded assigned shard {} from: {}", shard_id, shard_path.display());
-        } else {
-            println!("[SHARD] ⚠️  Assigned shard {} not found locally.", shard_id);
-            println!("[SHARD]   Shard will be downloaded via torrent when LOAD_SHARD command is received.");
-            println!("[SHARD]   Or it can be pre-downloaded by querying DHT for available peers.");
+        match s.load_shard_file(shard_id) {
+            Ok(shard_path) => {
+                println!("\n[SHARD] ═══════════════════════════════════════════════════════════════════════════");
+                println!("[SHARD] ✓✓✓ SHARD {} LOADED BEFORE JOINING NETWORK ✓✓✓", shard_id);
+                println!("[SHARD]   Path: {}", shard_path.display());
+                println!("[SHARD]   Shard will be available for inference immediately");
+                println!("[SHARD] ═══════════════════════════════════════════════════════════════════════════\n");
+                
+                // Mark shard as loaded in capabilities
+                s.announcement.capabilities.shard_loaded = true;
+            }
+            Err(e) => {
+                println!("\n[SHARD] ═══════════════════════════════════════════════════════════════════════════");
+                println!("[SHARD] ⚠️  ASSIGNED SHARD {} NOT FOUND LOCALLY ⚠️", shard_id);
+                println!("[SHARD]   Error: {}", e);
+                println!("[SHARD]   Expected location: {}", s.shards_dir.join(format!("shard-{}.gguf", shard_id)).display());
+                println!("[SHARD]");
+                println!("[SHARD]   Node will join the network and download shard when LOAD_SHARD command is received.");
+                println!("[SHARD]   Shard will be downloaded via torrent from other nodes in the cluster.");
+                println!("[SHARD] ═══════════════════════════════════════════════════════════════════════════\n");
+                
+                // Don't exit - allow node to join network and download shard later
+                // Shard will be loaded when coordinator sends LOAD_SHARD command
+                s.announcement.capabilities.shard_loaded = false;
+            }
         }
     }
 
@@ -554,14 +633,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     kademlia_config.set_query_timeout(Duration::from_secs(60));
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
 
-    // Add bootstrap node
-    let bootstrap_addr: Multiaddr = args.bootstrap.parse()?;
-    kademlia.add_address(&peer_id, bootstrap_addr.clone());
+    // Bootstrap address will be added after we connect and get the bootstrap node's peer_id
+    let bootstrap_addr: Multiaddr = bootstrap.parse()?;
+    let bootstrap_addr_for_dht = bootstrap_addr.clone(); // Clone for use in event handler
 
     // Identify
     let identify = libp2p::identify::Behaviour::new(
         libp2p::identify::Config::new(
-            format!("shard-listener/{}/{}", args.cluster, shard_id),
+            format!("shard-listener/{}/{}", cluster, shard_id),
             key.public(),
         )
     );
@@ -605,19 +684,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
 
     // Listen
-    let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", args.port).parse()?;
+    let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
     swarm.listen_on(listen_addr)?;
 
     // Connect to bootstrap
     println!("\n🔗 Connecting to bootstrap node...");
-    swarm.dial(bootstrap_addr)?;
+    swarm.dial(bootstrap_addr.clone())?;
 
     let mut bootstrapped = false;
     let mut announced = false;
-    let cluster_name = args.cluster.clone();
+    let mut torrent_files_registered = false; // Track if torrent files have been registered in DHT
+    let cluster_name = cluster.clone();
 
     // Announcement refresh timer
-    let refresh_interval = Duration::from_secs(args.refresh_interval);
+    let refresh_interval = Duration::from_secs(refresh_interval);
     let mut next_refresh = tokio::time::Instant::now() + refresh_interval;
 
     println!("\n✅ Shard listener started! Waiting for connections...\n");
@@ -630,7 +710,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("[LISTEN] Listening on: {}", address);
                         let mut s = state.write().await;
                         s.update_listen_addr(&address);
-                        swarm.add_external_address(address);
+                        swarm.add_external_address(address.clone());
+                        
+                        // Add our own address to Kademlia so other nodes can route to us
+                        swarm.behaviour_mut().kademlia.add_address(&peer_id, address);
                     }
 
                     SwarmEvent::ConnectionEstablished { peer_id: connected_peer, endpoint, .. } => {
@@ -643,11 +726,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("[CONNECT] ═══════════════════════════════════════════════════════════════════════════\n");
 
                         if !bootstrapped {
+                            // Add bootstrap node's address to Kademlia (now we know its peer_id from the connection)
+                            swarm.behaviour_mut().kademlia.add_address(&connected_peer, bootstrap_addr_for_dht.clone());
+                            
                             // Start Kademlia bootstrap
                             if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
                                 eprintln!("[WARN] Bootstrap failed: {:?}", e);
                             } else {
-                                println!("[DHT] ✓ Started Kademlia bootstrap");
+                                println!("[DHT] ✓ Started Kademlia bootstrap with bootstrap node {}", connected_peer);
                                 bootstrapped = true;
                             }
                         }
@@ -689,9 +775,63 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             ShardBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { peer, .. }) => {
                                 println!("[DHT] Routing updated: {}", peer);
 
+                                // Check if we need to re-announce (e.g., after loading a shard)
+                                let mut s = state.write().await;
+                                let should_announce = !announced || s.needs_reannounce;
+                                let torrent_files_clone: Vec<(String, String, u64)> = s.torrent_files.iter()
+                                    .map(|(hash, info)| (hash.clone(), info.filename.clone(), info.size))
+                                    .collect();
+                                if s.needs_reannounce {
+                                    s.needs_reannounce = false;
+                                    println!("[DHT] Re-announcing after shard load...");
+                                }
+                                drop(s);
+                                
+                                // Register torrent files in DHT for auto-propagation (only once)
+                                // This allows other nodes to discover available files via DHT queries
+                                if !torrent_files_clone.is_empty() && !torrent_files_registered {
+                                    torrent_files_registered = true;
+                                    println!("[TORRENT] Registering {} torrent file(s) in DHT for auto-propagation...", torrent_files_clone.len());
+                                    for (info_hash, filename, size) in torrent_files_clone {
+                                        let file_info = serde_json::json!({
+                                            "info_hash": info_hash,
+                                            "filename": filename,
+                                            "size": size,
+                                            "peer_id": peer_id.to_string(),
+                                        });
+                                        
+                                        // Use info_hash as DHT key so other nodes can query for files
+                                        let key = kad::RecordKey::new(&info_hash);
+                                        match serde_json::to_vec(&file_info) {
+                                            Ok(value) => {
+                                                let record = kad::Record::new(key, value);
+                                                if let Err(e) = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
+                                                    eprintln!("[TORRENT] ⚠️  Failed to register torrent file {} in DHT: {:?}", filename, e);
+                                                } else {
+                                                    println!("[TORRENT] ✓ Registered torrent file in DHT: {} (hash: {})", filename, &info_hash[..16]);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[TORRENT] ⚠️  Failed to serialize torrent file {}: {:?}", filename, e);
+                                            }
+                                        }
+                                    }
+                                    println!("[TORRENT] ✓ All torrent files registered in DHT - auto-propagation enabled");
+                                }
+
                                 // Announce shard after routing table is populated
-                                if !announced {
+                                // Announce to DHT (even if shard not loaded yet - allows coordinator to find us and send LOAD_SHARD)
+                                if should_announce {
                                     let s = state.read().await;
+                                    
+                                    // Always announce - even without shard loaded, so coordinator can discover us
+                                    // Coordinator will send LOAD_SHARD command if needed
+                                    if !s.is_shard_loaded(shard_id) {
+                                        println!("[DHT] ⚠️  Announcing node without shard loaded (shard {}), waiting for LOAD_SHARD command", shard_id);
+                                    } else {
+                                        println!("[DHT] ✓ Announcing with shard {} loaded", shard_id);
+                                    }
+                                    
                                     let record = s.create_announcement_record();
                                     drop(s);
 
@@ -704,16 +844,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         println!("[DHT]   Shard ID: {}", shard_id);
                                         println!("[DHT]   Peer ID: {}", peer_id);
                                         println!("[DHT]   Layers: {}-{}", 
-                                            shard_id * (args.total_layers / args.total_shards),
-                                            if shard_id == args.total_shards - 1 { args.total_layers } 
-                                            else { (shard_id + 1) * (args.total_layers / args.total_shards) }
+                                            shard_id * (total_layers / total_shards),
+                                            if shard_id == total_shards - 1 { total_layers } 
+                                            else { (shard_id + 1) * (total_layers / total_shards) }
                                         );
+                                        println!("[DHT]   Shard Status: ✓ LOADED AND READY");
                                         println!("[DHT] ═══════════════════════════════════════════════════════════════════════════\n");
                                         announced = true;
                                     }
 
                                     // Also query for other shards
-                                    for i in 0..args.total_shards {
+                                    for i in 0..total_shards {
                                         if i != shard_id {
                                             let key = kad::RecordKey::new(&dht_keys::shard_key(&cluster_name, i));
                                             swarm.behaviour_mut().kademlia.get_record(key);
@@ -822,6 +963,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                         match s.load_shard_file(shard_id) {
                                                             Ok(shard_path) => {
                                                                 println!("[LOAD_SHARD] ✓ Loaded shard {} from local directory", shard_id);
+                                                                
+                                                                // Mark shard as loaded in capabilities
+                                                                s.announcement.capabilities.shard_loaded = true;
+                                                                s.needs_reannounce = true; // Flag to trigger immediate re-announcement
+                                                                
                                                                 let mut result = HashMap::new();
                                                                 result.insert("shard_id".to_string(), serde_json::json!(shard_id));
                                                                 result.insert("status".to_string(), serde_json::json!("loaded"));
@@ -1039,6 +1185,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     &format!("Unknown task type: {}", task_type),
                                                 )
                                             }
+                                        }
                                         
                                         _ => {
                                             CommandResponse::error(
@@ -1084,8 +1231,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         println!("[RESPONSE] ═══════════════════════════════════════════════════════════════════════════\n");
                                         
                                         println!("[STATUS] {}", status_string);
-                                        response
-                                    };
                                 } else {
                                     eprintln!("[REQUEST] ❌ Failed to parse command JSON: {}", request.message);
                                 }
@@ -1251,5 +1396,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    run_shard_listener(
+        args.bootstrap,
+        args.cluster,
+        args.shard_id,
+        args.total_shards,
+        args.total_layers,
+        args.model_name,
+        args.port,
+        args.refresh_interval,
+        args.shards_dir,
+        args.enable_torrent,
+    ).await
 }
 
