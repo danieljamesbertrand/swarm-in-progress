@@ -46,6 +46,93 @@ use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 use sha2::{Sha256, Digest};
+use serde::{Serialize, Deserialize};
+
+/// Torrent protocol codec (same as torrent_server)
+#[derive(Clone)]
+struct TorrentCodec;
+
+#[async_trait::async_trait]
+impl request_response::Codec for TorrentCodec {
+    type Request = TorrentMessage;
+    type Response = TorrentMessage;
+    type Protocol = StreamProtocol;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> std::io::Result<Self::Request>
+    where
+        T: libp2p::futures::AsyncRead + Unpin + Send,
+    {
+        use libp2p::futures::AsyncReadExt;
+        let mut buffer = Vec::new();
+        io.read_to_end(&mut buffer).await?;
+        serde_json::from_slice(&buffer).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> std::io::Result<Self::Response>
+    where
+        T: libp2p::futures::AsyncRead + Unpin + Send,
+    {
+        use libp2p::futures::AsyncReadExt;
+        let mut buffer = Vec::new();
+        io.read_to_end(&mut buffer).await?;
+        serde_json::from_slice(&buffer).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, req: Self::Request) -> std::io::Result<()>
+    where
+        T: libp2p::futures::AsyncWrite + Unpin + Send,
+    {
+        use libp2p::futures::AsyncWriteExt;
+        let json = serde_json::to_vec(&req).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        io.write_all(&json).await?;
+        Ok(())
+    }
+
+    async fn write_response<T>(&mut self, _: &Self::Protocol, io: &mut T, res: Self::Response) -> std::io::Result<()>
+    where
+        T: libp2p::futures::AsyncWrite + Unpin + Send,
+    {
+        use libp2p::futures::AsyncWriteExt;
+        let json = serde_json::to_vec(&res).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        io.write_all(&json).await?;
+        Ok(())
+    }
+}
+
+/// Torrent protocol messages
+#[derive(Clone, Serialize, Deserialize, Debug)]
+enum TorrentMessage {
+    RequestPiece {
+        info_hash: String,
+        piece_index: u64,
+    },
+    PieceData {
+        info_hash: String,
+        piece_index: u64,
+        data: Vec<u8>,
+    },
+    RequestMetadata {
+        info_hash: String,
+    },
+    Metadata {
+        metadata: TorrentMetadata,
+    },
+    ListFiles,
+    FileList {
+        files: Vec<TorrentFileInfo>,
+    },
+}
+
+/// Torrent file metadata
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct TorrentMetadata {
+    info_hash: String,
+    filename: String,
+    file_size: u64,
+    piece_size: u64,
+    pieces: Vec<String>, // SHA256 hashes of pieces
+    announce: Vec<String>, // Peer addresses
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "shard_listener")]
@@ -98,11 +185,12 @@ struct ShardBehaviour {
     identify: libp2p::identify::Behaviour,
     request_response: request_response::Behaviour<JsonCodec>,
     metrics_response: request_response::Behaviour<MetricsCodec>,
+    torrent_response: request_response::Behaviour<TorrentCodec>,
     relay: relay::Behaviour,
 }
 
 /// Torrent file metadata (simplified from torrent_server)
-#[derive(Clone, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct TorrentFileInfo {
     info_hash: String,
     filename: String,
@@ -123,6 +211,21 @@ struct ShardNodeState {
     torrent_files: HashMap<String, TorrentFileInfo>, // info_hash -> file info
     shards_dir: PathBuf,
     loaded_shards: HashMap<u32, PathBuf>, // shard_id -> path to loaded GGUF file
+    // Download state
+    active_downloads: HashMap<String, DownloadState>, // info_hash -> download state
+}
+
+/// State for an active torrent download
+#[derive(Clone, Debug)]
+struct DownloadState {
+    info_hash: String,
+    filename: String,
+    target_path: PathBuf,
+    metadata: Option<TorrentMetadata>,
+    pieces: HashMap<u64, Vec<u8>>, // piece_index -> piece data
+    total_pieces: usize,
+    downloaded_pieces: usize,
+    peer_id: Option<PeerId>, // Peer we're downloading from
 }
 
 impl ShardNodeState {
@@ -151,6 +254,7 @@ impl ShardNodeState {
             torrent_files: HashMap::new(),
             shards_dir: shards_path.clone(),
             loaded_shards: HashMap::new(),
+            active_downloads: HashMap::new(),
         };
         
         // Scan for GGUF files to seed
@@ -235,23 +339,102 @@ impl ShardNodeState {
         }
     }
     
-    /// Download a shard via torrent (placeholder - will be implemented with actual torrent client)
-    /// This would query the DHT for peers sharing the shard file and download it
-    async fn download_shard_via_torrent(&mut self, shard_id: u32) -> Result<PathBuf, String> {
+    /// Get info hash for a shard file (if it exists in torrent_files)
+    fn get_shard_info_hash(&self, shard_id: u32) -> Option<String> {
+        let shard_filename = format!("shard-{}.gguf", shard_id);
+        self.torrent_files.values()
+            .find(|f| f.filename == shard_filename)
+            .map(|f| f.info_hash.clone())
+    }
+    
+    /// Find info hash for a shard by querying other nodes
+    fn find_shard_info_hash(&self, shard_id: u32) -> String {
+        // Generate a deterministic info hash based on shard_id
+        // In production, this would query DHT for actual file records
+        let mut hasher = Sha256::new();
+        hasher.update(format!("shard-{}.gguf", shard_id).as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+    
+    /// Start downloading a shard via torrent
+    fn start_download(&mut self, shard_id: u32, peer_id: PeerId) -> Result<String, String> {
         let shard_filename = format!("shard-{}.gguf", shard_id);
         let shard_path = self.shards_dir.join(&shard_filename);
         
-        println!("[TORRENT] Attempting to download shard {} via torrent...", shard_id);
+        // Get or generate info hash
+        let info_hash = self.get_shard_info_hash(shard_id)
+            .unwrap_or_else(|| self.find_shard_info_hash(shard_id));
         
-        // TODO: Implement actual torrent download
-        // 1. Query DHT for peers sharing this shard file
-        // 2. Connect to peers
-        // 3. Request file metadata
-        // 4. Download file pieces
-        // 5. Verify and save file
+        // Check if already downloading
+        if self.active_downloads.contains_key(&info_hash) {
+            return Ok(info_hash.clone());
+        }
         
-        // For now, return error indicating torrent download is needed
-        Err(format!("Torrent download not yet implemented. Shard {} needs to be downloaded from other nodes.", shard_id))
+        // Create download state
+        let download = DownloadState {
+            info_hash: info_hash.clone(),
+            filename: shard_filename.clone(),
+            target_path: shard_path.clone(),
+            metadata: None,
+            pieces: HashMap::new(),
+            total_pieces: 0,
+            downloaded_pieces: 0,
+            peer_id: Some(peer_id),
+        };
+        
+        self.active_downloads.insert(info_hash.clone(), download);
+        println!("[TORRENT] Started download for shard {} (info_hash: {})", shard_id, &info_hash[..16]);
+        
+        Ok(info_hash)
+    }
+    
+    /// Check if download is complete and save file
+    fn check_download_complete(&mut self, info_hash: &str) -> Result<Option<PathBuf>, String> {
+        let download = self.active_downloads.get_mut(info_hash)
+            .ok_or_else(|| format!("Download not found: {}", info_hash))?;
+        
+        if let Some(metadata) = &download.metadata {
+            if download.downloaded_pieces >= metadata.pieces.len() {
+                // All pieces downloaded - assemble file
+                println!("[TORRENT] All pieces downloaded, assembling file: {}", download.filename);
+                
+                // Sort pieces by index
+                let mut sorted_pieces: Vec<_> = download.pieces.iter().collect();
+                sorted_pieces.sort_by_key(|(idx, _)| **idx);
+                
+                // Concatenate pieces
+                let mut file_data = Vec::new();
+                for (_, piece_data) in sorted_pieces {
+                    file_data.extend_from_slice(piece_data);
+                }
+                
+                // Truncate to actual file size
+                if file_data.len() > metadata.file_size as usize {
+                    file_data.truncate(metadata.file_size as usize);
+                }
+                
+                // Save file
+                std::fs::create_dir_all(&download.target_path.parent().unwrap())?;
+                std::fs::write(&download.target_path, &file_data)
+                    .map_err(|e| format!("Failed to write file: {}", e))?;
+                
+                println!("[TORRENT] ✓ File saved: {}", download.target_path.display());
+                
+                // Extract shard_id from filename
+                if let Some(shard_id_str) = download.filename.strip_prefix("shard-").and_then(|s| s.strip_suffix(".gguf")) {
+                    if let Ok(shard_id) = shard_id_str.parse::<u32>() {
+                        self.loaded_shards.insert(shard_id, download.target_path.clone());
+                    }
+                }
+                
+                // Remove from active downloads
+                self.active_downloads.remove(info_hash);
+                
+                return Ok(Some(download.target_path.clone()));
+            }
+        }
+        
+        Ok(None)
     }
 
     fn update_listen_addr(&mut self, addr: &Multiaddr) {
@@ -387,6 +570,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         request_response::Config::default(),
     );
 
+    // Torrent protocol for file sharing
+    let torrent_response = request_response::Behaviour::with_codec(
+        TorrentCodec,
+        [(StreamProtocol::new("/torrent/1.0"), ProtocolSupport::Full)],
+        request_response::Config::default(),
+    );
+
     // Relay
     let relay = relay::Behaviour::new(peer_id, relay::Config::default());
 
@@ -395,6 +585,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         identify,
         request_response,
         metrics_response,
+        torrent_response,
         relay,
     };
 
@@ -442,6 +633,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             } else {
                                 println!("[DHT] ✓ Started Kademlia bootstrap");
                                 bootstrapped = true;
+                            }
+                        }
+                        
+                        // Check if we have pending downloads for this peer
+                        let s = state.read().await;
+                        for (info_hash, download) in &s.active_downloads {
+                            if download.metadata.is_none() {
+                                if let Some(peer_id) = download.peer_id {
+                                    if peer_id == connected_peer {
+                                        drop(s);
+                                        let _ = swarm.behaviour_mut().torrent_response.send_request(
+                                            &connected_peer,
+                                            TorrentMessage::RequestMetadata {
+                                                info_hash: info_hash.clone(),
+                                            }
+                                        );
+                                        println!("[TORRENT] Requested metadata for {} from {}", &info_hash[..16], connected_peer);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -575,20 +786,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                                     result,
                                                                 )
                                                             }
-                                                            Err(e) => {
-                                                                // Shard not found locally - need to download via torrent
-                                                                println!("[LOAD_SHARD] Shard {} not found locally: {}", shard_id, e);
-                                                                println!("[LOAD_SHARD] TODO: Download shard {} via torrent from other nodes", shard_id);
+                                                            Err(_e) => {
+                                                                // Shard not found locally - start torrent download
+                                                                println!("[LOAD_SHARD] Shard {} not found locally, starting torrent download", shard_id);
                                                                 
-                                                                // For now, return error indicating torrent download needed
-                                                                // In production, this would trigger torrent download
-                                                                CommandResponse::error(
-                                                                    &cmd.command,
-                                                                    &cmd.request_id,
-                                                                    &peer_id.to_string(),
-                                                                    &cmd.from,
-                                                                    &format!("Shard {} not found. Torrent download required.", shard_id),
-                                                                )
+                                                                // Start download from the requesting peer (they likely have it)
+                                                                match s.start_download(shard_id, peer) {
+                                                                    Ok(info_hash) => {
+                                                                        let mut result = HashMap::new();
+                                                                        result.insert("shard_id".to_string(), serde_json::json!(shard_id));
+                                                                        result.insert("status".to_string(), serde_json::json!("downloading"));
+                                                                        result.insert("info_hash".to_string(), serde_json::json!(info_hash.clone()));
+                                                                        
+                                                                        // Request metadata will be sent in event loop
+                                                                        // Store pending request
+                                                                        drop(s);
+                                                                        
+                                                                        CommandResponse::success(
+                                                                            &cmd.command,
+                                                                            &cmd.request_id,
+                                                                            &peer_id.to_string(),
+                                                                            &cmd.from,
+                                                                            result,
+                                                                        )
+                                                                    }
+                                                                    Err(e) => {
+                                                                        CommandResponse::error(
+                                                                            &cmd.command,
+                                                                            &cmd.request_id,
+                                                                            &peer_id.to_string(),
+                                                                            &cmd.from,
+                                                                            &format!("Failed to start download: {}", e),
+                                                                        )
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -715,7 +946,134 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             ShardBehaviourEvent::Identify(libp2p::identify::Event::Received { peer_id: identified_peer, info }) => {
                                 println!("[IDENTIFY] {} running {}", identified_peer, info.agent_version);
                             }
-
+                            
+                            // Handle torrent protocol messages
+                            ShardBehaviourEvent::TorrentResponse(request_response::Event::Message {
+                                peer,
+                                message: request_response::Message::Request { request, channel },
+                                ..
+                            }) => {
+                                // Handle incoming torrent requests (serving files)
+                                let mut s = state.write().await;
+                                
+                                match request {
+                                    TorrentMessage::ListFiles => {
+                                        let files: Vec<TorrentFileInfo> = s.get_torrent_file_list()
+                                            .iter()
+                                            .cloned()
+                                            .collect();
+                                        
+                                        let response = TorrentMessage::FileList { files };
+                                        let _ = swarm.behaviour_mut().torrent_response.send_response(channel, response);
+                                    }
+                                    
+                                    TorrentMessage::RequestMetadata { info_hash } => {
+                                        // Find file and return metadata
+                                        if let Some(file_info) = s.torrent_files.get(&info_hash) {
+                                            // Load file and create metadata
+                                            let file_path = s.shards_dir.join(&file_info.filename);
+                                            if let Ok(file_data) = std::fs::read(&file_path) {
+                                                let piece_size = 64 * 1024; // 64 KB
+                                                let mut pieces = Vec::new();
+                                                
+                                                for chunk in file_data.chunks(piece_size) {
+                                                    let mut hasher = Sha256::new();
+                                                    hasher.update(chunk);
+                                                    pieces.push(format!("{:x}", hasher.finalize()));
+                                                }
+                                                
+                                                let metadata = TorrentMetadata {
+                                                    info_hash: info_hash.clone(),
+                                                    filename: file_info.filename.clone(),
+                                                    file_size: file_info.size,
+                                                    piece_size: piece_size as u64,
+                                                    pieces,
+                                                    announce: vec![],
+                                                };
+                                                
+                                                let response = TorrentMessage::Metadata { metadata };
+                                                let _ = swarm.behaviour_mut().torrent_response.send_response(channel, response);
+                                            }
+                                        }
+                                    }
+                                    
+                                    TorrentMessage::RequestPiece { info_hash, piece_index } => {
+                                        // Serve piece data
+                                        if let Some(file_info) = s.torrent_files.get(&info_hash) {
+                                            let file_path = s.shards_dir.join(&file_info.filename);
+                                            if let Ok(file_data) = std::fs::read(&file_path) {
+                                                let piece_size = 64 * 1024;
+                                                let start = (piece_index as usize) * piece_size;
+                                                let end = std::cmp::min(start + piece_size, file_data.len());
+                                                
+                                                if start < file_data.len() {
+                                                    let piece_data = file_data[start..end].to_vec();
+                                                    let response = TorrentMessage::PieceData {
+                                                        info_hash: info_hash.clone(),
+                                                        piece_index,
+                                                        data: piece_data,
+                                                    };
+                                                    let _ = swarm.behaviour_mut().torrent_response.send_response(channel, response);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    _ => {}
+                                }
+                            }
+                            
+                            ShardBehaviourEvent::TorrentResponse(request_response::Event::Message {
+                                peer,
+                                message: request_response::Message::Response { response, .. },
+                                ..
+                            }) => {
+                                // Handle torrent responses (downloading files)
+                                let mut s = state.write().await;
+                                
+                                match response {
+                                    TorrentMessage::Metadata { metadata } => {
+                                        println!("[TORRENT] Received metadata for: {} ({} pieces)", metadata.filename, metadata.pieces.len());
+                                        
+                                        if let Some(download) = s.active_downloads.get_mut(&metadata.info_hash) {
+                                            download.metadata = Some(metadata.clone());
+                                            download.total_pieces = metadata.pieces.len();
+                                            
+                                            // Request all pieces
+                                            if let Some(peer_id) = download.peer_id {
+                                                for i in 0..metadata.pieces.len() {
+                                                    let _ = swarm.behaviour_mut().torrent_response.send_request(
+                                                        &peer_id,
+                                                        TorrentMessage::RequestPiece {
+                                                            info_hash: metadata.info_hash.clone(),
+                                                            piece_index: i as u64,
+                                                        }
+                                                    );
+                                                }
+                                                println!("[TORRENT] Requested {} pieces from {}", metadata.pieces.len(), peer_id);
+                                            }
+                                        }
+                                    }
+                                    
+                                    TorrentMessage::PieceData { info_hash, piece_index, data } => {
+                                        if let Some(download) = s.active_downloads.get_mut(&info_hash) {
+                                            download.pieces.insert(piece_index, data);
+                                            download.downloaded_pieces += 1;
+                                            
+                                            println!("[TORRENT] Received piece {}/{} for {}", 
+                                                download.downloaded_pieces, download.total_pieces, download.filename);
+                                            
+                                            // Check if download is complete
+                                            if let Ok(Some(file_path)) = s.check_download_complete(&info_hash) {
+                                                println!("[TORRENT] ✓ Download complete: {}", file_path.display());
+                                            }
+                                        }
+                                    }
+                                    
+                                    _ => {}
+                                }
+                            }
+                            
                             _ => {}
                         }
                     }
