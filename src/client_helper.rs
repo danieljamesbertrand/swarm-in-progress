@@ -214,10 +214,10 @@ impl P2PClient {
             .multiplex(yamux::Config::default())
             .boxed();
         
-        // Create Kademlia DHT store and behaviour
+        // Create Kademlia DHT store and behaviour - Large timeout for reliable discovery
         let store = kad::store::MemoryStore::new(peer_id);
         let mut kademlia_config = kad::Config::default();
-        kademlia_config.set_query_timeout(Duration::from_secs(60));
+        kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
         let mut kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
         
         // Add bootstrap nodes to Kademlia

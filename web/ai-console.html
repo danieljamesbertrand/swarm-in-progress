@@ -287,6 +287,7 @@
             margin-bottom: 24px;
             display: flex;
             align-items: center;
+            justify-content: space-between;
             gap: 10px;
         }
 
@@ -379,6 +380,14 @@
             50% { box-shadow: 0 0 30px var(--red-glow), 0 0 60px rgba(255, 59, 59, 0.5); }
         }
 
+        .stage-light.registered {
+            background: radial-gradient(circle at 30% 30%, var(--red-glow), #cc2222);
+            border-color: var(--red-glow);
+            color: white;
+            box-shadow: 0 0 20px var(--red-glow), 0 0 40px rgba(255, 59, 59, 0.3);
+            animation: pulse-red 0.8s ease-in-out infinite;
+        }
+
         .stage-light.complete {
             background: radial-gradient(circle at 30% 30%, var(--green-glow), #00cc6a);
             border-color: var(--green-glow);
@@ -420,6 +429,14 @@
             color: var(--text-dim);
             margin-top: 4px;
             font-family: 'JetBrains Mono', monospace;
+            word-break: break-all;
+            line-height: 1.3;
+            max-width: 100px;
+        }
+
+        .stage.registered .stage-sublabel {
+            color: var(--red-glow);
+            font-weight: 500;
         }
 
         .stage.active .stage-label {
@@ -572,6 +589,7 @@
             margin-bottom: 20px;
             display: flex;
             align-items: center;
+            justify-content: space-between;
             gap: 10px;
         }
 
@@ -649,6 +667,110 @@
         .event-time {
             color: var(--text-dim);
             font-size: 10px;
+        }
+
+        /* Node Log Section */
+        .node-log-section {
+            padding: 24px 32px;
+            background: var(--bg-surface);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .node-log-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .node-log-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .node-log-title::before {
+            content: '';
+            display: block;
+            width: 4px;
+            height: 16px;
+            background: var(--accent-cyan);
+            border-radius: 2px;
+        }
+
+        .node-log-container {
+            max-height: 200px;
+            overflow-y: auto;
+            background: var(--bg-deep);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            padding: 16px;
+        }
+
+        .node-log-placeholder {
+            text-align: center;
+            color: var(--text-dim);
+            padding: 20px;
+            font-size: 13px;
+        }
+
+        .node-log-entry {
+            padding: 12px;
+            margin-bottom: 8px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            border-radius: 8px;
+            font-size: 12px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .node-log-entry .node-id {
+            color: var(--accent-cyan);
+            font-weight: 600;
+        }
+
+        .node-log-entry .shard-id {
+            color: var(--accent-gold);
+        }
+
+        .node-log-entry .layers {
+            color: var(--accent-flame);
+        }
+
+        .node-log-entry .timestamp {
+            color: var(--text-dim);
+            font-size: 11px;
+        }
+
+        .node-log-entry .input-preview {
+            color: var(--text-secondary);
+            margin-top: 4px;
+            font-style: italic;
+        }
+
+        /* Clear buttons */
+        .clear-btn, .clear-log-btn {
+            padding: 8px 16px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            border-radius: 8px;
+            color: var(--text-secondary);
+            font-family: 'Outfit', sans-serif;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .clear-btn:hover, .clear-log-btn:hover {
+            background: var(--bg-surface);
+            border-color: var(--accent-ember);
+            color: var(--accent-ember);
         }
         }
 
@@ -835,7 +957,10 @@
 
             <!-- Pipeline Tracker -->
             <section class="pipeline-tracker">
-                <h2 class="tracker-title">Pipeline Status</h2>
+                <div class="tracker-title">
+                    <h2>Pipeline Status</h2>
+                    <button class="clear-btn" id="clearPipelineBtn" title="Reset pipeline">Clear</button>
+                </div>
                 <div class="pipeline-stages" id="pipelineStages">
                     <div class="stage" data-stage="input">
                         <div class="stage-light-container">
@@ -899,7 +1024,10 @@
             <section class="response-section">
                 <div class="response-header">
                     <h2 class="response-title">Response</h2>
-                    <div class="response-meta" id="responseMeta"></div>
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                        <div class="response-meta" id="responseMeta"></div>
+                        <button class="clear-btn" id="clearResponseBtn" title="Clear response">Clear</button>
+                    </div>
                 </div>
                 <div class="response-content" id="responseContent">
                     <div class="response-placeholder">
@@ -963,6 +1091,9 @@
         let currentStage = -1;
         let ws = null;
         let wsConnected = false;
+        
+        // Track registered nodes and their details
+        let registeredNodes = new Map(); // shard_id -> { node_id, peer_id, timestamp, status, shard_id }
 
         // WebSocket connection to Rust backend
         const WS_URL = 'ws://localhost:8081';
@@ -1005,7 +1136,13 @@
             };
             
             ws.onerror = (err) => {
-                console.error('[WS] Connection error:', err);
+                console.error('[WS] ❌ Connection error:', err);
+                console.error('[WS] Error details:', {
+                    type: err.type,
+                    target: err.target,
+                    readyState: ws ? ws.readyState : 'null',
+                    url: WS_URL
+                });
                 wsConnected = false;
                 
                 // Update connection status in UI
@@ -1014,6 +1151,9 @@
                     statusIndicator.textContent = 'Connection Error';
                     statusIndicator.style.color = 'var(--red-glow)';
                 }
+                
+                // Log to error display if available
+                logError('WebSocket connection error', err);
             };
             
             ws.onmessage = (event) => {
@@ -1022,6 +1162,39 @@
             };
         }
 
+        // Error logging function
+        function logError(message, error) {
+            const timestamp = new Date().toISOString();
+            const errorMsg = {
+                timestamp,
+                message,
+                error: error ? (error.message || String(error)) : 'Unknown error',
+                stack: error && error.stack ? error.stack : null
+            };
+            console.error('[ERROR]', errorMsg);
+            
+            // Store in error log
+            if (!window.errorLog) {
+                window.errorLog = [];
+            }
+            window.errorLog.push(errorMsg);
+            
+            // Keep only last 50 errors
+            if (window.errorLog.length > 50) {
+                window.errorLog.shift();
+            }
+            
+            // Display in UI if error container exists
+            const errorContainer = document.getElementById('errorLog');
+            if (errorContainer) {
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'error-entry';
+                errorDiv.innerHTML = `<strong>${timestamp}</strong>: ${message} - ${errorMsg.error}`;
+                errorContainer.appendChild(errorDiv);
+                errorContainer.scrollTop = errorContainer.scrollHeight;
+            }
+        }
+        
         function handleServerMessage(event) {
             try {
                 console.log('[WS] Raw message:', event.data);
@@ -1032,6 +1205,25 @@
                 if (data.type === 'metrics') {
                     console.log('[WS] Received metrics update');
                     updateMetrics(data.metrics);
+                    return;
+                }
+                
+                // Node inference request message
+                if (data.type === 'node_inference_request') {
+                    console.log('[WS] Received node inference request:', data);
+                    addNodeInferenceRequest(data);
+                    // Refresh UI to show new request
+                    refreshNodeStatus();
+                    return;
+                }
+                
+                // Node event message (command_sent, command_received, node_joined, shard_loaded, etc.)
+                if (data.type === 'node_event') {
+                    console.log('[WS] Received node event:', data.event, 'from node', data.node_id);
+                    handleNodeEvent(data);
+                    // Refresh UI immediately when nodes communicate
+                    refreshNodeStatus();
+                    refreshMetrics();
                     return;
                 }
                 
@@ -1056,19 +1248,42 @@
                     }
                     
                     // Update pipeline stages based on available shards
+                    // Preserve registered node details when updating status
                     if (isComplete) {
                         // All shards available - mark all stages as ready
+                        // But preserve registered node info if available
                         for (let i = 2; i <= 5; i++) {
-                            setStageStatus(i, 'waiting');
+                            const shardId = i - 2;
+                            if (registeredNodes.has(shardId)) {
+                                // Keep registered status and node details
+                                const nodeInfo = registeredNodes.get(shardId);
+                                const peerId = nodeInfo.peer_id;
+                                const shortId = peerId.length > 20 
+                                    ? `${peerId.substring(0, 12)}...${peerId.substring(peerId.length - 8)}`
+                                    : peerId;
+                                setStageStatus(i, 'registered', `Node: ${shortId}`);
+                            } else {
+                                setStageStatus(i, 'waiting');
+                            }
                         }
                     } else {
                         // Mark missing shards as error/waiting
+                        // Preserve registered node details for available shards
                         const missingShards = data.missing_shards || [];
                         for (let i = 0; i < 4; i++) {
+                            const stageIndex = i + 2;
                             if (missingShards.includes(i)) {
-                                setStageStatus(i + 2, 'error');
+                                setStageStatus(stageIndex, 'error', 'Shard missing');
+                            } else if (registeredNodes.has(i)) {
+                                // Keep registered status and node details
+                                const nodeInfo = registeredNodes.get(i);
+                                const peerId = nodeInfo.peer_id;
+                                const shortId = peerId.length > 20 
+                                    ? `${peerId.substring(0, 12)}...${peerId.substring(peerId.length - 8)}`
+                                    : peerId;
+                                setStageStatus(stageIndex, 'registered', `Node: ${shortId}`);
                             } else {
-                                setStageStatus(i + 2, 'waiting');
+                                setStageStatus(stageIndex, 'waiting');
                             }
                         }
                     }
@@ -1146,7 +1361,10 @@
                     submitBtn.disabled = false;
                 }
             } catch (e) {
-                console.error('[WS] Parse error:', e);
+                console.error('[WS] ❌ Parse error:', e);
+                logError('Failed to parse WebSocket message', e);
+                console.error('[WS] Raw message that failed:', event.data);
+                console.error('[WS] Error stack:', e.stack);
             }
         }
 
@@ -1163,6 +1381,7 @@
         const speakBtn = document.getElementById('speakBtn');
         const modeBtns = document.querySelectorAll('.mode-btn');
         const stages = document.querySelectorAll('.stage');
+        const nodeLogContainer = document.getElementById('nodeLogContainer');
 
         // Mode switching
         modeBtns.forEach(btn => {
@@ -1195,12 +1414,29 @@
             }
         });
         
-        // Clear log button
+        // Clear buttons
+        const clearLogBtn = document.getElementById('clearLogBtn');
+        const clearResponseBtn = document.getElementById('clearResponseBtn');
+        const clearPipelineBtn = document.getElementById('clearPipelineBtn');
+        
         if (clearLogBtn) {
             clearLogBtn.addEventListener('click', () => {
                 if (nodeLogContainer) {
                     nodeLogContainer.innerHTML = '<div class="node-log-placeholder">Waiting for inference requests...</div>';
                 }
+            });
+        }
+        
+        if (clearResponseBtn) {
+            clearResponseBtn.addEventListener('click', () => {
+                responseContent.innerHTML = '<div class="response-placeholder"><span class="icon">💭</span><p>Your AI response will appear here...</p></div>';
+                responseMeta.textContent = '';
+            });
+        }
+        
+        if (clearPipelineBtn) {
+            clearPipelineBtn.addEventListener('click', () => {
+                resetPipeline();
             });
         }
         
@@ -1240,19 +1476,81 @@
             console.log('[WS] Added node inference request to log:', data);
         }
 
+        // Update shard node details display
+        function updateShardNodeDetails(shardId, shortId, fullPeerId) {
+            try {
+                const stageIndex = shardId + 2;
+                const stage = stages[stageIndex];
+                if (!stage) {
+                    console.error(`[UI] ❌ Stage not found for shard ${shardId} (stageIndex: ${stageIndex})`);
+                    logError(`Stage not found for shard ${shardId}`, new Error(`stageIndex: ${stageIndex}, stages.length: ${stages.length}`));
+                    return;
+                }
+                
+                const sublabel = stage.querySelector('.stage-sublabel');
+                if (!sublabel) {
+                    console.error(`[UI] ❌ Sublabel not found for shard ${shardId}`);
+                    logError(`Sublabel not found for shard ${shardId}`, new Error(`stage: ${stage}`));
+                    return;
+                }
+                
+                // Store original if not already stored
+                if (!sublabel.dataset.original) {
+                    sublabel.dataset.original = sublabel.textContent;
+                }
+                
+                // Update with node details
+                sublabel.textContent = `Node: ${shortId}`;
+                sublabel.title = `Full Peer ID: ${fullPeerId}\nShard: ${shardId}\nRegistered: ${new Date().toLocaleTimeString()}`;
+            } catch (e) {
+                console.error('[UI] ❌ Error updating shard node details:', e);
+                logError('Error updating shard node details', e);
+            }
+        }
+        
         // Pipeline stage animation
-        function setStageStatus(stageIndex, status) {
-            const stage = stages[stageIndex];
-            if (!stage) return;
+        function setStageStatus(stageIndex, status, details = null) {
+            try {
+                if (stageIndex < 0 || stageIndex >= stages.length) {
+                    console.error(`[UI] ❌ Invalid stageIndex: ${stageIndex} (stages.length: ${stages.length})`);
+                    logError(`Invalid stageIndex: ${stageIndex}`, new Error(`stages.length: ${stages.length}`));
+                    return;
+                }
+                
+                const stage = stages[stageIndex];
+                if (!stage) {
+                    console.error(`[UI] ❌ Stage not found at index ${stageIndex}`);
+                    logError(`Stage not found at index ${stageIndex}`, new Error(`stages.length: ${stages.length}`));
+                    return;
+                }
 
-            const light = stage.querySelector('.stage-light');
-            const connector = stage.querySelector('.stage-connector');
+                const light = stage.querySelector('.stage-light');
+                const connector = stage.querySelector('.stage-connector');
+                const sublabel = stage.querySelector('.stage-sublabel');
+                
+                if (!light) {
+                    console.error(`[UI] ❌ Stage light not found at index ${stageIndex}`);
+                    logError(`Stage light not found at index ${stageIndex}`, new Error(`stage: ${stage}`));
+                    return;
+                }
 
-            // Remove all status classes
-            light.classList.remove('off', 'waiting', 'active', 'error', 'complete');
-            
-            // Add new status
-            light.classList.add(status);
+                // Remove all status classes
+                light.classList.remove('off', 'waiting', 'active', 'error', 'complete', 'registered');
+                
+                // Add new status
+                light.classList.add(status);
+
+                // Update sublabel with details if provided, otherwise restore original
+                if (details !== null && sublabel) {
+                    sublabel.textContent = details;
+                } else if (details === null && sublabel && sublabel.dataset.original) {
+                    // Restore original text if available
+                    sublabel.textContent = sublabel.dataset.original;
+                }
+            } catch (e) {
+                console.error(`[UI] ❌ Error setting stage status:`, e);
+                logError(`Error setting stage status (stageIndex: ${stageIndex}, status: ${status})`, e);
+            }
 
             // Update connector if complete
             if (status === 'complete' && connector) {
@@ -1262,22 +1560,35 @@
             // Update stage class
             if (status === 'active' || status === 'complete') {
                 stage.classList.add('active');
+            } else if (status === 'registered') {
+                stage.classList.add('registered');
             }
         }
 
         function resetPipeline() {
+            // Clear registered nodes tracking
+            registeredNodes.clear();
+            
             stages.forEach((stage, index) => {
                 const light = stage.querySelector('.stage-light');
                 const connector = stage.querySelector('.stage-connector');
+                const sublabel = stage.querySelector('.stage-sublabel');
                 
-                light.classList.remove('waiting', 'active', 'error', 'complete');
+                // Clear stored original text and restore
+                if (sublabel && sublabel.dataset.original) {
+                    sublabel.textContent = sublabel.dataset.original;
+                    delete sublabel.dataset.original;
+                    sublabel.title = '';
+                }
+                
+                light.classList.remove('waiting', 'active', 'error', 'complete', 'registered');
                 light.classList.add('off');
                 
                 if (connector) {
                     connector.classList.remove('active');
                 }
                 
-                stage.classList.remove('active');
+                stage.classList.remove('active', 'registered');
             });
             currentStage = -1;
         }
@@ -1421,6 +1732,108 @@
                     </div>
                 `).join('');
             }
+        }
+
+        // Handle node event messages
+        function handleNodeEvent(data) {
+            console.log('[WS] Handling node event:', data.event, 'from', data.node_id);
+            
+            // Log the event to console for debugging
+            const eventTypes = {
+                'command_sent': '📤',
+                'command_received': '📥',
+                'command_error': '❌',
+                'node_joined': '🟢',
+                'shard_loaded': '📦'
+            };
+            
+            const icon = eventTypes[data.event] || 'ℹ️';
+            const message = `${icon} ${data.event} from node ${data.node_id.substring(0, 12)}...`;
+            
+            if (data.shard_id !== undefined) {
+                console.log(`[WS]   Shard: ${data.shard_id}`);
+            }
+            if (data.latency_ms) {
+                console.log(`[WS]   Latency: ${data.latency_ms}ms`);
+            }
+            if (data.details) {
+                console.log(`[WS]   Details: ${data.details}`);
+            }
+            
+            // Update UI based on event type
+            if (data.event === 'node_joined') {
+                // Node joined - turn the corresponding shard button red and show node details
+                if (data.shard_id !== undefined) {
+                    const shardId = data.shard_id;
+                    const stageIndex = shardId + 2; // Shard 0 = stage 2, etc.
+                    
+                    // Store node information
+                    registeredNodes.set(shardId, {
+                        node_id: data.node_id || 'unknown',
+                        peer_id: data.node_id || 'unknown',
+                        timestamp: data.timestamp || Date.now(),
+                        status: data.status || 'online',
+                        shard_id: shardId
+                    });
+                    
+                    // Create unique identifier from node_id (peer_id)
+                    let nodeIdentifier = 'Node registered';
+                    if (data.node_id) {
+                        // Show first 12 and last 8 characters of peer_id for uniqueness
+                        const peerId = data.node_id;
+                        if (peerId.length > 20) {
+                            nodeIdentifier = `${peerId.substring(0, 12)}...${peerId.substring(peerId.length - 8)}`;
+                        } else {
+                            nodeIdentifier = peerId;
+                        }
+                    }
+                    
+                    // Update the UI with node details
+                    const details = `Node: ${nodeIdentifier}`;
+                    updateShardNodeDetails(shardId, nodeIdentifier, data.node_id);
+                    setStageStatus(stageIndex, 'registered', details);
+                    console.log(`[WS] Node joined - Shard ${shardId} button turned red (stage ${stageIndex})`);
+                    console.log(`[WS]   Node ID: ${data.node_id}`);
+                } else {
+                    console.log('[WS] Node joined event processed (no shard_id)');
+                }
+            } else if (data.event === 'shard_loaded') {
+                // Shard loaded - update pipeline status
+                if (data.shard_id !== undefined) {
+                    const stageIndex = data.shard_id + 2; // Shard 0 = stage 2, etc.
+                    // Restore original layer info
+                    const originalLabels = ['Tokenizing', 'DHT Lookup', 'Layers 0-7', 'Layers 8-15', 'Layers 16-23', 'Layers 24-31', 'Decoding'];
+                    setStageStatus(stageIndex, 'waiting', originalLabels[stageIndex] || '');
+                }
+            } else if (data.event === 'command_error') {
+                // Command error - mark stage as error if applicable
+                if (data.shard_id !== undefined) {
+                    const stageIndex = data.shard_id + 2;
+                    setStageStatus(stageIndex, 'error', 'Error occurred');
+                }
+            }
+        }
+
+        // Refresh node status display
+        function refreshNodeStatus() {
+            // This function is called when node events occur
+            // The actual status update happens via pipeline_status messages
+            // This is a placeholder for any additional UI updates needed
+            console.log('[WS] Refreshing node status...');
+            
+            // If we have access to the coordinator, we could fetch fresh status
+            // For now, we rely on periodic pipeline_status updates
+        }
+
+        // Refresh metrics display
+        function refreshMetrics() {
+            // This function is called when node events occur
+            // The actual metrics update happens via metrics messages
+            // This is a placeholder for any additional UI updates needed
+            console.log('[WS] Refreshing metrics...');
+            
+            // Metrics are updated via the updateMetrics() function
+            // which is called when metrics messages are received
         }
 
         // Generate contextual response based on query

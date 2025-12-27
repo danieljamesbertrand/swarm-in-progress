@@ -1,5 +1,8 @@
 //! Network Monitor - Web-based monitoring and management system for Kademlia P2P network
 //! Usage: cargo run --bin monitor [--listen-addr ADDR] [--port PORT] [--web-port WEB_PORT]
+//! 
+//! Also available via unified node binary:
+//!   cargo run --bin node -- monitor --listen-addr ADDR --port PORT --web-port WEB_PORT
 
 use clap::Parser;
 use libp2p::{
@@ -141,13 +144,11 @@ impl NetworkState {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    
+/// Run monitor node (extracted for unified binary)
+pub async fn run_monitor(listen_addr: String, port: u16, web_port: u16) -> Result<(), Box<dyn Error>> {
     println!("=== Network Monitor ===\n");
-    println!("P2P Listen: {}:{}", args.listen_addr, args.port);
-    println!("Web Server: http://localhost:{}\n", args.web_port);
+    println!("P2P Listen: {}:{}", listen_addr, port);
+    println!("Web Server: http://localhost:{}\n", web_port);
 
     // Generate local key and PeerId
     let local_key = identity::Keypair::generate_ed25519();
@@ -165,8 +166,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .multiplex(yamux::Config::default())
         .boxed();
 
+    // Kademlia DHT - Large timeout for reliable discovery
     let store = kad::store::MemoryStore::new(local_peer_id);
-    let kademlia_config = kad::Config::default();
+    let mut kademlia_config = kad::Config::default();
+    kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
     let kademlia = kad::Behaviour::with_config(local_peer_id, store, kademlia_config);
 
     let identify = libp2p::identify::Behaviour::new(
@@ -201,22 +204,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         swarm_config,
     );
 
-    let addr: Multiaddr = format!("/ip4/{}/tcp/{}", args.listen_addr, args.port).parse()?;
+    let addr: Multiaddr = format!("/ip4/{}/tcp/{}", listen_addr, port).parse()?;
     swarm.listen_on(addr.clone())?;
     println!("[MONITOR] Listening on: {}", addr);
 
     // Start web server in background
     let web_state = network_state.clone();
-    let web_port = args.web_port;
+    let web_port_clone = web_port;
     tokio::spawn(async move {
-        if let Err(e) = start_web_server(web_port, web_state, start_time).await {
+        if let Err(e) = start_web_server(web_port_clone, web_state, start_time).await {
             eprintln!("Web server error: {}", e);
         }
     });
 
     println!("✅ Monitor started!");
-    println!("   P2P Network: {}:{}", args.listen_addr, args.port);
-    println!("   Web Dashboard: http://localhost:{}", args.web_port);
+    println!("   P2P Network: {}:{}", listen_addr, port);
+    println!("   Web Dashboard: http://localhost:{}", web_port);
     println!("\nPress Ctrl+C to stop.\n");
 
     // Main event loop - track network events
@@ -493,5 +496,11 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, tx: broadcast::Send
             send_task.abort();
         }
     };
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    run_monitor(args.listen_addr, args.port, args.web_port).await
 }
 

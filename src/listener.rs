@@ -1,5 +1,8 @@
 //! Simple Kademlia Listener - Joins DHT and waits for connections
 //! Usage: cargo run --bin listener [--bootstrap ADDR] [--namespace NAMESPACE]
+//! 
+//! Also available via unified node binary:
+//!   cargo run --bin node -- listener --bootstrap ADDR --namespace NAMESPACE
 
 mod message;
 mod metrics;
@@ -51,14 +54,12 @@ struct Behaviour {
     relay: relay::Behaviour,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    
+/// Run listener node (extracted for unified binary)
+pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Box<dyn Error>> {
     println!("=== Simple Kademlia Listener ===\n");
     println!("Configuration:");
-    println!("  Bootstrap: {}", args.bootstrap);
-    println!("  Namespace: {}\n", args.namespace);
+    println!("  Bootstrap: {}", bootstrap);
+    println!("  Namespace: {}\n", namespace);
 
     let key = identity::Keypair::generate_ed25519();
     let peer_id = PeerId::from(key.public());
@@ -71,14 +72,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .multiplex(yamux::Config::default())
         .boxed();
     
-    // Kademlia DHT
+    // Kademlia DHT - Large timeout for reliable discovery
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia_config = kad::Config::default();
-    kademlia_config.set_query_timeout(Duration::from_secs(60));
+    kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
     
     // Add bootstrap node
-    let bootstrap_addr: Multiaddr = args.bootstrap.parse()?;
+    let bootstrap_addr: Multiaddr = bootstrap.parse()?;
     kademlia.add_address(&peer_id, bootstrap_addr.clone());
     
     // Identify
@@ -121,7 +122,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     // Bootstrap to DHT
-    println!("Bootstrapping to DHT via: {}\n", args.bootstrap);
+    println!("Bootstrapping to DHT via: {}\n", bootstrap);
     
     // Listen on all interfaces
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
@@ -137,7 +138,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Metrics tracking
     let metrics = Arc::new(RwLock::new(PeerMetrics {
         peer_id: peer_id.to_string(),
-        namespace: args.namespace.clone(),
+        namespace: namespace.clone(),
         messages_sent: 0,
         messages_received: 0,
         latency_samples: Vec::new(),
@@ -192,7 +193,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 } else if !registered {
                     // Register our peer info in DHT
-                    let key = kad::RecordKey::new(&args.namespace);
+                    let key = kad::RecordKey::new(&namespace);
                     let value = peer_id.to_bytes();
                     let record = kad::Record::new(key.clone(), value);
                     if let Err(e) = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
@@ -224,7 +225,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("✓ DHT bootstrapped!");
                             // After bootstrapping, query for peers to discover them
                             if registered {
-                                let key = kad::RecordKey::new(&args.namespace);
+                                let key = kad::RecordKey::new(&namespace);
                                 let local_peer_id = *swarm.local_peer_id();
                                 swarm.behaviour_mut().kademlia.get_record(key);
                                 swarm.behaviour_mut().kademlia.get_closest_peers(local_peer_id);
@@ -247,7 +248,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             println!("[VERBOSE]   Discovered peer: {}", discovered_peer);
                                             // Kademlia will automatically maintain connections to closest peers
                                             // We can also query for their addresses if needed
-                                            let key = kad::RecordKey::new(&args.namespace);
+                                            let key = kad::RecordKey::new(&namespace);
                                             swarm.behaviour_mut().kademlia.get_record(key);
                                         }
                                     }
@@ -451,4 +452,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    run_listener(args.bootstrap, args.namespace).await
 }

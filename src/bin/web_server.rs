@@ -39,6 +39,32 @@ struct QueryRequest {
     request_id: Option<String>,
 }
 
+/// Node control request from web client
+#[derive(Deserialize, Clone)]
+struct NodeControlRequest {
+    #[serde(rename = "type")]
+    message_type: String,
+    node_id: String,
+    command: String,
+    params: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    request_id: Option<String>,
+}
+
+/// Node control response to web client
+#[derive(Serialize)]
+struct NodeControlResponse {
+    #[serde(rename = "type")]
+    message_type: String,
+    node_id: String,
+    command: String,
+    success: bool,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+}
+
 /// Response to web client
 #[derive(Serialize)]
 struct QueryResponse {
@@ -60,7 +86,7 @@ struct PipelineUpdate {
 }
 
 /// Node inference request message (for scrolling log)
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct NodeInferenceRequestMessage {
     #[serde(rename = "type")]
     message_type: String,
@@ -70,6 +96,115 @@ struct NodeInferenceRequestMessage {
     timestamp: u64,
     input_preview: String, // First 100 chars of input
     layers: String, // "0-7" format
+}
+
+/// Node communication event message
+#[derive(Serialize, Clone)]
+struct NodeEventMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    event: String, // "command_sent", "command_received", "command_error", "node_joined", "shard_loaded"
+    node_id: String,
+    shard_id: Option<u32>,
+    command: Option<String>,
+    status: Option<String>,
+    latency_ms: Option<u64>,
+    timestamp: u64,
+    details: Option<String>,
+}
+
+/// Node status update from node to web server
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct NodeStatusUpdate {
+    #[serde(rename = "type")]
+    message_type: String,
+    node_id: String,
+    timestamp: u64,
+    status: NodeStatus,
+    operation_mode: OperationMode,
+    capabilities: Option<NodeCapabilitiesInfo>,
+    shard_id: Option<u32>,
+    active_requests: u32,
+    total_requests: u64,
+    last_error: Option<String>,
+}
+
+/// Node status enum
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum NodeStatus {
+    Online,
+    Offline,
+    Busy,
+    Idle,
+    Error,
+    Loading,
+}
+
+/// Operation mode for nodes
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum OperationMode {
+    Normal,      // Normal inference processing
+    Maintenance, // Maintenance mode - no new requests
+    Standby,     // Standby - ready but not processing
+    Shutdown,    // Shutting down
+}
+
+/// Node capabilities info (simplified for status updates)
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct NodeCapabilitiesInfo {
+    cpu_usage: f64,
+    memory_usage_mb: u64,
+    memory_available_mb: u64,
+    gpu_available: bool,
+    gpu_usage: Option<f64>,
+    latency_ms: f64,
+}
+
+/// Control command from web server to node
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct NodeControlCommand {
+    #[serde(rename = "type")]
+    message_type: String,
+    command: ControlCommandType,
+    node_id: String,
+    request_id: String,
+    timestamp: u64,
+    params: HashMap<String, serde_json::Value>,
+}
+
+/// Control command types
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ControlCommandType {
+    SetOperationMode,
+    GetStatus,
+    GetCapabilities,
+    Pause,
+    Resume,
+    Restart,
+    Shutdown,
+    UpdateConfig,
+}
+
+/// Per-node message queue structure
+struct NodeQueue {
+    node_id: String,
+    // Current node state
+    current_status: Arc<RwLock<NodeStatusUpdate>>,
+    // Last seen timestamp
+    last_seen: Arc<RwLock<u64>>,
+    // Pending commands waiting for response
+    pending_commands: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
+}
+
+/// Node queue manager - tracks all nodes and their message queues
+struct NodeQueueManager {
+    // Map of node_id -> NodeQueue
+    nodes: Arc<RwLock<HashMap<String, NodeQueue>>>,
+    // Broadcast channel for status updates to all WebSocket clients
+    status_broadcast_tx: tokio::sync::broadcast::Sender<NodeStatusUpdate>,
 }
 
 /// Pipeline status message sent to web client
@@ -188,6 +323,134 @@ struct DiscoveryBehaviour {
     request_response: request_response::Behaviour<JsonCodec>,
 }
 
+impl NodeQueueManager {
+    fn new() -> (Self, tokio::sync::broadcast::Receiver<NodeStatusUpdate>) {
+        let (status_broadcast_tx, status_broadcast_rx) = tokio::sync::broadcast::channel(128);
+        (
+            Self {
+                nodes: Arc::new(RwLock::new(HashMap::new())),
+                status_broadcast_tx,
+            },
+            status_broadcast_rx,
+        )
+    }
+
+    /// Register a new node and create its message queues
+    async fn register_node(&self, node_id: String, shard_id: Option<u32>) -> Result<(), String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let initial_status = NodeStatusUpdate {
+            message_type: "node_status".to_string(),
+            node_id: node_id.clone(),
+            timestamp: now,
+            status: NodeStatus::Online,
+            operation_mode: OperationMode::Normal,
+            capabilities: None,
+            shard_id,
+            active_requests: 0,
+            total_requests: 0,
+            last_error: None,
+        };
+        
+        let node_queue = NodeQueue {
+            node_id: node_id.clone(),
+            current_status: Arc::new(RwLock::new(initial_status.clone())),
+            last_seen: Arc::new(RwLock::new(now)),
+            pending_commands: Arc::new(Mutex::new(HashMap::new())),
+        };
+        
+        let mut nodes = self.nodes.write().await;
+        nodes.insert(node_id.clone(), node_queue);
+        drop(nodes);
+        
+        // Broadcast initial status
+        let _ = self.status_broadcast_tx.send(initial_status);
+        
+        println!("[QUEUE] Registered node {} with dedicated message queues", node_id);
+        Ok(())
+    }
+
+    /// Send a control command to a specific node (returns command for P2P sending)
+    fn create_control_command(&self, node_id: &str, command: ControlCommandType, params: HashMap<String, serde_json::Value>) -> Result<NodeControlCommand, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        Ok(NodeControlCommand {
+            message_type: "node_control".to_string(),
+            command,
+            node_id: node_id.to_string(),
+            request_id: format!("cmd-{}", now),
+            timestamp: now,
+            params,
+        })
+    }
+
+    /// Get current status of a node
+    async fn get_node_status(&self, node_id: &str) -> Option<NodeStatusUpdate> {
+        let nodes = self.nodes.read().await;
+        nodes.get(node_id).map(|nq| {
+            // Clone the current status
+            nq.current_status.blocking_read().clone()
+        })
+    }
+
+    /// Get all registered nodes
+    async fn list_nodes(&self) -> Vec<String> {
+        let nodes = self.nodes.read().await;
+        nodes.keys().cloned().collect()
+    }
+
+    /// Update node status (called when receiving status from node via P2P)
+    async fn update_node_status(&self, status: NodeStatusUpdate) {
+        let node_id = status.node_id.clone();
+        
+        // Update stored status
+        {
+            let nodes = self.nodes.read().await;
+            if let Some(node_queue) = nodes.get(&node_id) {
+                *node_queue.current_status.write().await = status.clone();
+                *node_queue.last_seen.write().await = status.timestamp;
+            } else {
+                // Auto-register node if not found
+                drop(nodes);
+                let _ = self.register_node(node_id.clone(), status.shard_id).await;
+                let nodes = self.nodes.read().await;
+                if let Some(node_queue) = nodes.get(&node_id) {
+                    *node_queue.current_status.write().await = status.clone();
+                    *node_queue.last_seen.write().await = status.timestamp;
+                }
+            }
+        }
+        
+        // Broadcast to all WebSocket clients
+        let _ = self.status_broadcast_tx.send(status);
+    }
+
+    /// Check if node is registered
+    async fn is_node_registered(&self, node_id: &str) -> bool {
+        let nodes = self.nodes.read().await;
+        nodes.contains_key(node_id)
+    }
+
+    /// Remove a node (when it disconnects)
+    async fn unregister_node(&self, node_id: &str) {
+        let mut nodes = self.nodes.write().await;
+        if nodes.remove(node_id).is_some() {
+            println!("[QUEUE] Unregistered node {}", node_id);
+        }
+    }
+
+    /// Get broadcast sender for status updates
+    fn status_broadcast_sender(&self) -> tokio::sync::broadcast::Sender<NodeStatusUpdate> {
+        self.status_broadcast_tx.clone()
+    }
+}
+
 /// The inference engine - uses real distributed pipeline
 struct InferenceEngine {
     coordinator: Arc<PipelineCoordinator>,
@@ -197,10 +460,18 @@ struct InferenceEngine {
     pending_responses: Arc<Mutex<HashMap<u64, oneshot::Sender<punch_simple::command_protocol::CommandResponse>>>>,
     discovery_task: Arc<tokio::task::JoinHandle<()>>,
     metrics: Arc<RwLock<SystemMetrics>>,
+    // Channel for broadcasting node events to all WebSocket connections
+    node_event_tx: Option<tokio::sync::broadcast::Sender<NodeEventMessage>>,
+    // Node queue manager for dedicated per-node communication
+    node_queue_manager: Arc<NodeQueueManager>,
 }
 
 impl InferenceEngine {
-    async fn new(bootstrap: &str, node_request_tx: Option<tokio::sync::broadcast::Sender<NodeInferenceRequestMessage>>) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(
+        bootstrap: &str, 
+        node_request_tx: Option<tokio::sync::broadcast::Sender<NodeInferenceRequestMessage>>,
+        node_event_tx: Option<tokio::sync::broadcast::Sender<NodeEventMessage>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Generate peer identity
         let key = identity::Keypair::generate_ed25519();
         let peer_id = PeerId::from(key.public());
@@ -239,10 +510,10 @@ impl InferenceEngine {
             .multiplex(yamux::Config::default())
             .boxed();
 
-        // Kademlia
+        // Kademlia DHT - Large timeout for reliable discovery
         let store = kad::store::MemoryStore::new(peer_id);
         let mut kademlia_config = kad::Config::default();
-        kademlia_config.set_query_timeout(Duration::from_secs(30));
+        kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
         let kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
 
         // Identify
@@ -278,7 +549,7 @@ impl InferenceEngine {
         }
         
         // Create pending responses map
-        let pending_responses = Arc::new(Mutex::new(HashMap::new()));
+        let pending_responses: Arc<Mutex<HashMap<u64, oneshot::Sender<punch_simple::command_protocol::CommandResponse>>>> = Arc::new(Mutex::new(HashMap::new()));
         
         // Create P2P command sender with real P2P communication
         let metrics_for_sender = Arc::clone(&metrics);
@@ -286,12 +557,14 @@ impl InferenceEngine {
         let pending_for_sender = Arc::clone(&pending_responses);
         let sender_peer_id = peer_id;
         let node_request_tx_for_sender = node_request_tx.clone();
+        let node_event_tx_for_sender = node_event_tx.clone();
         let command_sender = move |peer_id_str: String, cmd: punch_simple::command_protocol::Command| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<punch_simple::command_protocol::CommandResponse, punch_simple::PipelineError>> + Send>> {
             let metrics_clone = Arc::clone(&metrics_for_sender);
             let swarm_clone = Arc::clone(&swarm_for_sender);
             let pending_clone = Arc::clone(&pending_for_sender);
             let sender_peer_id_clone = sender_peer_id;
             let node_request_tx_clone = node_request_tx_for_sender.clone();
+            let node_event_tx_clone = node_event_tx_for_sender.clone();
             Box::pin(async move {
                 let cmd_start = Instant::now();
                 let is_load_shard = cmd.command == punch_simple::command_protocol::commands::LOAD_SHARD;
@@ -406,6 +679,25 @@ impl InferenceEngine {
                 println!("[P2P] 📤 Sending command {} to node {} (request_id: {})", cmd.command, peer_id_str, cmd_request_id);
                 println!("[P2P]   Command details: {:?}", serde_json::to_string(&cmd).unwrap_or_default());
                 
+                // Broadcast node event: command sent
+                if let Some(ref tx) = node_event_tx_clone {
+                    let event = NodeEventMessage {
+                        message_type: "node_event".to_string(),
+                        event: "command_sent".to_string(),
+                        node_id: peer_id_str.clone(),
+                        shard_id: Some(shard_id),
+                        command: Some(cmd.command.clone()),
+                        status: None,
+                        latency_ms: None,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                        details: Some(format!("Sending {} to node", cmd.command)),
+                    };
+                    let _ = tx.send(event);
+                }
+                
                 // Wait for response with timeout
                 println!("[P2P] ⏳ Waiting for response from {}...", peer_id_str);
                 let response = tokio::time::timeout(Duration::from_secs(30), rx).await;
@@ -422,6 +714,26 @@ impl InferenceEngine {
                 match response {
                     Ok(Ok(cmd_response)) => {
                         println!("[P2P] ✅ Received response from {}", peer_id_str);
+                        
+                        // Broadcast node event: command received
+                        if let Some(ref tx) = node_event_tx_clone {
+                            let status_str = format!("{:?}", cmd_response.status);
+                            let event = NodeEventMessage {
+                                message_type: "node_event".to_string(),
+                                event: "command_received".to_string(),
+                                node_id: peer_id_str.clone(),
+                                shard_id: Some(shard_id),
+                                command: Some(cmd.command.clone()),
+                                status: Some(status_str.clone()),
+                                latency_ms: Some(duration_ms),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                                details: Some(format!("Response received: {}", status_str)),
+                            };
+                            let _ = tx.send(event);
+                        }
                         
                         // Record command received
                         {
@@ -446,6 +758,25 @@ impl InferenceEngine {
                                     status: "loaded".to_string(),
                                     duration_ms: Some(duration_ms),
                                 });
+                                
+                                // Broadcast shard loaded event
+                                if let Some(ref tx) = node_event_tx_clone {
+                                    let event = NodeEventMessage {
+                                        message_type: "node_event".to_string(),
+                                        event: "shard_loaded".to_string(),
+                                        node_id: peer_id_str.clone(),
+                                        shard_id: Some(shard_id),
+                                        command: None,
+                                        status: Some("loaded".to_string()),
+                                        latency_ms: Some(duration_ms),
+                                        timestamp: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_secs(),
+                                        details: Some(format!("Shard {} loaded in {}ms", shard_id, duration_ms)),
+                                    };
+                                    let _ = tx.send(event);
+                                }
                             }
                         }
                         
@@ -453,6 +784,26 @@ impl InferenceEngine {
                     }
                     Ok(Err(_)) => {
                         eprintln!("[P2P] ❌ Channel error waiting for response from {}", peer_id_str);
+                        
+                        // Broadcast node event: command error
+                        if let Some(ref tx) = node_event_tx_clone {
+                            let event = NodeEventMessage {
+                                message_type: "node_event".to_string(),
+                                event: "command_error".to_string(),
+                                node_id: peer_id_str.clone(),
+                                shard_id: Some(shard_id),
+                                command: Some(cmd.command.clone()),
+                                status: Some("error".to_string()),
+                                latency_ms: None,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                                details: Some("Channel error".to_string()),
+                            };
+                            let _ = tx.send(event);
+                        }
+                        
                         Err(punch_simple::PipelineError::Internal { 
                             message: format!("Channel error from {}", peer_id_str) 
                         })
@@ -463,6 +814,26 @@ impl InferenceEngine {
                             let mut m = metrics_clone.write().await;
                             m.command_errors += 1;
                         }
+                        
+                        // Broadcast node event: command timeout
+                        if let Some(ref tx) = node_event_tx_clone {
+                            let event = NodeEventMessage {
+                                message_type: "node_event".to_string(),
+                                event: "command_error".to_string(),
+                                node_id: peer_id_str.clone(),
+                                shard_id: Some(shard_id),
+                                command: Some(cmd.command.clone()),
+                                status: Some("timeout".to_string()),
+                                latency_ms: None,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                                details: Some("Timeout waiting for response".to_string()),
+                            };
+                            let _ = tx.send(event);
+                        }
+                        
                         Err(punch_simple::PipelineError::Internal { 
                             message: format!("Timeout from {}", peer_id_str) 
                         })
@@ -480,6 +851,7 @@ impl InferenceEngine {
         let metrics_clone = Arc::clone(&metrics);
         let swarm_for_discovery = Arc::clone(&swarm_arc);
         let pending_for_discovery = Arc::clone(&pending_responses);
+        let node_event_tx_for_discovery = node_event_tx.clone();
         let discovery_task = tokio::spawn(async move {
             Self::run_dht_discovery_with_swarm(
                 bootstrap_clone, 
@@ -487,6 +859,7 @@ impl InferenceEngine {
                 metrics_clone,
                 swarm_for_discovery,
                 pending_for_discovery,
+                node_event_tx_for_discovery,
             ).await;
         });
         
@@ -526,6 +899,21 @@ impl InferenceEngine {
             }
         });
         
+        // Create node queue manager
+        let (node_queue_manager, _status_rx) = NodeQueueManager::new();
+        let node_queue_manager = Arc::new(node_queue_manager);
+        
+        // Start periodic status polling task - request status from all known nodes
+        let queue_manager_clone = Arc::clone(&node_queue_manager);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                // Process any pending status updates (nodes will send status automatically)
+                // This task can be extended to actively poll nodes if needed
+            }
+        });
+        
         Ok(Self {
             coordinator,
             peer_id,
@@ -533,6 +921,8 @@ impl InferenceEngine {
             pending_responses,
             discovery_task: Arc::new(discovery_task),
             metrics,
+            node_event_tx,
+            node_queue_manager,
         })
     }
 
@@ -543,6 +933,7 @@ impl InferenceEngine {
         metrics: Arc<RwLock<SystemMetrics>>,
         swarm: Arc<Mutex<Swarm<DiscoveryBehaviour>>>,
         pending_responses: Arc<Mutex<HashMap<u64, oneshot::Sender<punch_simple::command_protocol::CommandResponse>>>>,
+        node_event_tx: Option<tokio::sync::broadcast::Sender<NodeEventMessage>>,
     ) {
         println!("[DHT] Starting background DHT discovery with shared swarm...");
         
@@ -555,6 +946,7 @@ impl InferenceEngine {
             }
         };
         
+        let bootstrap_addr_for_dht = bootstrap_addr.clone();
         {
             let mut swarm = swarm.lock().await;
             println!("[DHT] Connecting to bootstrap: {}", bootstrap);
@@ -577,6 +969,8 @@ impl InferenceEngine {
         let coordinator_for_events = Arc::clone(&coordinator);
         let metrics_for_events = Arc::clone(&metrics);
         let bootstrapped_for_events = Arc::clone(&bootstrapped);
+        let node_event_tx_for_events = node_event_tx.clone();
+        let bootstrap_addr_for_events = bootstrap_addr_for_dht.clone();
         tokio::spawn(async move {
             use futures_util::StreamExt;
             loop {
@@ -586,14 +980,17 @@ impl InferenceEngine {
                 };
                 
                 match event {
-                    SwarmEvent::ConnectionEstablished { .. } => {
+                    SwarmEvent::ConnectionEstablished { peer_id: connected_peer, .. } => {
                         let mut boot = bootstrapped_for_events.lock().await;
                         if !*boot {
                             let mut swarm_guard = swarm_for_events.lock().await;
+                            // Add bootstrap node's address to Kademlia
+                            swarm_guard.behaviour_mut().kademlia.add_address(&connected_peer, bootstrap_addr_for_events.clone());
+                            
                             if let Err(e) = swarm_guard.behaviour_mut().kademlia.bootstrap() {
                                 eprintln!("[DHT] Bootstrap failed: {:?}", e);
                             } else {
-                                println!("[DHT] ✓ Started Kademlia bootstrap");
+                                println!("[DHT] ✓ Started Kademlia bootstrap with bootstrap node {}", connected_peer);
                                 *boot = true;
                             }
                         }
@@ -642,7 +1039,8 @@ impl InferenceEngine {
                             }) => {
                                 // Process discovered shard
                                 // This query result came from Kademlia's queue - closer nodes queried first
-                                if let Some(announcement) = coordinator_for_events.process_dht_record(&peer_record.record).await {
+                                match coordinator_for_events.process_dht_record(&peer_record.record).await {
+                                Some(announcement) => {
                                     // Calculate routing depth for this node based on query result
                                     // Nodes returned earlier in queries are typically closer (queue ordering)
                                     let local_peer_id = {
@@ -654,10 +1052,7 @@ impl InferenceEngine {
                                         let depth = estimate_bucket_depth(distance);
                                         
                                         // Update discovery with routing information
-                                        {
-                                            let mut discovery = coordinator_for_events.discovery.write().await;
-                                            discovery.update_routing_depth(announcement.peer_id.clone(), depth);
-                                        }
+                                        coordinator_for_events.update_routing_depth(announcement.peer_id.clone(), depth).await;
                                     }
                                     
                                     println!("[DHT] ✓ Discovered shard {} from {} (using queue/depth tree for routing)", 
@@ -678,11 +1073,39 @@ impl InferenceEngine {
                                         });
                                     }
                                     
+                                    // Register node in queue manager (if we have access to it)
+                                    // Note: We'll need to pass queue manager to discovery task
+                                    
+                                    // Broadcast node_joined event
+                                    if let Some(ref tx) = node_event_tx_for_events {
+                                        let event = NodeEventMessage {
+                                            message_type: "node_event".to_string(),
+                                            event: "node_joined".to_string(),
+                                            node_id: announcement.peer_id.clone(),
+                                            shard_id: Some(announcement.shard_id),
+                                            command: None,
+                                            status: Some("online".to_string()),
+                                            latency_ms: None,
+                                            timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_secs(),
+                                            details: Some(format!("Node joined with shard {}", announcement.shard_id)),
+                                        };
+                                        let _ = tx.send(event);
+                                    }
+                                    
                                     // Immediately update pipeline status after discovering a node
                                     let (online_nodes, total_nodes, missing_shards, is_complete) = coordinator_for_events.get_pipeline_status().await;
                                     println!("[DHT] Pipeline status after discovery: {}/{} nodes online, complete: {}", 
                                              online_nodes, total_nodes, is_complete);
                                 }
+                                None => {
+                                    eprintln!("[DHT] ⚠️  Failed to process DHT record - invalid or malformed announcement");
+                                    eprintln!("[DHT]   Record key: {:?}", peer_record.record.key);
+                                    eprintln!("[DHT]   Record value length: {} bytes", peer_record.record.value.len());
+                                }
+                            }
                             }
                             DiscoveryBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { 
                                 peer,
@@ -703,10 +1126,7 @@ impl InferenceEngine {
                                 let depth = estimate_bucket_depth(distance);
                                 
                                 // Update discovery with routing depth for better node selection
-                                {
-                                    let mut discovery = coordinator_for_events.discovery.write().await;
-                                    discovery.update_routing_depth(peer_id_str.clone(), depth);
-                                }
+                                coordinator_for_events.update_routing_depth(peer_id_str.clone(), depth).await;
                                 
                                 println!("[DHT] Routing updated: peer={}, depth={} (using Kademlia queue/depth tree for weighting)", 
                                          peer, depth);
@@ -1010,6 +1430,135 @@ impl InferenceEngine {
             }
         }
     }
+
+    /// Send a control command to a specific node
+    pub async fn send_node_control_command(
+        &self,
+        node_id: &str,
+        command: ControlCommandType,
+        params: HashMap<String, serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        // Register node if not already registered
+        if !self.node_queue_manager.is_node_registered(node_id).await {
+            // Try to get shard_id from coordinator if available
+            let shard_id = None; // Could query coordinator for this
+            self.node_queue_manager.register_node(node_id.to_string(), shard_id).await
+                .map_err(|e| format!("Failed to register node: {}", e))?;
+        }
+
+        // Create control command
+        let control_cmd = self.node_queue_manager.create_control_command(node_id, command, params)
+            .map_err(|e| format!("Failed to create command: {}", e))?;
+
+        // Convert to P2P Command format
+        let command_name = format!("NODE_CONTROL_{:?}", control_cmd.command);
+        let mut params = HashMap::new();
+        params.insert("control_command".to_string(), serde_json::to_value(&control_cmd).unwrap());
+        params.insert("request_id".to_string(), serde_json::Value::String(control_cmd.request_id.clone()));
+        
+        let p2p_command = punch_simple::command_protocol::Command {
+            command: command_name,
+            request_id: control_cmd.request_id.clone(),
+            from: self.peer_id.to_string(),
+            to: Some(node_id.to_string()),
+            timestamp: control_cmd.timestamp,
+            params,
+        };
+
+        // Send via P2P directly using swarm
+        let target_peer: PeerId = node_id.parse()
+            .map_err(|e| format!("Invalid peer ID: {}", e))?;
+        
+        let cmd_json = serde_json::to_string(&p2p_command)
+            .map_err(|e| format!("Serialization error: {}", e))?;
+        
+        let msg = JsonMessage::new(self.peer_id.to_string(), cmd_json);
+        
+        // Send request via P2P
+        let (tx, rx) = oneshot::channel();
+        let request_id_u64 = {
+            let mut swarm = self.swarm.lock().await;
+            let request_id = swarm.behaviour_mut().request_response.send_request(&target_peer, msg);
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            format!("{:?}", request_id).hash(&mut hasher);
+            hasher.finish()
+        };
+        
+        // Store channel for response
+        {
+            let mut pending = self.pending_responses.lock().await;
+            pending.insert(request_id_u64, tx);
+        }
+        
+        // Wait for response with timeout
+        let response = tokio::time::timeout(Duration::from_secs(30), rx).await;
+        
+        // Remove from pending
+        {
+            let mut pending = self.pending_responses.lock().await;
+            pending.remove(&request_id_u64);
+        }
+        
+        let cmd_response = match response {
+            Ok(Ok(cmd_response)) => cmd_response,
+            Ok(Err(_)) => return Err("Channel error".to_string()),
+            Err(_) => return Err("Timeout waiting for response".to_string()),
+        };
+
+        // Extract result from response
+        match cmd_response.status {
+            punch_simple::command_protocol::ResponseStatus::Success => {
+                cmd_response.result
+                    .ok_or_else(|| "No result in response".to_string())
+                    .and_then(|r| {
+                        r.get("result")
+                            .cloned()
+                            .ok_or_else(|| "No result field".to_string())
+                    })
+            }
+            _ => Err(cmd_response.error.unwrap_or_else(|| "Command failed".to_string())),
+        }
+    }
+
+    /// Get status of a specific node
+    pub async fn get_node_status(&self, node_id: &str) -> Option<NodeStatusUpdate> {
+        self.node_queue_manager.get_node_status(node_id).await
+    }
+
+    /// List all registered nodes
+    pub async fn list_nodes(&self) -> Vec<String> {
+        self.node_queue_manager.list_nodes().await
+    }
+
+    /// Update node status (called when receiving status from node)
+    pub async fn update_node_status(&self, status: NodeStatusUpdate) {
+        self.node_queue_manager.update_node_status(status).await;
+    }
+
+    /// Restart all 4 nodes (shards 0, 1, 2, 3)
+    pub async fn restart_all_nodes(&self) -> Result<String, String> {
+        println!("[SERVER] 🔄 Restarting all 4 nodes...");
+        
+        // Unregister all nodes from queue manager first
+        let node_ids = self.node_queue_manager.list_nodes().await;
+        for node_id in node_ids {
+            self.node_queue_manager.unregister_node(&node_id).await;
+        }
+        
+        // Use coordinator's restart method
+        match self.coordinator.restart_all_nodes().await {
+            Ok(_) => {
+                println!("[SERVER] ✅ Successfully restarted all nodes");
+                Ok("All 4 nodes restarted successfully. They will come online shortly.".to_string())
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to restart nodes: {}", e);
+                eprintln!("[SERVER] ❌ {}", error_msg);
+                Err(error_msg)
+            }
+        }
+    }
 }
 
 /// Generate contextual responses (DEPRECATED - now using real inference)
@@ -1113,7 +1662,14 @@ fn generate_response(query: &str) -> String {
 }
 
 /// Handle a WebSocket connection
-async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<InferenceEngine>, mut node_request_rx: tokio::sync::mpsc::Receiver<NodeInferenceRequestMessage>) {
+async fn handle_connection(
+    stream: TcpStream, 
+    addr: SocketAddr, 
+    engine: Arc<InferenceEngine>, 
+    mut node_request_rx: tokio::sync::broadcast::Receiver<NodeInferenceRequestMessage>,
+    mut node_event_rx: tokio::sync::broadcast::Receiver<NodeEventMessage>,
+    mut node_status_rx: tokio::sync::broadcast::Receiver<NodeStatusUpdate>,
+) {
     println!("[WS] New TCP connection from: {}", addr);
     
     let ws_stream = match accept_async(stream).await {
@@ -1137,10 +1693,13 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<Infe
     tokio::spawn(async move {
         while let Some(msg) = outgoing_rx.recv().await {
             if let Err(e) = write_sink.send(msg).await {
-                eprintln!("[WS] Failed to send message: {}", e);
+                eprintln!("[WS] ❌ Failed to send message: {}", e);
+                eprintln!("[WS]   Message type: {:?}", msg);
+                eprintln!("[WS]   Connection may be closed");
                 break;
             }
         }
+        eprintln!("[WS] Outgoing message channel closed");
     });
     
     // Wait a moment for WebSocket to be fully ready, then send initial pipeline status
@@ -1240,7 +1799,103 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<Infe
                     Some(Ok(Message::Text(text))) => {
                         println!("[WS] Received: {}", text);
                         
-                        // Parse request
+                        // Check for restart_all_nodes command
+                        if let Ok(restart_req) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if restart_req.get("type").and_then(|v| v.as_str()) == Some("restart_all_nodes") {
+                                println!("[WS] Received restart_all_nodes command");
+                                let engine_clone = Arc::clone(&engine);
+                                let outgoing_tx_clone = outgoing_tx.clone();
+                                
+                                tokio::spawn(async move {
+                                    let result = engine_clone.restart_all_nodes().await;
+                                    
+                                    let response = serde_json::json!({
+                                        "type": "restart_all_nodes_response",
+                                        "success": result.is_ok(),
+                                        "message": result.as_ref().ok().cloned().unwrap_or_else(|| result.unwrap_err()),
+                                    });
+                                    
+                                    let _ = outgoing_tx_clone.send(Message::Text(serde_json::to_string(&response).unwrap()));
+                                });
+                                
+                                continue;
+                            }
+                        }
+                        
+                        // Try to parse as node control request first
+                        if let Ok(mut control_req) = serde_json::from_str::<NodeControlRequest>(&text) {
+                            if control_req.message_type == "node_control" {
+                                println!("[WS] Processing node control command: {} for node {}", control_req.command, control_req.node_id);
+                                
+                                // Clone before using in match
+                                let control_req_clone = control_req.clone();
+                                let command_str = control_req.command.clone();
+                                
+                                // Parse command type
+                                let command_type = match command_str.as_str() {
+                                    "SET_OPERATION_MODE" => ControlCommandType::SetOperationMode,
+                                    "GET_STATUS" => ControlCommandType::GetStatus,
+                                    "GET_CAPABILITIES" => ControlCommandType::GetCapabilities,
+                                    "PAUSE" => ControlCommandType::Pause,
+                                    "RESUME" => ControlCommandType::Resume,
+                                    "RESTART" => ControlCommandType::Restart,
+                                    "SHUTDOWN" => ControlCommandType::Shutdown,
+                                    "UPDATE_CONFIG" => ControlCommandType::UpdateConfig,
+                                    _ => {
+                                        let error_response = NodeControlResponse {
+                                            message_type: "node_control_response".to_string(),
+                                            node_id: control_req_clone.node_id.clone(),
+                                            command: command_str.clone(),
+                                            success: false,
+                                            result: None,
+                                            error: Some(format!("Unknown command: {}", command_str)),
+                                            request_id: control_req_clone.request_id.clone(),
+                                        };
+                                        let _ = outgoing_tx.send(Message::Text(serde_json::to_string(&error_response).unwrap()));
+                                        continue;
+                                    }
+                                };
+                                
+                                let params = control_req.params.take().unwrap_or_default();
+                                let engine_clone = Arc::clone(&engine);
+                                let outgoing_tx_clone = outgoing_tx.clone();
+                                
+                                tokio::spawn(async move {
+                                    let result = engine_clone.send_node_control_command(
+                                        &control_req_clone.node_id,
+                                        command_type,
+                                        params,
+                                    ).await;
+                                    
+                                    let response = match result {
+                                        Ok(result_value) => NodeControlResponse {
+                                            message_type: "node_control_response".to_string(),
+                                            node_id: control_req_clone.node_id,
+                                            command: control_req_clone.command,
+                                            success: true,
+                                            result: Some(result_value),
+                                            error: None,
+                                            request_id: control_req_clone.request_id,
+                                        },
+                                        Err(e) => NodeControlResponse {
+                                            message_type: "node_control_response".to_string(),
+                                            node_id: control_req_clone.node_id,
+                                            command: control_req_clone.command,
+                                            success: false,
+                                            result: None,
+                                            error: Some(e),
+                                            request_id: control_req_clone.request_id,
+                                        },
+                                    };
+                                    
+                                    let _ = outgoing_tx_clone.send(Message::Text(serde_json::to_string(&response).unwrap()));
+                                });
+                                
+                                continue;
+                            }
+                        }
+                        
+                        // Parse as regular query request
                         let request: QueryRequest = match serde_json::from_str(&text) {
                             Ok(r) => r,
                             Err(_) => QueryRequest { query: text, request_id: None },
@@ -1315,6 +1970,44 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<Infe
                     }
                 }
             }
+            node_event = node_event_rx.recv() => {
+                // Handle node event messages from broadcast channel
+                match node_event {
+                    Ok(event) => {
+                        println!("[WS] Sending node event: {} from node {}", event.event, event.node_id);
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            if let Err(e) = outgoing_tx.send(Message::Text(json)) {
+                                eprintln!("[WS] Failed to send node event message: {}", e);
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Messages were dropped, continue
+                    }
+                    Err(e) => {
+                        eprintln!("[WS] Error receiving node event: {}", e);
+                    }
+                }
+            }
+            node_status = node_status_rx.recv() => {
+                // Handle node status updates from broadcast channel
+                match node_status {
+                    Ok(status) => {
+                        println!("[WS] Broadcasting node status update: node={}, status={:?}", status.node_id, status.status);
+                        if let Ok(json) = serde_json::to_string(&status) {
+                            if let Err(e) = outgoing_tx.send(Message::Text(json)) {
+                                eprintln!("[WS] Failed to send node status update: {}", e);
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Messages were dropped, continue
+                    }
+                    Err(e) => {
+                        eprintln!("[WS] Error receiving node status update: {}", e);
+                    }
+                }
+            }
         }
     }
 }
@@ -1380,11 +2073,20 @@ async fn serve_static(path: &str) -> Option<(String, Vec<u8>)> {
             format!("web/{}", clean_path)
         }
     };
+    
+    // Log file access attempts
+    if !file_path.starts_with("web/") {
+        eprintln!("[HTTP] ⚠️  Security: Blocked access to file outside web/ directory: {}", file_path);
+        return None;
+    }
 
     let full_path = std::path::Path::new(&file_path);
     
     match tokio::fs::read(full_path).await {
         Ok(content) => {
+            if content.is_empty() {
+                eprintln!("[HTTP] ⚠️  Warning: File is empty: {}", file_path);
+            }
             let content_type = match full_path.extension().and_then(|e| e.to_str()) {
                 Some("html") => "text/html",
                 Some("css") => "text/css",
@@ -1397,12 +2099,15 @@ async fn serve_static(path: &str) -> Option<(String, Vec<u8>)> {
             };
             Some((content_type.to_string(), content))
         }
-        Err(_) => None,
+        Err(e) => {
+            eprintln!("[HTTP] ❌ Failed to read file {}: {}", file_path, e);
+            None
+        }
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Run web server (extracted for unified binary)
+pub async fn run_web_server(bootstrap: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n");
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║          🔥 PROMETHOS-AI WEB SERVER 🔥                       ║");
@@ -1411,15 +2116,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║  WebSocket:   ws://localhost:8081                            ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-    // Create channel for node inference request messages (for scrolling log) - BEFORE creating engine
-    let (node_request_tx, mut node_request_rx) = tokio::sync::mpsc::channel::<NodeInferenceRequestMessage>(64);
+    // Create channels for node messages - BEFORE creating engine
+    let (node_request_tx, _) = tokio::sync::broadcast::channel::<NodeInferenceRequestMessage>(64);
+    let (node_event_tx, _) = tokio::sync::broadcast::channel::<NodeEventMessage>(128);
     
     // Initialize real inference engine with DHT discovery
-    let bootstrap = std::env::var("BOOTSTRAP").unwrap_or_else(|_| "/ip4/127.0.0.1/tcp/51820".to_string());
     println!("[SERVER] Connecting to DHT bootstrap: {}", bootstrap);
     
-    let engine = Arc::new(InferenceEngine::new(&bootstrap, Some(node_request_tx.clone())).await?);
+    let engine = Arc::new(InferenceEngine::new(&bootstrap, Some(node_request_tx.clone()), Some(node_event_tx.clone())).await?);
     println!("[SERVER] Inference engine initialized with real distributed pipeline");
+    
+    // Get node status broadcast receiver (for potential future use)
+    let _node_status_rx = engine.node_queue_manager.status_broadcast_sender().subscribe();
     
     // Spawn nodes for missing shards on startup
     println!("[SERVER] Ensuring minimal pipeline is ready...");
@@ -1451,18 +2159,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .and_then(|line| line.split_whitespace().nth(1))
                             .unwrap_or("/");
                         
-                        let response = if let Some((content_type, body)) = serve_static(path).await {
-                            let header = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-                                content_type,
-                                body.len()
-                            );
-                            [header.into_bytes(), body].concat()
-                        } else {
-                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found".to_vec()
+                        let response = match serve_static(path).await {
+                            Some((content_type, body)) => {
+                                let header = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                                    content_type,
+                                    body.len()
+                                );
+                                [header.into_bytes(), body].concat()
+                            }
+                            None => {
+                                eprintln!("[HTTP] 404 Not Found: {}", path);
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found".to_vec()
+                            }
                         };
                         
-                        let _ = stream.write_all(&response).await;
+                        if let Err(e) = stream.write_all(&response).await {
+                            eprintln!("[HTTP] ❌ Error writing response for {}: {}", path, e);
+                        }
                     }
                 });
             }
@@ -1475,8 +2189,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match ws_listener.accept().await {
             Ok((stream, addr)) => {
                 let engine_clone = Arc::clone(&engine);
-                let mut node_request_rx_clone = node_request_rx.resubscribe();
-                tokio::spawn(handle_connection(stream, addr, engine_clone, node_request_rx_clone));
+                let node_request_rx_clone = node_request_tx.subscribe();
+                let node_event_rx_clone = node_event_tx.subscribe();
+                let node_status_rx_clone = engine_clone.node_queue_manager.status_broadcast_sender().subscribe();
+                tokio::spawn(handle_connection(stream, addr, engine_clone, node_request_rx_clone, node_event_rx_clone, node_status_rx_clone));
             }
             Err(e) => {
                 eprintln!("[SERVER] Error accepting WebSocket connection: {}", e);
@@ -1484,5 +2200,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bootstrap = std::env::var("BOOTSTRAP").unwrap_or_else(|_| "/ip4/127.0.0.1/tcp/51820".to_string());
+    run_web_server(bootstrap).await
 }
 

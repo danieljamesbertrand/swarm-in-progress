@@ -5,3 +5,4 @@ echo "Describe a cat." | ./llama.cpp/build/bin/llama-cli -m models_cache/shards/
 
 
 
+

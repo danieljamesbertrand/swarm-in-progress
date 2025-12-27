@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Error Log - Promethos AI</title>
+    <style>
+        body {
+            font-family: 'JetBrains Mono', monospace;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            padding: 20px;
+        }
+        .error-entry {
+            background: #1a1a1a;
+            border-left: 3px solid #ff3b3b;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .error-entry strong {
+            color: #ff3b3b;
+        }
+        h1 {
+            color: #ff3b3b;
+        }
+        #clearLog {
+            background: #ff3b3b;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            cursor: pointer;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        #clearLog:hover {
+            background: #ff5555;
+        }
+    </style>
+</head>
+<body>
+    <h1>Error Log</h1>
+    <button id="clearLog">Clear Log</button>
+    <div id="errorLog"></div>
+    <script>
+        function loadErrors() {
+            if (window.errorLog && window.errorLog.length > 0) {
+                const container = document.getElementById('errorLog');
+                container.innerHTML = '';
+                window.errorLog.forEach(err => {
+                    const div = document.createElement('div');
+                    div.className = 'error-entry';
+                    div.innerHTML = `<strong>${err.timestamp}</strong><br>${err.message}<br>${err.error}`;
+                    if (err.stack) {
+                        div.innerHTML += `<br><pre style="font-size: 10px; color: #888;">${err.stack}</pre>`;
+                    }
+                    container.appendChild(div);
+                });
+            } else {
+                document.getElementById('errorLog').innerHTML = '<p>No errors logged</p>';
+            }
+        }
+        document.getElementById('clearLog').addEventListener('click', () => {
+            if (window.errorLog) {
+                window.errorLog = [];
+            }
+            loadErrors();
+        });
+        loadErrors();
+        setInterval(loadErrors, 1000);
+    </script>
+</body>
+</html>
+

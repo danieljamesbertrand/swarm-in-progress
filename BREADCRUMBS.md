@@ -12,16 +12,21 @@ This file tracks progress on protocol fixes implementation. If an agent loses co
 ### ✅ Step 1: Backup and Breadcrumb System
 - [x] Create backup directory
 - [x] Create breadcrumb file (this file)
-- [ ] Commit breadcrumb system to git
+- [x] Commit breadcrumb system to git
+- [x] Push to GitHub (commit: 27ecddc)
 
-### ⏳ Step 2: Fix DHT Timeouts
-- [ ] Standardize DHT query timeout to 120s (large value) across all nodes
-- [ ] Update `src/kademlia_shard_discovery.rs`
-- [ ] Update `src/bin/web_server.rs`
-- [ ] Update `src/shard_listener.rs`
-- [ ] Update `src/server.rs`
-- [ ] Update `src/monitor.rs`
-- [ ] Test and verify
+### ✅ Step 2: Fix DHT Timeouts
+- [x] Standardize DHT query timeout to 120s (large value) across all nodes
+- [x] Update `src/bin/web_server.rs` (30s → 120s)
+- [x] Update `src/shard_listener.rs` (60s → 120s)
+- [x] Update `src/dialer.rs` (60s → 120s)
+- [x] Update `src/listener.rs` (60s → 120s)
+- [x] Update `src/client_helper.rs` (60s → 120s)
+- [x] Update `src/torrent_client.rs` (60s → 120s)
+- [x] Update `src/torrent_server.rs` (60s → 120s)
+- [x] Update `src/server.rs` (default → 120s)
+- [x] Update `src/monitor.rs` (default → 120s)
+- [x] Verify no lint errors
 - [ ] Commit and push
 
 ### ⏳ Step 3: Add Keepalive (Ping Protocol)
@@ -77,10 +82,10 @@ This file tracks progress on protocol fixes implementation. If an agent loses co
 - [ ] Final commit and push to GitHub
 
 ## Current File Being Modified
-None yet - starting with Step 1
+Step 2 complete - DHT timeouts standardized to 120s
 
 ## Last Successful Commit
-None yet - starting fresh
+Step 1: 27ecddc - Add breadcrumb system and protocol analysis documentation
 
 ## Known Issues
 - None yet

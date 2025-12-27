@@ -627,10 +627,10 @@ pub async fn run_shard_listener(
         .multiplex(yamux::Config::default())
         .boxed();
 
-    // Kademlia DHT
+    // Kademlia DHT - Large timeout for reliable discovery
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia_config = kad::Config::default();
-    kademlia_config.set_query_timeout(Duration::from_secs(60));
+    kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
 
     // Bootstrap address will be added after we connect and get the bootstrap node's peer_id
@@ -700,10 +700,42 @@ pub async fn run_shard_listener(
     let refresh_interval = Duration::from_secs(refresh_interval);
     let mut next_refresh = tokio::time::Instant::now() + refresh_interval;
 
+    // Fallback announcement timer - if RoutingUpdated doesn't fire, announce anyway after timeout
+    let mut fallback_announce_deadline: Option<tokio::time::Instant> = None;
+
     println!("\n✅ Shard listener started! Waiting for connections...\n");
 
     loop {
         tokio::select! {
+            // Check fallback announcement deadline
+            _ = async {
+                if let Some(deadline) = fallback_announce_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    futures::future::pending::<()>().await;
+                }
+            }, if fallback_announce_deadline.is_some() => {
+                // Fallback deadline reached - force announcement
+                if !announced {
+                    println!("[DHT] ⚠️  No RoutingUpdated received after 15s, forcing announcement...");
+                    let s = state.read().await;
+                    let record = s.create_announcement_record();
+                    drop(s);
+                    
+                    if let Err(e) = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
+                        eprintln!("[DHT] ❌ Forced announcement failed: {:?}", e);
+                    } else {
+                        println!("\n[DHT] ═══════════════════════════════════════════════════════════════════════════");
+                        println!("[DHT] ✓✓✓ FORCED ANNOUNCEMENT - SHARD {} TO DHT ✓✓✓", shard_id);
+                        println!("[DHT]   Cluster: {}", cluster_name);
+                        println!("[DHT]   Shard ID: {}", shard_id);
+                        println!("[DHT]   Peer ID: {}", peer_id);
+                        println!("[DHT] ═══════════════════════════════════════════════════════════════════════════\n");
+                        announced = true;
+                    }
+                }
+                fallback_announce_deadline = None;
+            }
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -729,12 +761,16 @@ pub async fn run_shard_listener(
                             // Add bootstrap node's address to Kademlia (now we know its peer_id from the connection)
                             swarm.behaviour_mut().kademlia.add_address(&connected_peer, bootstrap_addr_for_dht.clone());
                             
-                            // Start Kademlia bootstrap
+                                // Start Kademlia bootstrap
                             if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
                                 eprintln!("[WARN] Bootstrap failed: {:?}", e);
                             } else {
                                 println!("[DHT] ✓ Started Kademlia bootstrap with bootstrap node {}", connected_peer);
                                 bootstrapped = true;
+                                
+                                // Set fallback deadline: if RoutingUpdated doesn't fire within 15 seconds, force announcement
+                                fallback_announce_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(15));
+                                println!("[DHT] Fallback announcement scheduled in 15s if RoutingUpdated doesn't fire");
                             }
                         }
                         
@@ -774,6 +810,9 @@ pub async fn run_shard_listener(
                         match behaviour_event {
                             ShardBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { peer, .. }) => {
                                 println!("[DHT] Routing updated: {}", peer);
+
+                                // Cancel fallback announcement since RoutingUpdated fired
+                                fallback_announce_deadline = None;
 
                                 // Check if we need to re-announce (e.g., after loading a shard)
                                 let mut s = state.write().await;

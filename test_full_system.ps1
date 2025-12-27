@@ -90,3 +90,4 @@ Write-Host "  3. Enter a query like 'What is 2+2?' and watch the pipeline stages
 Write-Host "  4. Check the browser console (F12) for WebSocket messages" -ForegroundColor White
 Write-Host ""
 
+

@@ -1,5 +1,8 @@
 //! Simple Kademlia Dialer - Discovers peers via DHT and connects
 //! Usage: cargo run --bin dialer [--bootstrap ADDR] [--namespace NAMESPACE]
+//! 
+//! Also available via unified node binary:
+//!   cargo run --bin node -- dialer --bootstrap ADDR --namespace NAMESPACE
 
 mod message;
 use message::{JsonMessage, JsonCodec};
@@ -46,14 +49,12 @@ struct Behaviour {
     relay: relay::Behaviour,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    
+/// Run dialer node (extracted for unified binary)
+pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<dyn Error>> {
     println!("=== Simple Kademlia Dialer ===\n");
     println!("Configuration:");
-    println!("  Bootstrap: {}", args.bootstrap);
-    println!("  Namespace: {}\n", args.namespace);
+    println!("  Bootstrap: {}", bootstrap);
+    println!("  Namespace: {}\n", namespace);
 
     let key = identity::Keypair::generate_ed25519();
     let peer_id = PeerId::from(key.public());
@@ -66,14 +67,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .multiplex(yamux::Config::default())
         .boxed();
     
-    // Kademlia DHT
+    // Kademlia DHT - Large timeout for reliable discovery
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia_config = kad::Config::default();
-    kademlia_config.set_query_timeout(Duration::from_secs(60));
+    kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
     
     // Add bootstrap node
-    let bootstrap_addr: Multiaddr = args.bootstrap.parse()?;
+    let bootstrap_addr: Multiaddr = bootstrap.parse()?;
     kademlia.add_address(&peer_id, bootstrap_addr.clone());
     
     // Identify
@@ -109,7 +110,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Bootstrap to DHT
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-    println!("[1] Bootstrapping to DHT via: {}\n", args.bootstrap);
+    println!("[1] Bootstrapping to DHT via: {}\n", bootstrap);
     
     // Connect to bootstrap node
     swarm.dial(bootstrap_addr.clone())?;
@@ -194,7 +195,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("✓ DHT bootstrapped! Discovering peers...");
                             
                             // Store our peer info in DHT
-                            let key = kad::RecordKey::new(&args.namespace);
+                            let key = kad::RecordKey::new(&namespace);
                             let value = peer_id.to_bytes();
                             let record = kad::Record::new(key.clone(), value);
                             if let Err(e) = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
@@ -344,4 +345,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    run_dialer(args.bootstrap, args.namespace).await
 }

@@ -1,5 +1,8 @@
 //! Simple Kademlia Bootstrap Node - Acts as a bootstrap node for the DHT network
 //! Usage: cargo run --bin server [--listen-addr ADDR] [--port PORT]
+//! 
+//! Also available via unified node binary:
+//!   cargo run --bin node -- bootstrap --listen-addr ADDR --port PORT
 
 use clap::Parser;
 use libp2p::{
@@ -38,13 +41,11 @@ struct Behaviour {
     relay: relay::Behaviour,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    
+/// Run bootstrap server (extracted for unified binary)
+pub async fn run_bootstrap(listen_addr: String, port: u16) -> Result<(), Box<dyn Error>> {
     println!("=== Simple Kademlia Bootstrap Node ===\n");
     println!("Configuration:");
-    println!("  Listen Address: {}:{}", args.listen_addr, args.port);
+    println!("  Listen Address: {}:{}", listen_addr, port);
     println!();
 
     // Generate local key and PeerId
@@ -59,9 +60,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .multiplex(yamux::Config::default())
         .boxed();
 
-    // Kademlia DHT behaviour (bootstrap node)
+    // Kademlia DHT behaviour (bootstrap node) - Large timeout for reliable discovery
     let store = kad::store::MemoryStore::new(local_peer_id);
-    let kademlia_config = kad::Config::default();
+    let mut kademlia_config = kad::Config::default();
+    kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
     let kademlia = kad::Behaviour::with_config(local_peer_id, store, kademlia_config);
 
     // Identify so clients can learn our addresses/peer id
@@ -92,13 +94,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     // Listen on specified address and port
-    let addr: Multiaddr = format!("/ip4/{}/tcp/{}", args.listen_addr, args.port).parse()?;
+    let addr: Multiaddr = format!("/ip4/{}/tcp/{}", listen_addr, port).parse()?;
     println!("Starting server...");
     swarm.listen_on(addr)?;
 
     println!("\n✅ Bootstrap node started! Waiting for connections...\n");
     println!("Clients can bootstrap to this node using:");
-    println!("  --bootstrap /ip4/{}/tcp/{}", args.listen_addr, args.port);
+    println!("  --bootstrap /ip4/{}/tcp/{}", listen_addr, port);
     println!("\nPress Ctrl+C to stop the bootstrap node.\n");
 
     // Main event loop
@@ -143,5 +145,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             _ => {}
         }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    run_bootstrap(args.listen_addr, args.port).await
 }
 
