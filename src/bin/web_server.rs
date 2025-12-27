@@ -260,9 +260,23 @@ impl InferenceEngine {
                         }
                         SwarmEvent::Behaviour(behaviour_event) => {
                             // The NetworkBehaviour macro generates DiscoveryBehaviourEvent enum
-                            // We need to match on it to handle Kademlia query results
-                            // For now, we'll rely on periodic queries - proper event handling can be added later
-                            let _ = behaviour_event;
+                            // Match on Kademlia events to process discovered shards
+                            // The enum name is auto-generated as {StructName}Event = DiscoveryBehaviourEvent
+                            match behaviour_event {
+                                DiscoveryBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+                                    result: kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_record))),
+                                    ..
+                                }) => {
+                                    // Process discovered shard
+                                    if let Some(announcement) = coordinator.process_dht_record(&peer_record.record).await {
+                                        println!("[DHT] ✓ Discovered shard {} from {}", announcement.shard_id, announcement.peer_id);
+                                    }
+                                }
+                                DiscoveryBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { .. }) => {
+                                    // Routing table updated - queries will be sent by periodic task
+                                }
+                                _ => {}
+                            }
                         }
                         _ => {}
                     }
