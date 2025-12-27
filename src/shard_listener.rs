@@ -34,6 +34,7 @@ use libp2p::{
     noise,
     yamux,
     kad,
+    ping,
     relay,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
@@ -186,6 +187,7 @@ struct Args {
 struct ShardBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: libp2p::identify::Behaviour,
+    ping: ping::Behaviour,
     request_response: request_response::Behaviour<JsonCodec>,
     metrics_response: request_response::Behaviour<MetricsCodec>,
     torrent_response: request_response::Behaviour<TorrentCodec>,
@@ -666,21 +668,29 @@ pub async fn run_shard_listener(
         request_response::Config::default(),
     );
 
+    // Ping protocol for connection keepalive (sends pings every 25 seconds)
+    let ping = ping::Behaviour::new(
+        ping::Config::new()
+            .with_interval(Duration::from_secs(25)) // Ping every 25 seconds
+            .with_timeout(Duration::from_secs(10)), // 10 second timeout
+    );
+
     // Relay
     let relay = relay::Behaviour::new(peer_id, relay::Config::default());
 
     let behaviour = ShardBehaviour {
         kademlia,
         identify,
+        ping,
         request_response,
         metrics_response,
         torrent_response,
         relay,
     };
 
-    // Swarm
+    // Swarm - Increased idle timeout since ping keeps connections alive
     let swarm_config = SwarmConfig::with_tokio_executor()
-        .with_idle_connection_timeout(Duration::from_secs(60));
+        .with_idle_connection_timeout(Duration::from_secs(90));
     let mut swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
 
     // Listen

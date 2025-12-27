@@ -29,14 +29,15 @@ This file tracks progress on protocol fixes implementation. If an agent loses co
 - [x] Verify no lint errors
 - [ ] Commit and push
 
-### ⏳ Step 3: Add Keepalive (Ping Protocol)
-- [ ] Add ping protocol to `src/shard_listener.rs`
-- [ ] Add ping protocol to `src/bin/web_server.rs`
-- [ ] Add ping protocol to `src/server.rs`
-- [ ] Add ping protocol to `src/listener.rs`
-- [ ] Add ping protocol to `src/dialer.rs`
-- [ ] Configure 25s interval (same as monitor)
-- [ ] Test and verify
+### ✅ Step 3: Add Keepalive (Ping Protocol)
+- [x] Add ping protocol to `src/shard_listener.rs`
+- [x] Add ping protocol to `src/bin/web_server.rs`
+- [x] Add ping protocol to `src/server.rs`
+- [x] Add ping protocol to `src/listener.rs`
+- [x] Add ping protocol to `src/dialer.rs`
+- [x] Configure 25s interval with 10s timeout (same as monitor)
+- [x] Update idle connection timeout to 90s (since ping keeps connections alive)
+- [x] Verify no lint errors
 - [ ] Commit and push
 
 ### ⏳ Step 4: Input Validation

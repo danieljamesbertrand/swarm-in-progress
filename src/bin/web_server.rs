@@ -24,6 +24,7 @@ use libp2p::{
     noise,
     yamux,
     kad,
+    ping,
     request_response::{self, ProtocolSupport},
     swarm::{Swarm, SwarmEvent},
     core::transport::Transport,
@@ -320,6 +321,7 @@ struct ShardLoadEvent {
 struct DiscoveryBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: libp2p::identify::Behaviour,
+    ping: ping::Behaviour,
     request_response: request_response::Behaviour<JsonCodec>,
 }
 
@@ -521,6 +523,13 @@ impl InferenceEngine {
             libp2p::identify::Config::new("web-server/1.0".to_string(), key.public())
         );
 
+        // Ping protocol for connection keepalive (sends pings every 25 seconds)
+        let ping = ping::Behaviour::new(
+            ping::Config::new()
+                .with_interval(Duration::from_secs(25)) // Ping every 25 seconds
+                .with_timeout(Duration::from_secs(10)), // 10 second timeout
+        );
+
         // Request-Response
         let request_response = request_response::Behaviour::with_codec(
             JsonCodec,
@@ -531,12 +540,13 @@ impl InferenceEngine {
         let behaviour = DiscoveryBehaviour {
             kademlia,
             identify,
+            ping,
             request_response,
         };
 
-        // Swarm
+        // Swarm - Increased idle timeout since ping keeps connections alive
         let swarm_config = SwarmConfig::with_tokio_executor()
-            .with_idle_connection_timeout(Duration::from_secs(60));
+            .with_idle_connection_timeout(Duration::from_secs(90));
         let swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
         
         // Listen on ephemeral port

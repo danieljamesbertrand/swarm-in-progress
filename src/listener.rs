@@ -17,6 +17,7 @@ use libp2p::{
     noise,
     yamux,
     kad,
+    ping,
     relay,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
@@ -49,6 +50,7 @@ struct Args {
 struct Behaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: libp2p::identify::Behaviour,
+    ping: ping::Behaviour,
     request_response: request_response::Behaviour<JsonCodec>,
     metrics_response: request_response::Behaviour<MetricsCodec>,
     relay: relay::Behaviour,
@@ -87,6 +89,13 @@ pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Bo
         libp2p::identify::Config::new("simple-listener/1.0".to_string(), key.public())
     );
     
+    // Ping protocol for connection keepalive (sends pings every 25 seconds)
+    let ping = ping::Behaviour::new(
+        ping::Config::new()
+            .with_interval(Duration::from_secs(25)) // Ping every 25 seconds
+            .with_timeout(Duration::from_secs(10)), // 10 second timeout
+    );
+    
     // Request-Response for JSON messaging using custom JSON codec
     let codec = JsonCodec;
     let request_response = request_response::Behaviour::with_codec(
@@ -109,11 +118,11 @@ pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Bo
         relay::Config::default(),
     );
     
-    let behaviour = Behaviour { kademlia, identify, request_response, metrics_response, relay };
+    let behaviour = Behaviour { kademlia, identify, ping, request_response, metrics_response, relay };
     
-    // Swarm
+    // Swarm - Increased idle timeout since ping keeps connections alive
     let swarm_config = SwarmConfig::with_tokio_executor()
-        .with_idle_connection_timeout(Duration::from_secs(60));
+        .with_idle_connection_timeout(Duration::from_secs(90));
     let mut swarm = Swarm::new(
         transport,
         behaviour,
