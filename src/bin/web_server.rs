@@ -61,6 +61,17 @@ struct PipelineUpdate {
     latency_ms: Option<u64>,
 }
 
+/// Pipeline status message sent to web client
+#[derive(Serialize)]
+struct PipelineStatusMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    total_nodes: u32,
+    online_nodes: u32,
+    missing_shards: Vec<u32>,
+    is_complete: bool,
+}
+
 /// Shard info for response
 #[derive(Serialize, Clone)]
 struct ShardInfo {
@@ -384,11 +395,46 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<Infe
 
     let (mut write, mut read) = ws_stream.split();
     
-    // Create channel for pipeline updates
-    let (update_tx, _update_rx) = tokio::sync::mpsc::channel::<PipelineUpdate>(32);
+    // Send initial pipeline status
+    {
+        let discovery = engine.coordinator.discovery.read().await;
+        let status = discovery.status();
+        let pipeline = discovery.get_pipeline();
+        let online_nodes = pipeline.len() as u32;
+        let total_shards = 4; // Expected shards
+        let missing_shards = discovery.get_missing_shards();
+        drop(discovery);
+        
+        let status_msg = PipelineStatusMessage {
+            message_type: "pipeline_status".to_string(),
+            total_nodes: total_shards,
+            online_nodes,
+            missing_shards,
+            is_complete: status.is_complete,
+        };
+        
+        let status_json = serde_json::to_string(&status_msg).unwrap();
+        if let Err(e) = write.send(Message::Text(status_json)).await {
+            eprintln!("[WS] Failed to send initial status: {}", e);
+        } else {
+            println!("[WS] Sent initial pipeline status: {} nodes online, complete: {}", online_nodes, status.is_complete);
+        }
+    }
     
-    // Spawn task to send updates
-    let mut write_clone = write;
+    // Create channel for pipeline updates
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<PipelineUpdate>(32);
+    
+    // Spawn task to send pipeline updates
+    let mut write_clone = write.clone();
+    tokio::spawn(async move {
+        while let Some(update) = update_rx.recv().await {
+            let update_json = serde_json::to_string(&update).unwrap();
+            if let Err(e) = write_clone.send(Message::Text(update_json)).await {
+                eprintln!("[WS] Failed to send update: {}", e);
+                break;
+            }
+        }
+    });
     
     while let Some(msg) = read.next().await {
         match msg {
@@ -407,9 +453,30 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<Infe
                 
                 // Send final response
                 let response_json = serde_json::to_string(&response).unwrap();
-                if let Err(e) = write_clone.send(Message::Text(response_json)).await {
+                if let Err(e) = write.send(Message::Text(response_json)).await {
                     eprintln!("[WS] Failed to send response: {}", e);
                     break;
+                }
+                
+                // Send updated pipeline status after query
+                {
+                    let discovery = engine.coordinator.discovery.read().await;
+                    let status = discovery.status();
+                    let pipeline = discovery.get_pipeline();
+                    let online_nodes = pipeline.len() as u32;
+                    let missing_shards = discovery.get_missing_shards();
+                    drop(discovery);
+                    
+                    let status_msg = PipelineStatusMessage {
+                        message_type: "pipeline_status".to_string(),
+                        total_nodes: 4,
+                        online_nodes,
+                        missing_shards,
+                        is_complete: status.is_complete,
+                    };
+                    
+                    let status_json = serde_json::to_string(&status_msg).unwrap();
+                    let _ = write.send(Message::Text(status_json)).await;
                 }
             }
             Ok(Message::Close(_)) => {

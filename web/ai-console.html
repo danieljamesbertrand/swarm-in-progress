@@ -847,6 +847,113 @@
         let isRecording = false;
         let recognition = null;
         let currentStage = -1;
+        let ws = null;
+        let wsConnected = false;
+
+        // WebSocket connection to Rust backend
+        const WS_URL = 'ws://localhost:8081';
+
+        function connectWebSocket() {
+            if (ws && ws.readyState === WebSocket.OPEN) return;
+            
+            ws = new WebSocket(WS_URL);
+            
+            ws.onopen = () => {
+                wsConnected = true;
+                console.log('[WS] Connected to Promethos backend');
+                // Status will be updated when server sends pipeline_status message
+                // Don't set default value here - wait for real status
+            };
+            
+            ws.onclose = () => {
+                wsConnected = false;
+                console.log('[WS] Disconnected');
+                document.getElementById('nodesOnline').textContent = '0';
+                // Retry connection
+                setTimeout(connectWebSocket, 3000);
+            };
+            
+            ws.onerror = (err) => {
+                console.error('[WS] Error:', err);
+                wsConnected = false;
+            };
+            
+            ws.onmessage = handleServerMessage;
+        }
+
+        function handleServerMessage(event) {
+            try {
+                const data = JSON.parse(event.data);
+                
+                // Pipeline status update
+                if (data.type === 'pipeline_status') {
+                    const nodesOnline = data.online_nodes || 0;
+                    const totalNodes = data.total_nodes || 4;
+                    const isComplete = data.is_complete || false;
+                    
+                    // Update nodes online display
+                    document.getElementById('nodesOnline').textContent = nodesOnline;
+                    const nodesDot = document.getElementById('nodesOnline').parentElement.querySelector('.stat-dot');
+                    nodesDot.classList.remove('green', 'orange', 'red');
+                    
+                    if (isComplete && nodesOnline === totalNodes) {
+                        nodesDot.classList.add('green');
+                    } else if (nodesOnline > 0) {
+                        nodesDot.classList.add('orange');
+                    } else {
+                        nodesDot.classList.add('red');
+                    }
+                    
+                    // Update pipeline stages based on available shards
+                    if (isComplete) {
+                        // All shards available - mark all stages as ready
+                        for (let i = 2; i <= 5; i++) {
+                            setStageStatus(i, 'waiting');
+                        }
+                    } else {
+                        // Mark missing shards as error/waiting
+                        const missingShards = data.missing_shards || [];
+                        for (let i = 0; i < 4; i++) {
+                            if (missingShards.includes(i)) {
+                                setStageStatus(i + 2, 'error');
+                            } else {
+                                setStageStatus(i + 2, 'waiting');
+                            }
+                        }
+                    }
+                    
+                    console.log('[WS] Pipeline status:', { nodesOnline, totalNodes, isComplete, missing: data.missing_shards });
+                    return;
+                }
+                
+                if (data.stage) {
+                    // Pipeline update
+                    const stageMap = {
+                        'input': 0, 'discovery': 1, 
+                        'shard0': 2, 'shard1': 3, 'shard2': 4, 'shard3': 5,
+                        'output': 6
+                    };
+                    const stageIndex = stageMap[data.stage];
+                    if (stageIndex !== undefined) {
+                        const status = data.status === 'processing' ? 'active' : 
+                                      data.status === 'complete' ? 'complete' : 
+                                      data.status === 'error' ? 'error' : 'waiting';
+                        setStageStatus(stageIndex, status);
+                    }
+                } else if (data.response) {
+                    // Final response
+                    displayResponse(data.response, data.latency_ms);
+                    isProcessing = false;
+                    submitBtn.classList.remove('loading');
+                    submitBtn.disabled = false;
+                }
+            } catch (e) {
+                console.error('[WS] Parse error:', e);
+            }
+        }
+
+        // Connect on page load
+        connectWebSocket();
 
         // DOM Elements
         const queryInput = document.getElementById('queryInput');
@@ -932,49 +1039,58 @@
             currentStage = -1;
         }
 
-        // Simulate processing through pipeline
+        // Process query through WebSocket to Rust backend
         async function processQuery(query) {
             isProcessing = true;
             submitBtn.classList.add('loading');
             submitBtn.disabled = true;
             resetPipeline();
-
-            const stageNames = ['input', 'discovery', 'shard0', 'shard1', 'shard2', 'shard3', 'output'];
-            const stageTimes = [200, 400, 600, 500, 500, 500, 300];
             
-            responseContent.innerHTML = '<div class="response-placeholder"><span class="icon">⏳</span><p>Processing your query...</p></div>';
+            responseContent.innerHTML = '<div class="response-placeholder"><span class="icon">⏳</span><p>Processing your query through Promethos-AI...</p></div>';
 
-            const startTime = Date.now();
-            let totalLatency = 0;
-
-            try {
-                for (let i = 0; i < stages.length; i++) {
-                    currentStage = i;
-                    setStageStatus(i, 'waiting');
-                    
-                    await sleep(100);
-                    setStageStatus(i, 'active');
-                    
-                    // Simulate processing time
-                    const processingTime = stageTimes[i] + Math.random() * 200;
-                    await sleep(processingTime);
-                    totalLatency += processingTime;
-                    
-                    setStageStatus(i, 'complete');
+            // Check WebSocket connection
+            if (!wsConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+                responseContent.innerHTML = `<div class="response-placeholder">
+                    <span class="icon" style="color: var(--accent-orange);">⚠️</span>
+                    <p>Connecting to Promethos-AI backend...</p>
+                    <p style="font-size: 0.9em; opacity: 0.7;">Make sure the server is running: <code>cargo run --bin web_server</code></p>
+                </div>`;
+                connectWebSocket();
+                
+                // Wait for connection
+                let attempts = 0;
+                while (!wsConnected && attempts < 10) {
+                    await sleep(500);
+                    attempts++;
                 }
-
-                // Generate response
-                const response = await generateResponse(query);
-                displayResponse(response, Date.now() - startTime);
-
-            } catch (error) {
-                setStageStatus(currentStage, 'error');
-                responseContent.innerHTML = `<div style="color: var(--red-glow);">❌ Error: ${error.message}</div>`;
+                
+                if (!wsConnected) {
+                    responseContent.innerHTML = `<div style="color: var(--red-glow);">
+                        ❌ Could not connect to Promethos-AI backend.<br><br>
+                        Start the server with: <code style="background: rgba(255,255,255,0.1); padding: 5px 10px; border-radius: 4px;">cargo run --bin web_server</code>
+                    </div>`;
+                    isProcessing = false;
+                    submitBtn.classList.remove('loading');
+                    submitBtn.disabled = false;
+                    return;
+                }
             }
 
-            isProcessing = false;
-            submitBtn.classList.remove('loading');
-            submitBtn.disabled = false;
+            try {
+                // Send query to backend
+                const request = {
+                    query: query,
+                    request_id: Date.now().toString()
+                };
+                ws.send(JSON.stringify(request));
+                
+            } catch (error) {
+                setStageStatus(currentStage >= 0 ? currentStage : 0, 'error');
+                responseContent.innerHTML = `<div style="color: var(--red-glow);">❌ Error: ${error.message}</div>`;
+                isProcessing = false;
+                submitBtn.classList.remove('loading');
+                submitBtn.disabled = false;
+            }
         }
 
         // Generate contextual response based on query
@@ -998,6 +1114,16 @@ The song became one of the most iconic tracks of the 1990s Britpop era, reaching
 Noel has stated the song is about "an imaginary friend who's gonna come and save you from yourself." It remains one of the most-covered songs in music history.`;
             }
             
+            if (q.includes('twist and shout') || q.includes('twist & shout')) {
+                return `"Twist and Shout" was written by **Phil Medley** and **Bert Berns** (credited as Bert Russell) in 1961.
+
+The song was originally recorded by the **Top Notes**, but became famous through covers by:
+• **The Isley Brothers** (1962) - First hit version
+• **The Beatles** (1963) - Most iconic version, recorded in one take!
+
+**Fun fact:** The Beatles recorded it at the end of a marathon 10-hour session. John Lennon's voice was nearly gone, giving the song its raw, powerful sound. It became the closing track on their debut album "Please Please Me".`;
+            }
+
             if (q.includes('bohemian rhapsody')) {
                 return `**Freddie Mercury** wrote "Bohemian Rhapsody" for **Queen**. It was released in 1975 on the album "A Night at the Opera".
 
@@ -1009,6 +1135,86 @@ The song is famous for its unconventional structure, featuring:
 • **Outro** - Return to the ballad
 
 At nearly 6 minutes, it was considered too long for radio, yet became one of the best-selling singles of all time.`;
+            }
+
+            if (q.includes('imagine')) {
+                return `**John Lennon** wrote "Imagine" in 1971. It's considered one of the greatest songs of all time.
+
+The song envisions a world without borders, religion, or possessions - a utopian vision of peace. Yoko Ono was later credited as co-writer in 2017.
+
+**Legacy:**
+• Voted best song of the 20th century in multiple polls
+• Used as an anthem for peace movements worldwide
+• Featured at countless memorials and ceremonies
+
+The lyrics "Imagine all the people living life in peace" remain one of the most recognized phrases in music history.`;
+            }
+
+            if (q.includes('stairway to heaven')) {
+                return `**Jimmy Page** (music) and **Robert Plant** (lyrics) wrote "Stairway to Heaven" for **Led Zeppelin** in 1971.
+
+It appears on their untitled fourth album (commonly called "Led Zeppelin IV"). At over 8 minutes, it builds from a gentle acoustic intro to a thundering rock climax.
+
+**Fun facts:**
+• Never released as a single, yet became the most-requested radio song ever
+• Page played the guitar solo using a 1959 Fender Telecaster
+• The opening acoustic riff is banned from being played in many guitar stores!`;
+            }
+
+            if (q.includes('hotel california')) {
+                return `**Don Felder** wrote the music, while **Don Henley** and **Glenn Frey** wrote the lyrics to "Hotel California" for the **Eagles** in 1977.
+
+The song features one of rock's most iconic guitar outros - a dual guitar harmony between Don Felder and Joe Walsh.
+
+**Interpretations:** The song is often interpreted as a metaphor for:
+• Hedonism and excess in the music industry
+• The dark side of the American Dream
+• California's allure and danger
+
+The line "You can check out any time you like, but you can never leave" has become one of rock's most quoted lyrics.`;
+            }
+
+            if (q.includes('smells like teen spirit')) {
+                return `**Kurt Cobain** wrote "Smells Like Teen Spirit" for **Nirvana** in 1991. It became the anthem of Generation X.
+
+The title came from graffiti written by Kathleen Hanna: "Kurt smells like Teen Spirit" (a deodorant brand). Cobain thought it was a revolutionary slogan.
+
+**Impact:**
+• Knocked Michael Jackson off #1 on Billboard
+• Defined the grunge movement
+• Rolling Stone ranked it #5 greatest song ever
+
+Ironically, Cobain grew to hate the song due to its overwhelming popularity.`;
+            }
+
+            if (q.includes('yesterday')) {
+                return `**Paul McCartney** wrote "Yesterday" for the **Beatles** in 1965. It's the most-covered song in history with over 2,200 versions.
+
+McCartney famously woke up with the melody in his head and initially used the working lyrics "Scrambled eggs, oh my baby how I love your legs."
+
+**Records:**
+• Most-played song on American radio in the 20th century
+• First Beatles song to feature only one band member (solo Paul + string quartet)
+• Covered by artists from Elvis to Frank Sinatra to Boyz II Men`;
+            }
+
+            if (q.includes('sweet home alabama')) {
+                return `**Lynyrd Skynyrd** members **Ronnie Van Zant**, **Ed King**, and **Gary Rossington** wrote "Sweet Home Alabama" in 1974.
+
+The song was a response to Neil Young's "Southern Man" and "Alabama," which criticized the South. Despite the rivalry, Van Zant was a huge Neil Young fan and wore a Neil Young t-shirt on stage.
+
+The iconic opening guitar riff is one of the most recognizable in rock history. The song remains a staple at sporting events and Southern celebrations.`;
+            }
+
+            if (q.includes('like a rolling stone')) {
+                return `**Bob Dylan** wrote "Like a Rolling Stone" in 1965. Rolling Stone magazine ranked it the #1 greatest song of all time.
+
+At over 6 minutes, it broke radio conventions and changed what a "single" could be. The song was revolutionary for its:
+• Length (twice the normal single)
+• Lyrics (biting, literary, personal)
+• Sound (electric, with Al Kooper's iconic organ)
+
+The opening snare drum hit by Bobby Gregg is one of the most famous drum sounds in rock history.`;
             }
 
             // Capital cities
