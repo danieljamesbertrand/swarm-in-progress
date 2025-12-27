@@ -265,8 +265,8 @@ impl DynamicShardLoader {
             use serde_json::json;
             
             let cmd = Command::new(commands::LOAD_SHARD, "coordinator", Some(node_id))
-                .with_param("shard_id".to_string(), json!(shard_id))
-                .with_param("model_name".to_string(), json!(model_name));
+                .with_param("shard_id", json!(shard_id))
+                .with_param("model_name", json!(model_name));
             
             println!("[LOADER] Sending LOAD_SHARD command to node {}", node_id);
             match sender(node_id.to_string(), cmd).await {
