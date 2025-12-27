@@ -114,6 +114,14 @@ impl ShardNode {
 struct InferenceEngine {
     coordinator: Arc<PipelineCoordinator>,
     peer_id: PeerId,
+    swarm: Arc<tokio::sync::Mutex<Option<libp2p::swarm::Swarm<ClientBehaviour>>>>,
+}
+
+#[derive(libp2p::swarm::NetworkBehaviour)]
+struct ClientBehaviour {
+    kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    identify: libp2p::identify::Behaviour,
+    request_response: request_response::Behaviour<JsonCodec>,
 }
 
 impl InferenceEngine {
@@ -194,7 +202,18 @@ impl InferenceEngine {
         }
 
         // Submit to pipeline coordinator
+        println!("[INFERENCE] Submitting inference request: {}", query);
+        
+        // Check pipeline status before submitting
+        let (online_nodes, total_nodes, missing_shards, is_complete) = self.coordinator.get_pipeline_status().await;
+        println!("[INFERENCE] Pipeline status: {}/{} nodes online, complete: {}, missing: {:?}", 
+                 online_nodes, total_nodes, is_complete, missing_shards);
+        
         let result = self.coordinator.submit_inference(inference_request).await;
+        match &result {
+            Ok(_) => println!("[INFERENCE] ✓ Inference request succeeded"),
+            Err(e) => eprintln!("[INFERENCE] ✗ Inference request failed: {}", e),
+        }
 
         if let Some(sender) = update_sender {
             let _ = sender.send(PipelineUpdate {
