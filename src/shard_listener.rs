@@ -28,6 +28,10 @@ use metrics::{MetricsCodec, PeerMetrics};
 use kademlia_shard_discovery::{KademliaShardDiscovery, ShardAnnouncement, dht_keys, PipelineStatus};
 use command_protocol::{Command, CommandResponse, ResponseStatus, commands};
 use command_validation::{validate_command, ValidationError};
+use punch_simple::protocol_logging::{
+    log_connection_established, log_connection_closed, log_connection_failed,
+    log_transaction_started, log_transaction_completed, log_transaction_failed,
+};
 
 use clap::Parser;
 use libp2p::{
@@ -844,6 +848,7 @@ pub async fn run_shard_listener(
 
                     SwarmEvent::ConnectionClosed { peer_id: closed_peer, cause, .. } => {
                         println!("[DISCONNECT] ✗ Peer disconnected: {} ({:?})", closed_peer, cause);
+                        log_connection_closed(&closed_peer.to_string(), "unknown", "P2P");
                     }
 
                     SwarmEvent::Behaviour(behaviour_event) => {
@@ -984,21 +989,29 @@ pub async fn run_shard_listener(
                                 
                                 // Parse command from message
                                 if let Ok(cmd) = serde_json::from_str::<Command>(&request.message) {
+                                    let cmd_start_time = std::time::Instant::now();
+                                    
                                     println!("[COMMAND] ✓ Parsed command: {}", cmd.command);
                                     println!("[COMMAND]   Request ID: {}", cmd.request_id);
                                     println!("[COMMAND]   From: {} → To: {}", cmd.from, peer);
                                     println!("[COMMAND]   Params: {:?}", cmd.params);
                                     
+                                    // Log transaction started
+                                    log_transaction_started("JSON_COMMAND", &cmd.command, &cmd.request_id, &cmd.from, Some(&peer.to_string()));
+                                    
                                     // Validate command input before processing
                                     let validation_result = validate_command(&cmd);
                                     if let Err(validation_error) = validation_result {
                                         eprintln!("[COMMAND] ✗ Validation failed: {}", validation_error);
+                                        let error_msg = format!("Input validation failed: {}", validation_error);
+                                        log_transaction_failed("JSON_COMMAND", &cmd.command, &cmd.request_id, &cmd.from, Some(&peer.to_string()), &error_msg);
+                                        
                                         let error_response = CommandResponse::error(
                                             &cmd.command,
                                             &cmd.request_id,
                                             &peer_id.to_string(),
                                             &cmd.from,
-                                            &format!("Input validation failed: {}", validation_error)
+                                            &error_msg
                                         );
                                         if let Err(e) = channel.send_response(serde_json::to_string(&error_response).unwrap().into()) {
                                             eprintln!("[COMMAND] Failed to send validation error response: {}", e);

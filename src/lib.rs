@@ -27,6 +27,7 @@
 pub mod message;
 pub mod command_protocol;
 pub mod command_validation;
+pub mod protocol_logging;
 pub mod capability_collector;
 pub mod ai_inference_handler;
 pub mod llama_fragment_processor;
@@ -40,6 +41,10 @@ pub mod shard_optimization;
 pub use message::{JsonMessage, JsonCodec};
 pub use command_protocol::{Command, CommandResponse, NodeCapabilities, NodeWeights, ReputationData, ResponseStatus, commands};
 pub use command_validation::{validate_command, ValidationError};
+pub use protocol_logging::{
+    log_connection_established, log_connection_closed, log_connection_failed,
+    log_transaction_started, log_transaction_completed, log_transaction_failed, log_transaction_timeout,
+};
 pub use capability_collector::CapabilityCollector;
 pub use ai_inference_handler::{AIInferenceRequest, process_ai_inference, create_ai_inference_response, create_ai_inference_error_response};
 pub use llama_fragment_processor::{LlamaJob, LlamaFragment, FragmentResult, JobResult, process_fragment};
