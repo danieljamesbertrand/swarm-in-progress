@@ -12,6 +12,8 @@ This project provides a decentralized P2P networking solution with multiple comp
 - **monitor** - Web-based network monitoring dashboard
 - **torrent_server** - Serves files via BitTorrent-like protocol over libp2p
 - **torrent_client** - Downloads files from peers via DHT discovery
+- **shard_listener** - Distributed AI inference node for Llama models
+- **web_server** - Web interface for AI inference with auto-scaling
 
 ## Key Features
 
@@ -22,6 +24,8 @@ This project provides a decentralized P2P networking solution with multiple comp
 - **File Sharing**: BitTorrent-like file sharing with DHT-based discovery
 - **NAT Traversal**: Relay protocol for connecting peers behind NATs
 - **Web Monitoring**: Real-time network dashboard with metrics and visualization
+- **Distributed AI Inference**: Distributed Llama model inference with shard-based processing
+- **Auto-Scaling**: On-demand node spawning for missing shards
 - **Cross-platform**: Works on Windows, Linux, and macOS
 - **Simple API**: Easy-to-use client helper for integration into your applications
 
@@ -416,6 +420,18 @@ Complete guide for connecting peers across the internet without a central rendez
 - Production deployment checklist
 
 See [EXTERNAL_IP_CONNECTION.md](EXTERNAL_IP_CONNECTION.md) for comprehensive documentation.
+
+### Distributed AI Inference
+
+The project includes a distributed inference system for Llama models:
+
+- **Shard-based Processing**: Models split into shards across multiple nodes
+- **Dynamic Shard Loading**: Load shards on existing nodes when needed
+- **Node Spawning**: Automatically spawn new nodes when shards are missing
+- **Adaptive Strategy**: Tries multiple approaches (loading → waiting → spawning → fallback)
+- **Web Interface**: Real-time AI inference via web UI
+
+See [NODE_SPAWNING.md](NODE_SPAWNING.md) for detailed documentation on node spawning and auto-scaling.
 
 ## License
 

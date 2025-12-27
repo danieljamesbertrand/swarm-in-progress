@@ -13,7 +13,7 @@ use tokio::time::{sleep, Duration, Instant};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures_util::{StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
-use punch_simple::pipeline_coordinator::{PipelineCoordinator, InferenceRequest, PipelineStrategy};
+use punch_simple::pipeline_coordinator::{PipelineCoordinator, InferenceRequest, PipelineStrategy, NodeSpawner};
 use punch_simple::kademlia_shard_discovery::KademliaShardDiscovery;
 use punch_simple::llama_model_loader::LlamaModelManager;
 use punch_simple::message::{JsonMessage, JsonCodec};
@@ -114,8 +114,19 @@ impl InferenceEngine {
         // Create discovery
         let discovery = KademliaShardDiscovery::with_expected_shards("llama-cluster", 4);
         
-        // Create pipeline coordinator with strategy
-        let mut coordinator = PipelineCoordinator::new(discovery);
+        // Create node spawner for on-demand node creation
+        let spawner = NodeSpawner::new(
+            bootstrap.to_string(),
+            "llama-cluster".to_string(),
+            4,  // total_shards
+            32, // total_layers
+            "llama-8b".to_string(),
+            "models_cache/shards".to_string(),
+        );
+
+        // Create pipeline coordinator with spawner and strategy
+        let mut coordinator = PipelineCoordinator::new(discovery)
+            .with_node_spawner(spawner);
         coordinator.set_strategy(PipelineStrategy::Adaptive {
             wait_timeout_secs: 30,
             min_memory_for_shard_mb: 4096,

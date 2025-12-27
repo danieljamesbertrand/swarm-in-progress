@@ -38,6 +38,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, RwLock, Mutex};
+use tokio::process::Command as TokioCommand;
+use std::process::Stdio;
 
 /// Strategy for handling incomplete pipelines
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -70,6 +72,18 @@ pub enum PipelineStrategy {
         wait_timeout_secs: u64,
         min_memory_for_shard_mb: u64,
         min_memory_for_full_mb: u64,
+    },
+    
+    /// Spawn new nodes on demand when shards are missing
+    SpawnNodes {
+        /// Maximum nodes to spawn per request
+        max_nodes_per_request: u32,
+        /// Minimum memory (MB) required per spawned node
+        min_memory_per_node_mb: u64,
+        /// Spawn command template (e.g., "cargo run --bin shard_listener -- --shard-id {shard_id}")
+        spawn_command_template: String,
+        /// Timeout for node to come online (seconds)
+        node_startup_timeout_secs: u64,
     },
 }
 
@@ -212,6 +226,183 @@ impl std::error::Error for PipelineError {}
 
 /// Command sender function type for sending commands to nodes
 pub type CommandSender = Box<dyn Fn(String, crate::command_protocol::Command) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::command_protocol::CommandResponse, PipelineError>> + Send>> + Send + Sync>;
+
+/// Node spawner for creating shard_listener processes on demand
+pub struct NodeSpawner {
+    /// Spawned node processes (shard_id -> process handle)
+    spawned_nodes: Arc<RwLock<HashMap<u32, tokio::process::Child>>>,
+    /// Bootstrap address for spawned nodes
+    bootstrap_addr: String,
+    /// Cluster name
+    cluster_name: String,
+    /// Total shards in cluster
+    total_shards: u32,
+    /// Total layers in model
+    total_layers: u32,
+    /// Model name
+    model_name: String,
+    /// Shards directory
+    shards_dir: String,
+}
+
+impl NodeSpawner {
+    pub fn new(
+        bootstrap_addr: String,
+        cluster_name: String,
+        total_shards: u32,
+        total_layers: u32,
+        model_name: String,
+        shards_dir: String,
+    ) -> Self {
+        Self {
+            spawned_nodes: Arc::new(RwLock::new(HashMap::new())),
+            bootstrap_addr,
+            cluster_name,
+            total_shards,
+            total_layers,
+            model_name,
+            shards_dir,
+        }
+    }
+
+    /// Spawn a new shard_listener node for a specific shard
+    pub async fn spawn_node_for_shard(&self, shard_id: u32) -> Result<(), PipelineError> {
+        // Check if node already exists
+        let spawned = self.spawned_nodes.read().await;
+        if spawned.contains_key(&shard_id) {
+            println!("[SPAWNER] Node for shard {} already exists", shard_id);
+            return Ok(());
+        }
+        drop(spawned);
+
+        println!("[SPAWNER] Spawning node for shard {}...", shard_id);
+
+        // Build command to spawn shard_listener
+        let mut cmd = TokioCommand::new("cargo");
+        cmd.args(&[
+            "run",
+            "--bin",
+            "shard_listener",
+            "--",
+            "--bootstrap",
+            &self.bootstrap_addr,
+            "--cluster",
+            &self.cluster_name,
+            "--shard-id",
+            &shard_id.to_string(),
+            "--total-shards",
+            &self.total_shards.to_string(),
+            "--total-layers",
+            &self.total_layers.to_string(),
+            "--model-name",
+            &self.model_name,
+            "--shards-dir",
+            &self.shards_dir,
+            "--enable-torrent",
+        ]);
+        
+        // Spawn process in background
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.stdin(Stdio::null());
+
+        match cmd.spawn() {
+            Ok(mut child) => {
+                println!("[SPAWNER] ✓ Spawned shard_listener process for shard {} (PID: {:?})", shard_id, child.id());
+                
+                // Store process handle
+                let mut spawned = self.spawned_nodes.write().await;
+                spawned.insert(shard_id, child);
+                
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[SPAWNER] Failed to spawn node for shard {}: {}", shard_id, e);
+                Err(PipelineError::ShardLoadFailed {
+                    shard_id,
+                    error: format!("Failed to spawn node: {}", e),
+                })
+            }
+        }
+    }
+
+    /// Wait for a spawned node to come online and join DHT
+    pub async fn wait_for_node_online(
+        &self,
+        shard_id: u32,
+        timeout_secs: u64,
+        discovery: &Arc<RwLock<KademliaShardDiscovery>>,
+    ) -> Result<(), PipelineError> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let check_interval = Duration::from_millis(500);
+
+        println!("[SPAWNER] Waiting for shard {} node to come online (timeout: {}s)...", shard_id, timeout_secs);
+
+        while Instant::now() < deadline {
+            // Check if shard is now available in discovery
+            let pipeline: Vec<ShardAnnouncement> = {
+                let disc = discovery.read().await;
+                disc.get_pipeline().into_iter().cloned().collect()
+            };
+
+            // Check if our shard is in the pipeline
+            if pipeline.iter().any(|s| s.shard_id == shard_id) {
+                println!("[SPAWNER] ✓ Shard {} node is online and discovered!", shard_id);
+                return Ok(());
+            }
+
+            // Check if process handle exists (we can't check status without mutable access)
+            // The process will be cleaned up when we try to wait on it later
+            let _process_exists = {
+                let spawned = self.spawned_nodes.read().await;
+                spawned.contains_key(&shard_id)
+            };
+
+            tokio::time::sleep(check_interval).await;
+        }
+
+        Err(PipelineError::Timeout {
+            missing_shards: vec![shard_id],
+            waited_secs: timeout_secs,
+        })
+    }
+
+    /// Get list of spawned shard IDs
+    pub async fn get_spawned_shards(&self) -> Vec<u32> {
+        self.spawned_nodes.read().await.keys().cloned().collect()
+    }
+
+    /// Terminate a spawned node
+    pub async fn terminate_node(&self, shard_id: u32) -> Result<(), PipelineError> {
+        let child_opt = {
+            let mut spawned = self.spawned_nodes.write().await;
+            spawned.remove(&shard_id)
+        };
+
+        if let Some(mut child) = child_opt {
+            println!("[SPAWNER] Terminating node for shard {}...", shard_id);
+            if let Err(e) = child.kill().await {
+                eprintln!("[SPAWNER] Failed to terminate node for shard {}: {}", shard_id, e);
+                return Err(PipelineError::Internal {
+                    message: format!("Failed to terminate node: {}", e),
+                });
+            }
+            println!("[SPAWNER] ✓ Terminated node for shard {}", shard_id);
+        }
+        Ok(())
+    }
+
+    /// Terminate all spawned nodes
+    pub async fn terminate_all(&self) {
+        let spawned = self.spawned_nodes.read().await;
+        let shard_ids: Vec<u32> = spawned.keys().cloned().collect();
+        drop(spawned);
+
+        for shard_id in shard_ids {
+            let _ = self.terminate_node(shard_id).await;
+        }
+    }
+}
 
 /// Dynamic shard loading capability
 pub struct DynamicShardLoader {
@@ -404,6 +595,8 @@ pub struct PipelineCoordinator {
     request_queue: Arc<Mutex<VecDeque<QueuedRequest>>>,
     /// Dynamic shard loader
     shard_loader: Option<DynamicShardLoader>,
+    /// Node spawner for on-demand node creation
+    node_spawner: Option<Arc<NodeSpawner>>,
     /// Single-node fallback
     fallback: Arc<RwLock<SingleNodeFallback>>,
     /// Statistics
@@ -421,6 +614,7 @@ pub struct CoordinatorStats {
     pub queued_requests: u64,
     pub fallback_requests: u64,
     pub dynamic_loads: u64,
+    pub nodes_spawned: u64,
     pub average_latency_ms: f64,
     pub average_queue_time_ms: f64,
 }
@@ -436,6 +630,7 @@ impl PipelineCoordinator {
             })),
             request_queue: Arc::new(Mutex::new(VecDeque::new())),
             shard_loader: None,
+            node_spawner: None,
             fallback: Arc::new(RwLock::new(SingleNodeFallback::new())),
             stats: Arc::new(RwLock::new(CoordinatorStats::default())),
             shutdown_tx: None,
@@ -445,6 +640,12 @@ impl PipelineCoordinator {
     /// Create with model manager for dynamic loading
     pub fn with_model_manager(mut self, manager: LlamaModelManager) -> Self {
         self.shard_loader = Some(DynamicShardLoader::new(manager));
+        self
+    }
+
+    /// Create with node spawner for on-demand node creation
+    pub fn with_node_spawner(mut self, spawner: NodeSpawner) -> Self {
+        self.node_spawner = Some(Arc::new(spawner));
         self
     }
 
@@ -552,6 +753,21 @@ impl PipelineCoordinator {
                     *wait_timeout_secs,
                     *min_memory_for_shard_mb,
                     *min_memory_for_full_mb,
+                    start,
+                ).await
+            }
+
+            PipelineStrategy::SpawnNodes {
+                max_nodes_per_request,
+                min_memory_per_node_mb: _,
+                spawn_command_template: _,
+                node_startup_timeout_secs,
+            } => {
+                self.try_spawn_nodes(
+                    request,
+                    &status.missing_shards,
+                    *max_nodes_per_request,
+                    *node_startup_timeout_secs,
                     start,
                 ).await
             }
@@ -765,9 +981,94 @@ impl PipelineCoordinator {
             Err(e) => println!("[COORDINATOR] Wait failed: {}", e),
         }
 
-        // Step 3: Try single-node fallback
-        println!("[COORDINATOR] Step 3: Trying single-node fallback...");
+        // Step 3: Try spawning nodes if spawner is available
+        if self.node_spawner.is_some() {
+            println!("[COORDINATOR] Step 3: Trying to spawn nodes...");
+            match self.try_spawn_nodes(
+                request.clone(),
+                missing_shards,
+                4,  // max 4 nodes
+                30, // 30 second timeout
+                start,
+            ).await {
+                Ok(response) => return Ok(response),
+                Err(e) => println!("[COORDINATOR] Node spawning failed: {}", e),
+            }
+        }
+
+        // Step 4: Try single-node fallback
+        println!("[COORDINATOR] Step 4: Trying single-node fallback...");
         self.try_fallback(request, min_memory_for_full_mb, start).await
+    }
+
+    /// Try to spawn new nodes for missing shards
+    async fn try_spawn_nodes(
+        &self,
+        request: InferenceRequest,
+        missing_shards: &[u32],
+        max_nodes_per_request: u32,
+        node_startup_timeout_secs: u64,
+        start: Instant,
+    ) -> Result<InferenceResponse, PipelineError> {
+        let Some(spawner) = &self.node_spawner else {
+            self.record_failure().await;
+            return Err(PipelineError::NoFallback {
+                reason: "Node spawner not configured".to_string(),
+            });
+        };
+
+        println!("[COORDINATOR] Attempting to spawn nodes for missing shards: {:?}", missing_shards);
+
+        // Limit number of nodes to spawn
+        let shards_to_spawn: Vec<u32> = missing_shards.iter()
+            .take(max_nodes_per_request as usize)
+            .cloned()
+            .collect();
+
+        if shards_to_spawn.is_empty() {
+            return Err(PipelineError::NoFallback {
+                reason: "No shards to spawn".to_string(),
+            });
+        }
+
+        // Update state
+        {
+            let mut state = self.state.write().await;
+            *state = CoordinatorState::LoadingShards { loading: shards_to_spawn.clone() };
+        }
+
+        // Spawn nodes for each missing shard
+        for shard_id in &shards_to_spawn {
+            if let Err(e) = spawner.spawn_node_for_shard(*shard_id).await {
+                eprintln!("[COORDINATOR] Failed to spawn node for shard {}: {}", shard_id, e);
+                self.record_failure().await;
+                return Err(e);
+            }
+        }
+
+        // Wait for nodes to come online
+        for shard_id in &shards_to_spawn {
+            if let Err(e) = spawner.wait_for_node_online(
+                *shard_id,
+                node_startup_timeout_secs,
+                &self.discovery,
+            ).await {
+                eprintln!("[COORDINATOR] Node for shard {} failed to come online: {}", shard_id, e);
+                self.record_failure().await;
+                return Err(e);
+            }
+        }
+
+        // Update stats
+        {
+            let mut stats = self.stats.write().await;
+            stats.nodes_spawned += shards_to_spawn.len() as u64;
+        }
+
+        println!("[COORDINATOR] ✓ All nodes spawned and online, processing inference...");
+
+        // Now process the request
+        self.process_inference(request, start).await
     }
 
     /// Process inference through the pipeline
