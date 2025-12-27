@@ -728,6 +728,18 @@ impl PipelineCoordinator {
         self.stats.read().await.clone()
     }
 
+    /// Get current pipeline status for web UI
+    pub async fn get_pipeline_status(&self) -> (u32, u32, Vec<u32>, bool) {
+        let discovery = self.discovery.read().await;
+        let status = discovery.status();
+        let pipeline = discovery.get_pipeline();
+        let online_nodes = pipeline.len() as u32;
+        let missing_shards = discovery.get_missing_shards();
+        let is_complete = status.is_complete;
+        drop(discovery);
+        (online_nodes, 4, missing_shards, is_complete) // 4 = total expected shards
+    }
+
     /// Update discovery with new shard information
     pub async fn update_discovery(&self, announcement: ShardAnnouncement) {
         let mut discovery = self.discovery.write().await;

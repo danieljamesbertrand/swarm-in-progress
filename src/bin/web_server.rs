@@ -397,97 +397,95 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, engine: Arc<Infe
     
     // Send initial pipeline status
     {
-        let discovery = engine.coordinator.discovery.read().await;
-        let status = discovery.status();
-        let pipeline = discovery.get_pipeline();
-        let online_nodes = pipeline.len() as u32;
-        let total_shards = 4; // Expected shards
-        let missing_shards = discovery.get_missing_shards();
-        drop(discovery);
+        let (online_nodes, total_nodes, missing_shards, is_complete) = engine.coordinator.get_pipeline_status().await;
         
         let status_msg = PipelineStatusMessage {
             message_type: "pipeline_status".to_string(),
-            total_nodes: total_shards,
+            total_nodes,
             online_nodes,
             missing_shards,
-            is_complete: status.is_complete,
+            is_complete,
         };
         
         let status_json = serde_json::to_string(&status_msg).unwrap();
         if let Err(e) = write.send(Message::Text(status_json)).await {
             eprintln!("[WS] Failed to send initial status: {}", e);
         } else {
-            println!("[WS] Sent initial pipeline status: {} nodes online, complete: {}", online_nodes, status.is_complete);
+            println!("[WS] Sent initial pipeline status: {} nodes online, complete: {}", online_nodes, is_complete);
         }
     }
     
     // Create channel for pipeline updates
     let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<PipelineUpdate>(32);
     
-    // Spawn task to send pipeline updates
-    let mut write_clone = write.clone();
-    tokio::spawn(async move {
-        while let Some(update) = update_rx.recv().await {
-            let update_json = serde_json::to_string(&update).unwrap();
-            if let Err(e) = write_clone.send(Message::Text(update_json)).await {
-                eprintln!("[WS] Failed to send update: {}", e);
-                break;
-            }
-        }
-    });
-    
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                println!("[WS] Received: {}", text);
-                
-                // Parse request
-                let request: QueryRequest = match serde_json::from_str(&text) {
-                    Ok(r) => r,
-                    Err(_) => QueryRequest { query: text, request_id: None },
-                };
-                
-                // Process query
-                let mut response = engine.process_query(&request.query, Some(&update_tx)).await;
-                response.request_id = request.request_id;
-                
-                // Send final response
-                let response_json = serde_json::to_string(&response).unwrap();
-                if let Err(e) = write.send(Message::Text(response_json)).await {
-                    eprintln!("[WS] Failed to send response: {}", e);
-                    break;
-                }
-                
-                // Send updated pipeline status after query
-                {
-                    let discovery = engine.coordinator.discovery.read().await;
-                    let status = discovery.status();
-                    let pipeline = discovery.get_pipeline();
-                    let online_nodes = pipeline.len() as u32;
-                    let missing_shards = discovery.get_missing_shards();
-                    drop(discovery);
-                    
-                    let status_msg = PipelineStatusMessage {
-                        message_type: "pipeline_status".to_string(),
-                        total_nodes: 4,
-                        online_nodes,
-                        missing_shards,
-                        is_complete: status.is_complete,
-                    };
-                    
-                    let status_json = serde_json::to_string(&status_msg).unwrap();
-                    let _ = write.send(Message::Text(status_json)).await;
+    // Use select to handle both incoming messages and updates
+    loop {
+        tokio::select! {
+            msg = read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        println!("[WS] Received: {}", text);
+                        
+                        // Parse request
+                        let request: QueryRequest = match serde_json::from_str(&text) {
+                            Ok(r) => r,
+                            Err(_) => QueryRequest { query: text, request_id: None },
+                        };
+                        
+                        // Process query
+                        let mut response = engine.process_query(&request.query, Some(&update_tx)).await;
+                        response.request_id = request.request_id;
+                        
+                        // Send final response
+                        let response_json = serde_json::to_string(&response).unwrap();
+                        if let Err(e) = write.send(Message::Text(response_json)).await {
+                            eprintln!("[WS] Failed to send response: {}", e);
+                            break;
+                        }
+                        
+                        // Send updated pipeline status after query
+                        {
+                            let (online_nodes, total_nodes, missing_shards, is_complete) = engine.coordinator.get_pipeline_status().await;
+                            
+                            let status_msg = PipelineStatusMessage {
+                                message_type: "pipeline_status".to_string(),
+                                total_nodes,
+                                online_nodes,
+                                missing_shards,
+                                is_complete,
+                            };
+                            
+                            let status_json = serde_json::to_string(&status_msg).unwrap();
+                            let _ = write.send(Message::Text(status_json)).await;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        println!("[WS] Client {} disconnected", addr);
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("[WS] Error: {}", e);
+                        break;
+                    }
+                    None => break,
+                    _ => {}
                 }
             }
-            Ok(Message::Close(_)) => {
-                println!("[WS] Client {} disconnected", addr);
-                break;
+            update = update_rx.recv() => {
+                match update {
+                    Some(update) => {
+                        let update_json = serde_json::to_string(&update).unwrap();
+                        if let Err(e) = write.send(Message::Text(update_json)).await {
+                            eprintln!("[WS] Failed to send update: {}", e);
+                            break;
+                        }
+                    }
+                    None => {
+                        // Channel closed
+                        break;
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("[WS] Error: {}", e);
-                break;
-            }
-            _ => {}
         }
     }
 }
