@@ -28,7 +28,7 @@ use metrics::{MetricsCodec, PeerMetrics};
 use kademlia_shard_discovery::{KademliaShardDiscovery, ShardAnnouncement, dht_keys, PipelineStatus};
 use command_protocol::{Command, CommandResponse, ResponseStatus, commands};
 use command_validation::{validate_command, ValidationError};
-use punch_simple::protocol_logging::{
+use punch_simple::{
     log_connection_established, log_connection_closed, log_connection_failed,
     log_transaction_started, log_transaction_completed, log_transaction_failed,
 };
@@ -756,7 +756,10 @@ pub async fn run_shard_listener(
                 if let Some(deadline) = fallback_announce_deadline {
                     tokio::time::sleep_until(deadline).await;
                 } else {
-                    futures::future::pending::<()>().await;
+                    // Wait indefinitely for events
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    }
                 }
             }, if fallback_announce_deadline.is_some() => {
                 // Fallback deadline reached - force announcement
@@ -1013,8 +1016,14 @@ pub async fn run_shard_listener(
                                             &cmd.from,
                                             &error_msg
                                         );
-                                        if let Err(e) = channel.send_response(serde_json::to_string(&error_response).unwrap().into()) {
-                                            eprintln!("[COMMAND] Failed to send validation error response: {}", e);
+                                        // Send error response using swarm's request_response behaviour
+                                        let response_json = serde_json::to_string(&error_response).unwrap_or_default();
+                                        let response_msg = JsonMessage::new(peer_id.to_string(), response_json);
+                                        if let Err(e) = swarm.behaviour_mut().request_response.send_response(
+                                            channel,
+                                            response_msg,
+                                        ) {
+                                            eprintln!("[COMMAND] Failed to send validation error response: {:?}", e);
                                         }
                                         continue;
                                     }
