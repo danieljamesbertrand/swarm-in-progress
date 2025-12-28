@@ -1,0 +1,82 @@
+   Compiling punch-simple v0.1.0 (C:\Users\dan\punch-simple)
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `punch_simple`
+ --> src\listener.rs:8:5
+  |
+8 | use punch_simple::metrics::{MetricsCodec, PeerMetrics, MetricsResponse};
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `punch_simple`
+  |
+  = help: if you wanted to use a crate named `punch_simple`, use `cargo add punch_simple` to add it to your `Cargo.toml`
+
+error[E0432]: unresolved import `punch_simple`
+ --> src\listener.rs:7:5
+  |
+7 | use punch_simple::{JsonMessage, JsonCodec};
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `punch_simple`
+  |
+  = help: if you wanted to use a crate named `punch_simple`, use `cargo add punch_simple` to add it to your `Cargo.toml`
+
+error[E0432]: unresolved import `punch_simple`
+ --> src\dialer.rs:7:5
+  |
+7 | use punch_simple::{JsonMessage, JsonCodec};
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `punch_simple`
+  |
+  = help: if you wanted to use a crate named `punch_simple`, use `cargo add punch_simple` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `punch_simple`
+  --> src\shard_listener.rs:20:5
+   |
+20 | use punch_simple::metrics::MetricsCodec;
+   |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `punch_simple`
+   |
+   = help: if you wanted to use a crate named `punch_simple`, use `cargo add punch_simple` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `punch_simple`
+  --> src\shard_listener.rs:21:5
+   |
+21 | use punch_simple::kademlia_shard_discovery::{KademliaShardDiscovery, ShardAnnouncement, dht_keys};
+   |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `punch_simple`
+   |
+   = help: if you wanted to use a crate named `punch_simple`, use `cargo add punch_simple` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `punch_simple`
+  --> src\shard_listener.rs:22:5
+   |
+22 | use punch_simple::command_protocol::{Command, CommandResponse, commands};
+   |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `punch_simple`
+   |
+   = help: if you wanted to use a crate named `punch_simple`, use `cargo add punch_simple` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `punch_simple`
+  --> src\shard_listener.rs:23:5
+   |
+23 | use punch_simple::command_validation::validate_command;
+   |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `punch_simple`
+   |
+   = help: if you wanted to use a crate named `punch_simple`, use `cargo add punch_simple` to add it to your `Cargo.toml`
+
+error[E0432]: unresolved import `punch_simple`
+  --> src\shard_listener.rs:19:5
+   |
+19 | use punch_simple::{JsonMessage, JsonCodec};
+   |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `punch_simple`
+   |
+   = help: if you wanted to use a crate named `punch_simple`, use `cargo add punch_simple` to add it to your `Cargo.toml`
+
+error[E0432]: unresolved import `punch_simple`
+  --> src\shard_listener.rs:24:5
+   |
+24 | use punch_simple::{
+   |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `punch_simple`
+   |
+   = help: if you wanted to use a crate named `punch_simple`, use `cargo add punch_simple` to add it to your `Cargo.toml`
+
+error[E0282]: type annotations needed
+    --> src\shard_listener.rs:1386:95
+     |
+1386 | ...                   println!("[RESPONSE]   Result keys: {:?}", result.keys().collect::<Vec<&String>>());
+     |                                                                         ^^^^ cannot infer type
+
+Some errors have detailed explanations: E0282, E0432, E0433.
+For more information about an error, try `rustc --explain E0282`.
+error: could not compile `punch-simple` (lib) due to 10 previous errors

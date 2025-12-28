@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Send Query - what does a cow say</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #fff;
+        }
+        .container {
+            background: #2a2a2a;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #4CAF50;
+            margin-top: 0;
+        }
+        .query-box {
+            background: #333;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+            border-left: 4px solid #4CAF50;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 5px;
+            display: none;
+        }
+        .status.success {
+            background: #4CAF50;
+            display: block;
+        }
+        .status.error {
+            background: #f44336;
+            display: block;
+        }
+        .response {
+            margin-top: 20px;
+            padding: 15px;
+            background: #333;
+            border-radius: 5px;
+            white-space: pre-wrap;
+            display: none;
+        }
+        .response.show {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🐄 Send Query to Inference System</h1>
+        <p>This page will automatically send the query to the WebSocket server.</p>
+        
+        <div class="query-box">
+            <strong>Query:</strong> "what does a cow say"
+        </div>
+        
+        <button onclick="sendQuery()">Send Query Now</button>
+        
+        <div id="status" class="status"></div>
+        <div id="response" class="response"></div>
+    </div>
+
+    <script>
+        function sendQuery() {
+            const statusDiv = document.getElementById('status');
+            const responseDiv = document.getElementById('response');
+            const button = event.target;
+            
+            statusDiv.className = 'status';
+            responseDiv.className = 'response';
+            button.disabled = true;
+            button.textContent = 'Sending...';
+            
+            const query = "what does a cow say";
+            const ws = new WebSocket('ws://localhost:8081');
+            
+            ws.onopen = function() {
+                statusDiv.className = 'status success';
+                statusDiv.textContent = '✓ Connected to WebSocket server';
+                
+                const request = {
+                    query: query,
+                    request_id: 'cow-query-' + Date.now()
+                };
+                
+                ws.send(JSON.stringify(request));
+                statusDiv.textContent = '✓ Query sent! Waiting for response...';
+            };
+            
+            ws.onmessage = function(event) {
+                try {
+                    const response = JSON.parse(event.data);
+                    statusDiv.className = 'status success';
+                    statusDiv.textContent = '✓ Response received!';
+                    
+                    responseDiv.className = 'response show';
+                    if (response.response) {
+                        responseDiv.textContent = response.response;
+                    } else {
+                        responseDiv.textContent = JSON.stringify(response, null, 2);
+                    }
+                    
+                    button.disabled = false;
+                    button.textContent = 'Send Query Again';
+                } catch (e) {
+                    responseDiv.className = 'response show';
+                    responseDiv.textContent = event.data;
+                }
+                ws.close();
+            };
+            
+            ws.onerror = function(error) {
+                statusDiv.className = 'status error';
+                statusDiv.textContent = '✗ Error: Could not connect to WebSocket server. Make sure the web server is running on ws://localhost:8081';
+                button.disabled = false;
+                button.textContent = 'Retry';
+            };
+            
+            ws.onclose = function() {
+                if (statusDiv.textContent.indexOf('Error') === -1 && statusDiv.textContent.indexOf('received') === -1) {
+                    statusDiv.className = 'status error';
+                    statusDiv.textContent = '✗ Connection closed unexpectedly';
+                    button.disabled = false;
+                    button.textContent = 'Retry';
+                }
+            };
+        }
+        
+        // Auto-send on page load (optional - uncomment to enable)
+        // window.onload = function() {
+        //     setTimeout(sendQuery, 1000);
+        // };
+    </script>
+</body>
+</html>
+

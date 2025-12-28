@@ -1,0 +1,50 @@
+╔══════════════════════════════════════════════════════════════╗
+║         Shard Listener - Distributed Llama Inference         ║
+╚══════════════════════════════════════════════════════════════╝
+
+Configuration:
+  Cluster: llama-cluster
+  Shard ID: 0 / 3
+  Model: llama-8b
+  Layers: 0-8
+  Bootstrap: /ip4/127.0.0.1/tcp/51820
+
+Peer ID: 12D3KooWMWhdzdGeym6P6Ht9ZyoPgCXbExjfHoTc4pgqEwM9BN9a
+[TORRENT] ✓ Seeding primary shard: shard-0.gguf (hash: 9e38f0e50f6da429)
+[TORRENT] ✓ Seeding primary shard: shard-1.gguf (hash: cb4d608e90704f73)
+[TORRENT] ✓ Seeding primary shard: shard-2.gguf (hash: 53ac59de82f25967)
+[TORRENT] ✓ Seeding primary shard: shard-3.gguf (hash: c162df85a8656ee0)
+[TORRENT] Found additional GGUF file to seed: shard-00009-of-00010.gguf (hash: 019925ff198f238d)
+[TORRENT] Found additional GGUF file to seed: shard-00010-of-00010.gguf (hash: 77fe7071107b9acd)
+[TORRENT] Found additional GGUF file to seed: shard-4.gguf (hash: 83e609ba8484160d)
+[TORRENT] Found additional GGUF file to seed: shard-5.gguf (hash: 70bee3fce325356a)
+[TORRENT] Found additional GGUF file to seed: shard-6.gguf (hash: 850f7538fb545041)
+[TORRENT] Found additional GGUF file to seed: shard-7.gguf (hash: db2545c8cc53ee75)
+[TORRENT] ═══════════════════════════════════════════════════════════════════════════
+[TORRENT] Torrent seeding complete:
+[TORRENT]   Primary shards (0-3): 4/4 seeded
+[TORRENT]   Additional files: 6 seeded
+[TORRENT]   Total files available for seeding: 10
+[TORRENT] ═══════════════════════════════════════════════════════════════════════════
+[SHARD] 📦 Loading shard 0 from: models_cache/shards\shard-0.gguf
+[SHARD]   File size: 492.03 MB
+[SHARD]   Status: Reading file metadata...
+[SHARD]   Progress: [████████████████████] 100%
+[SHARD]   ✓ Shard 0 loaded successfully
+
+[SHARD] ═══════════════════════════════════════════════════════════════════════════
+[SHARD] ✓✓✓ SHARD 0 LOADED BEFORE JOINING NETWORK ✓✓✓
+[SHARD]   Path: models_cache/shards\shard-0.gguf
+[SHARD]   Size: 492.03 MB
+[SHARD]   Status: Ready for inference
+[SHARD] ═══════════════════════════════════════════════════════════════════════════
+
+
+🔗 Connecting to bootstrap node...
+
+✅ Shard listener started! Waiting for connections...
+
+[LISTEN] Listening on: /ip4/10.0.7.51/tcp/51821
+[LISTEN] Listening on: /ip4/172.30.0.1/tcp/51821
+[LISTEN] Listening on: /ip4/192.168.170.211/tcp/51821
+[LISTEN] Listening on: /ip4/127.0.0.1/tcp/51821
