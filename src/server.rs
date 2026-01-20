@@ -177,6 +177,7 @@ pub async fn run_bootstrap(listen_addr: String, port: u16) -> Result<(), Box<dyn
     run_bootstrap_with_transport(listen_addr, port, TransportType::DualStack).await
 }
 
+#[allow(dead_code)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();

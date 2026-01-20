@@ -2192,9 +2192,15 @@ impl PipelineCoordinator {
                             eprintln!("[INFERENCE]     - Node internal error");
                             return Err(PipelineError::InferenceFailed {
                                 shard_id: shard.shard_id,
-                                error: format!("Node {} returned error: {} (status: {:?}, shard {}, layers {}-{})", 
-                                    shard.peer_id, error_msg, response.status, shard.shard_id, 
-                                    shard.layer_start, shard.layer_end),
+                                error: format!(
+                                    "Node {} returned error: {} (status: {:?}, shard {}, layers {}-{})",
+                                    shard.peer_id,
+                                    error_msg,
+                                    response.status,
+                                    shard.shard_id,
+                                    shard.layer_start,
+                                    shard.layer_end
+                                ),
                             });
                         }
                     }

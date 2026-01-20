@@ -86,7 +86,7 @@ pub async fn run_dialer_with_transport(
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia_config = kad::Config::default();
     kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
-    let mut kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
+    let kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
     
     let bootstrap_addr: Multiaddr = bootstrap.parse()?;
     
@@ -428,6 +428,7 @@ pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<
     run_dialer_with_transport(bootstrap, namespace, TransportType::DualStack, None).await
 }
 
+#[allow(dead_code)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();

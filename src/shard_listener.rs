@@ -1764,6 +1764,7 @@ pub async fn run_shard_listener(
     }
 }
 
+#[allow(dead_code)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();

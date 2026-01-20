@@ -85,7 +85,7 @@ pub async fn run_listener_with_transport(
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia_config = kad::Config::default();
     kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
-    let mut kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
+    let kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
     
     let bootstrap_addr: Multiaddr = bootstrap.parse()?;
     
@@ -336,11 +336,12 @@ pub async fn run_listener_with_transport(
                                 println!("  Message: {}", request.message);
                                 println!("  Timestamp: {}", request.timestamp);
 
-                                // If the payload is a Command, handle AI inference and return CommandResponse.
-                                if let Ok(cmd) = Command::from_json(&request.message) {
+                                // Build exactly one response and send exactly once.
+                                // (Prevents accidental "use of moved value: channel" regressions.)
+                                let response_msg = if let Ok(cmd) = Command::from_json(&request.message) {
                                     if cmd.command == commands::EXECUTE_TASK {
                                         if let Ok(ai_req) = AIInferenceRequest::from_command(&cmd) {
-                                            match process_ai_inference(&ai_req).await {
+                                            let resp = match process_ai_inference(&ai_req).await {
                                                 Ok(result) => {
                                                     let mut response_data = HashMap::new();
                                                     if let Some(output) = result.get("output") {
@@ -349,62 +350,80 @@ pub async fn run_listener_with_transport(
                                                     if let Some(model) = result.get("model") {
                                                         response_data.insert("model".to_string(), model.clone());
                                                     }
-                                                    let resp = CommandResponse::success(
+                                                    CommandResponse::success(
                                                         &cmd.command,
                                                         &cmd.request_id,
                                                         &swarm.local_peer_id().to_string(),
                                                         &cmd.from,
                                                         response_data,
-                                                    );
-                                                    let msg = JsonMessage::new(
-                                                        swarm.local_peer_id().to_string(),
-                                                        resp.to_json().unwrap_or_default(),
-                                                    );
-                                                    let _ = swarm.behaviour_mut().request_response.send_response(channel, msg);
-                                                    continue;
+                                                    )
                                                 }
-                                                Err(e) => {
-                                                    let resp = CommandResponse::error(
-                                                        &cmd.command,
-                                                        &cmd.request_id,
-                                                        &swarm.local_peer_id().to_string(),
-                                                        &cmd.from,
-                                                        &e,
-                                                    );
-                                                    let msg = JsonMessage::new(
-                                                        swarm.local_peer_id().to_string(),
-                                                        resp.to_json().unwrap_or_default(),
-                                                    );
-                                                    let _ = swarm.behaviour_mut().request_response.send_response(channel, msg);
-                                                    continue;
-                                                }
-                                            }
+                                                Err(e) => CommandResponse::error(
+                                                    &cmd.command,
+                                                    &cmd.request_id,
+                                                    &swarm.local_peer_id().to_string(),
+                                                    &cmd.from,
+                                                    &e,
+                                                ),
+                                            };
+
+                                            JsonMessage::new(
+                                                swarm.local_peer_id().to_string(),
+                                                resp.to_json().unwrap_or_default(),
+                                            )
+                                        } else {
+                                            JsonMessage::new(
+                                                format!(
+                                                    "listener-{}",
+                                                    peer_id.to_string().chars().take(8).collect::<String>()
+                                                ),
+                                                format!("Echo: {}", request.message),
+                                            )
                                         }
+                                    } else {
+                                        JsonMessage::new(
+                                            format!(
+                                                "listener-{}",
+                                                peer_id.to_string().chars().take(8).collect::<String>()
+                                            ),
+                                            format!("Echo: {}", request.message),
+                                        )
+                                    }
+                                } else {
+                                    JsonMessage::new(
+                                        format!(
+                                            "listener-{}",
+                                            peer_id.to_string().chars().take(8).collect::<String>()
+                                        ),
+                                        format!("Echo: {}", request.message),
+                                    )
+                                };
+
+                                // Update metrics for outgoing response
+                                {
+                                    let mut m = metrics.write().await;
+                                    m.messages_sent += 1;
+                                    if let Ok(json_bytes) = serde_json::to_vec(&response_msg) {
+                                        m.bytes_sent += json_bytes.len() as u64;
                                     }
                                 }
 
-                                // Default behavior: echo
-                                let response_msg = JsonMessage::new(
-                                    format!(
-                                        "listener-{}",
-                                        peer_id.to_string().chars().take(8).collect::<String>()
-                                    ),
-                                    format!("Echo: {}", request.message),
-                                );
-
-                                if let Err(e) = swarm
+                                // (clone is only for logging after send)
+                                let response_msg_for_log = response_msg.clone();
+                                let send_result = swarm
                                     .behaviour_mut()
                                     .request_response
-                                    .send_response(channel, response_msg.clone())
-                                {
+                                    .send_response(channel, response_msg);
+
+                                if let Err(e) = send_result {
                                     eprintln!("[ERROR] Failed to send response: {:?}", e);
                                     let mut m = metrics.write().await;
                                     m.message_errors += 1;
                                 } else {
                                     println!("\n[📤 SENT JSON RESPONSE]");
-                                    println!("  From: {}", response_msg.from);
-                                    println!("  Message: {}", response_msg.message);
-                                    println!("  Timestamp: {}", response_msg.timestamp);
+                                    println!("  From: {}", response_msg_for_log.from);
+                                    println!("  Message: {}", response_msg_for_log.message);
+                                    println!("  Timestamp: {}", response_msg_for_log.timestamp);
                                 }
                             }
                             request_response::Message::Response { response, .. } => {
@@ -544,6 +563,7 @@ pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Bo
     run_listener_with_transport(bootstrap, namespace, TransportType::DualStack).await
 }
 
+#[allow(dead_code)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();

@@ -498,6 +498,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, tx: broadcast::Send
     };
 }
 
+#[allow(dead_code)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();

@@ -287,7 +287,7 @@ mod tests {
     
     #[test]
     fn test_validate_missing_command() {
-        let mut cmd = Command::new("", "peer1", Some("peer2"));
+        let cmd = Command::new("", "peer1", Some("peer2"));
         assert!(validate_command_structure(&cmd).is_err());
     }
     
