@@ -101,6 +101,18 @@ End-to-end integration tests (marked with `#[ignore]` for manual execution):
   - Isolation verification
   - Cross-namespace operations
 
+#### QUIC-only deterministic E2E tests
+
+These tests are designed to be **deterministic** and safe for CI (no external network dependency):
+
+- ✅ `tests/e2e_quic_server_listener_dialer_tests.rs`
+  - **Proves**: rendezvous registration/lookup → direct QUIC dial → `EXECUTE_TASK/ai_inference` → response returns to requester with correct `request_id`
+  - **Guardrails**: asserts the response contains key “why is the sky blue?” facts (Rayleigh scattering, wavelength dependence)
+
+- ✅ `tests/e2e_quic_weighted_routing_ai_tests.rs`
+  - **Proves**: worker registration (capabilities) → weighted routing prefers the stronger node → distributed execution (shared `request_id`) → aggregated response
+  - **Guardrails**: asserts the combined answer includes Rayleigh scattering, shorter wavelengths, and sunrise/sunset color shift
+
 ## Test Execution
 
 ### Run All Unit Tests
@@ -116,6 +128,13 @@ cargo test --test '*'
 ### Run Specific Test Suite
 ```bash
 cargo test --test dht_node_discovery_tests
+```
+
+### Run QUIC-only E2E tests
+
+```bash
+cargo test --locked --test e2e_quic_server_listener_dialer_tests -- --nocapture
+cargo test --locked --test e2e_quic_weighted_routing_ai_tests -- --nocapture
 ```
 
 ### Run Ignored Tests (Integration Tests)

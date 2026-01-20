@@ -21,3 +21,5 @@ This repo must prioritize **regression resistance** over cleverness.
 - **Pinned toolchain + locked CI**: added `rust-toolchain.toml` and CI enforcing `cargo build/test --locked` to prevent dependency/MSRV drift regressions.
 - **PowerShell guardrails**: added CI parse check over all `*.ps1` and documented quoting/safety rules in `.cursor/rules/engineering_memory.md`.
 - **E2E QUIC-only integration test**: added a multi-node test proving DHT capability discovery → weighted routing → distributed AI request/response with correct `request_id` (and a deterministic “why is the sky blue?” answer), validated via `cargo test --locked`.
+- **Listener response-channel regression fix**: refactored listener request handling to compute one response and call `send_response(channel, ...)` exactly once (prevents `E0382` moved-channel regressions); verified via `cargo test --locked`.
+- **Test documentation**: documented what the QUIC E2E tests prove and how to run them in `docs/QUIC_E2E_TESTS.md`.

@@ -7,6 +7,7 @@ Complete documentation for the P2P network with JSON command protocol, weighted 
 - **[Complete Guide](COMPLETE_GUIDE.md)** - Start here for overview
 - **[Node Documentation](NODE_DOCUMENTATION.md)** - All nodes overview
 - **[External IP Connection Guide](../EXTERNAL_IP_CONNECTION.md)** - Connect peers across the internet
+- **[QUIC E2E Tests](QUIC_E2E_TESTS.md)** - What our QUIC integration tests prove + how to run them
 
 ## Node Documentation
 
