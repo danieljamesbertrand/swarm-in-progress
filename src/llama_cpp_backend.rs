@@ -94,6 +94,23 @@ pub async fn infer_with_llama_cpp(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Common pitfall on Windows: users point LLAMA_CPP_EXE at a different `llama-cli.exe`
+        // (e.g., a Rust CLI wrapper) that expects subcommands instead of llama.cpp flags like `-m`.
+        if stderr.contains("unexpected argument '-m'") && stderr.contains("Usage: llama-cli.exe <COMMAND>") {
+            return Err(format!(
+                "The configured LLAMA_CPP_EXE does not appear to be llama.cpp's `llama-cli`.\n\
+It rejected the llama.cpp flags (-m/-p/-n). Please point LLAMA_CPP_EXE at a llama.cpp build.\n\
+\n\
+Suggested fix:\n\
+- Build llama.cpp and use: <llama.cpp>\\build\\bin\\Release\\llama-cli.exe\n\
+- Or run: scripts/windows/build_llama_cpp.ps1 to clone+build llama.cpp.\n\
+\n\
+Details:\n\
+STDERR:\n{stderr}\nSTDOUT:\n{stdout}"
+            ));
+        }
+
         return Err(format!(
             "llama.cpp failed (exit={:?}).\nSTDERR:\n{}\nSTDOUT:\n{}",
             output.status.code(),
