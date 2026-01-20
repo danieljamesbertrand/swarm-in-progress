@@ -1,9 +1,10 @@
 //! AI Inference Request Handler
-//! 
+//!
 //! This module provides functionality for accepting and processing AI inference requests
 //! in the distributed inference pipeline.
 
-use crate::command_protocol::{Command, CommandResponse, commands};
+use crate::command_protocol::{commands, Command, CommandResponse};
+use crate::llama_cpp_backend::infer_with_llama_cpp;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -27,7 +28,8 @@ impl AIInferenceRequest {
             return Err("Command is not EXECUTE_TASK".to_string());
         }
 
-        let task_type = cmd.params
+        let task_type = cmd
+            .params
             .get("task_type")
             .and_then(|v| v.as_str())
             .ok_or("Missing task_type parameter")?;
@@ -36,13 +38,15 @@ impl AIInferenceRequest {
             return Err(format!("Task type is not ai_inference, got: {}", task_type));
         }
 
-        let model_name = cmd.params
+        let model_name = cmd
+            .params
             .get("model_name")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .ok_or("Missing model_name parameter")?;
 
-        let input_data = cmd.params
+        let input_data = cmd
+            .params
             .get("input_data")
             .cloned()
             .ok_or("Missing input_data parameter")?;
@@ -50,12 +54,24 @@ impl AIInferenceRequest {
         Ok(AIInferenceRequest {
             model_name,
             input_data,
-            max_tokens: cmd.params.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as u32),
+            max_tokens: cmd
+                .params
+                .get("max_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
             temperature: cmd.params.get("temperature").and_then(|v| v.as_f64()),
             top_p: cmd.params.get("top_p").and_then(|v| v.as_f64()),
             stream: cmd.params.get("stream").and_then(|v| v.as_bool()),
-            priority: cmd.params.get("priority").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            timeout_seconds: cmd.params.get("timeout_seconds").and_then(|v| v.as_u64()).map(|v| v as u32),
+            priority: cmd
+                .params
+                .get("priority")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            timeout_seconds: cmd
+                .params
+                .get("timeout_seconds")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
         })
     }
 
@@ -97,22 +113,35 @@ pub async fn process_ai_inference(request: &AIInferenceRequest) -> Result<Value,
     // Validate request
     request.validate()?;
 
-    // Mock AI inference processing
-    // In production, this would:
-    // 1. Load the model
-    // 2. Process the input
-    // 3. Generate the output
-    // 4. Return the result
+    let backend = std::env::var("PUNCH_INFERENCE_BACKEND")
+        .ok()
+        .unwrap_or_else(|| "mock".to_string());
+    let use_real = backend == "llama_cpp" && request.model_name.to_lowercase() != "mock";
 
     let output = match request.input_data {
         Value::String(ref text) => {
             let normalized = text.to_lowercase();
-            if normalized.contains("why is the sky blue") || normalized.contains("why's the sky blue") {
-                // Deterministic, factual response suitable for tests and demos.
-                // In production, this should be produced by a real model.
-                "The sky looks blue mainly because of Rayleigh scattering: molecules in Earth’s atmosphere scatter shorter wavelengths of sunlight much more strongly than longer wavelengths. Blue light (shorter wavelength) gets scattered in many directions across the sky, so when you look up you see more scattered blue light coming from all around. At sunrise and sunset, sunlight passes through more atmosphere, scattering out much of the blue and leaving the reds and oranges to dominate.".to_string()
+            if use_real {
+                let max_tokens = request.max_tokens.unwrap_or(256);
+                let temperature = request.temperature.unwrap_or(0.7);
+                let top_p = request.top_p.unwrap_or(0.9);
+                infer_with_llama_cpp(
+                    &request.model_name,
+                    &request.input_data,
+                    max_tokens,
+                    temperature,
+                    top_p,
+                )
+                .await?
             } else {
-                format!("AI Response to: {}", text)
+                // Deterministic mock response for CI/tests.
+                if normalized.contains("why is the sky blue")
+                    || normalized.contains("why's the sky blue")
+                {
+                    "The sky looks blue mainly because of Rayleigh scattering: molecules in Earth’s atmosphere scatter shorter wavelengths of sunlight much more strongly than longer wavelengths. Blue light (shorter wavelength) gets scattered in many directions across the sky, so when you look up you see more scattered blue light coming from all around. At sunrise and sunset, sunlight passes through more atmosphere, scattering out much of the blue and leaving the reds and oranges to dominate.".to_string()
+                } else {
+                    format!("AI Response to: {}", text)
+                }
             }
         }
         Value::Array(ref items) => {
@@ -131,12 +160,9 @@ pub async fn process_ai_inference(request: &AIInferenceRequest) -> Result<Value,
 }
 
 /// Create a success response for an AI inference request
-pub fn create_ai_inference_response(
-    request: &Command,
-    result: Value,
-) -> CommandResponse {
+pub fn create_ai_inference_response(request: &Command, result: Value) -> CommandResponse {
     let mut response_data = HashMap::new();
-    
+
     if let Some(output) = result.get("output") {
         response_data.insert("output".to_string(), output.clone());
     }
@@ -160,10 +186,7 @@ pub fn create_ai_inference_response(
 }
 
 /// Create an error response for an AI inference request
-pub fn create_ai_inference_error_response(
-    request: &Command,
-    error: &str,
-) -> CommandResponse {
+pub fn create_ai_inference_error_response(request: &Command, error: &str) -> CommandResponse {
     CommandResponse::error(
         &request.command,
         &request.request_id,
@@ -253,16 +276,10 @@ mod tests {
         });
 
         let response = create_ai_inference_response(&cmd, result);
-        assert_eq!(response.status, crate::command_protocol::ResponseStatus::Success);
+        assert_eq!(
+            response.status,
+            crate::command_protocol::ResponseStatus::Success
+        );
         assert!(response.result.is_some());
     }
 }
-
-
-
-
-
-
-
-
-
