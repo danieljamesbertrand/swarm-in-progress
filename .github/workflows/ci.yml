@@ -23,6 +23,33 @@ jobs:
       - name: Test (locked)
         run: cargo test --locked
 
+  clippy-critical:
+    name: Rust (clippy: critical lints only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.82.0
+          components: clippy
+      # We intentionally gate only on high-signal lints to avoid breaking CI due to
+      # pre-existing style/warning debt. This is a regression guardrail, not a rewrite.
+      - name: Clippy (deny correctness + suspicious)
+        run: cargo clippy --all-targets --locked -- -D clippy::correctness -D clippy::suspicious
+
+  rustfmt:
+    name: Rust (fmt check, informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.82.0
+          components: rustfmt
+      - name: rustfmt --check (non-blocking for now)
+        run: cargo fmt --all --check
+
   powershell-parse:
     name: PowerShell (parse check)
     runs-on: ubuntu-latest
