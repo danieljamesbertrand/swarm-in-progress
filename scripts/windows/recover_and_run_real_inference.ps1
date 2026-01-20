@@ -45,8 +45,11 @@ function Start-RunTranscript {
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
     $logPath = Join-Path $logDir ("recover_and_run_real_inference_{0}.log" -f $stamp)
+    $cmdLogPath = Join-Path $logDir ("recover_and_run_real_inference_{0}.commands.log" -f $stamp)
     Start-Transcript -Path $logPath -Append | Out-Null
     Write-Host ("Transcript: {0}" -f $logPath)
+    Write-Host ("Command log: {0}" -f $cmdLogPath)
+    $script:CommandLogPath = $cmdLogPath
     return $logPath
 }
 
@@ -66,9 +69,32 @@ function Run {
     if ($Why) { Write-Host "`n==> $Why" }
     $joined = ($Args | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
     Write-Host ("    {0} {1}" -f $Exe, $joined)
-    & $Exe @Args
-    if ($LASTEXITCODE -ne 0) {
-        throw ("Command failed (exit={0}): {1} {2}" -f $LASTEXITCODE, $Exe, $joined)
+
+    # Capture native command output reliably (PowerShell transcripts sometimes miss it).
+    $tmp = Join-Path $env:TEMP ("punch_cmd_{0}.log" -f ([Guid]::NewGuid().ToString('N')))
+    try {
+        $p = Start-Process -FilePath $Exe -ArgumentList $Args -NoNewWindow -PassThru -Wait `
+            -RedirectStandardOutput $tmp -RedirectStandardError $tmp
+
+        $out = ""
+        if (Test-Path -LiteralPath $tmp) {
+            $out = Get-Content -Raw -LiteralPath $tmp
+        }
+
+        # Write to console (captured by transcript) and to a persistent command log.
+        if ($out) {
+            Write-Host $out
+            if ($script:CommandLogPath) {
+                Add-Content -LiteralPath $script:CommandLogPath -Value ("`n=== {0} {1} ===`n" -f $Exe, $joined)
+                Add-Content -LiteralPath $script:CommandLogPath -Value $out
+            }
+        }
+
+        if ($p.ExitCode -ne 0) {
+            throw ("Command failed (exit={0}): {1} {2}" -f $p.ExitCode, $Exe, $joined)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }
 }
 
