@@ -6,20 +6,18 @@
 
 use punch_simple::{JsonMessage, JsonCodec};
 use punch_simple::metrics::{MetricsCodec, PeerMetrics, MetricsResponse};
+use punch_simple::ai_inference_handler::{AIInferenceRequest, process_ai_inference};
+use punch_simple::command_protocol::{Command, CommandResponse, commands};
 
 use clap::Parser;
 use serde_json;
 use libp2p::{
     identity,
-    tcp,
-    noise,
-    yamux,
     kad,
     ping,
     relay,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
-    core::transport::Transport,
     PeerId, Multiaddr, StreamProtocol,
 };
 use libp2p::swarm::Config as SwarmConfig;
@@ -30,6 +28,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use rand::Rng;
+use punch_simple::quic_transport::{create_transport, get_dual_listen_addresses, get_listen_address, TransportType};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PeerDiscoveryRecord {
+    peer_id: String,
+    addrs: Vec<String>,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "listener")]
@@ -42,6 +47,10 @@ struct Args {
     /// Namespace for peer discovery
     #[arg(long, default_value = "simple-chat")]
     namespace: String,
+
+    /// Transport: quic|tcp|dual (default: dual)
+    #[arg(long, default_value = "dual")]
+    transport: TransportType,
 }
 
 #[derive(NetworkBehaviour)]
@@ -54,8 +63,12 @@ struct Behaviour {
     relay: relay::Behaviour,
 }
 
-/// Run listener node (extracted for unified binary)
-pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Box<dyn Error>> {
+/// Run listener node with specified transport.
+pub async fn run_listener_with_transport(
+    bootstrap: String,
+    namespace: String,
+    transport_type: TransportType,
+) -> Result<(), Box<dyn Error>> {
     println!("=== Simple Kademlia Listener ===\n");
     println!("Configuration:");
     println!("  Bootstrap: {}", bootstrap);
@@ -65,12 +78,8 @@ pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Bo
     let peer_id = PeerId::from(key.public());
     println!("Peer ID: {}\n", peer_id);
 
-    // TCP transport with noise encryption and yamux multiplexing
-    let transport = tcp::tokio::Transport::default()
-        .upgrade(libp2p::core::upgrade::Version::V1)
-        .authenticate(noise::Config::new(&key)?)
-        .multiplex(yamux::Config::default())
-        .boxed();
+    // Transport: QUIC/TCP selectable (default dual-stack)
+    let transport = create_transport(&key, transport_type)?;
     
     // Kademlia DHT - Large timeout for reliable discovery
     let store = kad::store::MemoryStore::new(peer_id);
@@ -78,9 +87,7 @@ pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Bo
     kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
     
-    // Add bootstrap node
     let bootstrap_addr: Multiaddr = bootstrap.parse()?;
-    kademlia.add_address(&peer_id, bootstrap_addr.clone());
     
     // Identify
     let identify = libp2p::identify::Behaviour::new(
@@ -131,8 +138,17 @@ pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Bo
     // Bootstrap to DHT
     println!("Bootstrapping to DHT via: {}\n", bootstrap);
     
-    // Listen on all interfaces
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    // Listen on requested transport(s)
+    match transport_type {
+        TransportType::DualStack => {
+            let (quic, tcp) = get_dual_listen_addresses(0);
+            swarm.listen_on(quic.parse()?)?;
+            swarm.listen_on(tcp.parse()?)?;
+        }
+        other => {
+            swarm.listen_on(get_listen_address(other, 0).parse()?)?;
+        }
+    }
     
     // Connect to bootstrap node
     swarm.dial(bootstrap_addr.clone())?;
@@ -141,6 +157,7 @@ pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Bo
     let mut registered = false;
     let mut connected_peers: HashMap<PeerId, ()> = HashMap::new();
     let mut message_counter = 0u32;
+    let mut listen_addrs: Vec<Multiaddr> = Vec::new();
     
     // Metrics tracking
     let metrics = Arc::new(RwLock::new(PeerMetrics {
@@ -181,7 +198,8 @@ pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Bo
                 match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 println!("[VERBOSE] Listening on: {}", address);
-                swarm.add_external_address(address);
+                swarm.add_external_address(address.clone());
+                listen_addrs.push(address);
             }
             SwarmEvent::Dialing { .. } => {
                 println!("[VERBOSE] → Dialing...");
@@ -201,7 +219,11 @@ pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Bo
                 } else if !registered {
                     // Register our peer info in DHT
                     let key = kad::RecordKey::new(&namespace);
-                    let value = peer_id.to_bytes();
+                    let record_value = PeerDiscoveryRecord {
+                        peer_id: swarm.local_peer_id().to_string(),
+                        addrs: listen_addrs.iter().map(|a| a.to_string()).collect(),
+                    };
+                    let value = serde_json::to_vec(&record_value).unwrap_or_else(|_| peer_id.to_bytes());
                     let record = kad::Record::new(key.clone(), value);
                     if let Err(e) = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
                         eprintln!("[ERROR] Failed to put record: {:?}", e);
@@ -313,14 +335,68 @@ pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Bo
                                 println!("  From: {}", request.from);
                                 println!("  Message: {}", request.message);
                                 println!("  Timestamp: {}", request.timestamp);
-                                
-                                // Send a response
+
+                                // If the payload is a Command, handle AI inference and return CommandResponse.
+                                if let Ok(cmd) = Command::from_json(&request.message) {
+                                    if cmd.command == commands::EXECUTE_TASK {
+                                        if let Ok(ai_req) = AIInferenceRequest::from_command(&cmd) {
+                                            match process_ai_inference(&ai_req).await {
+                                                Ok(result) => {
+                                                    let mut response_data = HashMap::new();
+                                                    if let Some(output) = result.get("output") {
+                                                        response_data.insert("output".to_string(), output.clone());
+                                                    }
+                                                    if let Some(model) = result.get("model") {
+                                                        response_data.insert("model".to_string(), model.clone());
+                                                    }
+                                                    let resp = CommandResponse::success(
+                                                        &cmd.command,
+                                                        &cmd.request_id,
+                                                        &swarm.local_peer_id().to_string(),
+                                                        &cmd.from,
+                                                        response_data,
+                                                    );
+                                                    let msg = JsonMessage::new(
+                                                        swarm.local_peer_id().to_string(),
+                                                        resp.to_json().unwrap_or_default(),
+                                                    );
+                                                    let _ = swarm.behaviour_mut().request_response.send_response(channel, msg);
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    let resp = CommandResponse::error(
+                                                        &cmd.command,
+                                                        &cmd.request_id,
+                                                        &swarm.local_peer_id().to_string(),
+                                                        &cmd.from,
+                                                        &e,
+                                                    );
+                                                    let msg = JsonMessage::new(
+                                                        swarm.local_peer_id().to_string(),
+                                                        resp.to_json().unwrap_or_default(),
+                                                    );
+                                                    let _ = swarm.behaviour_mut().request_response.send_response(channel, msg);
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Default behavior: echo
                                 let response_msg = JsonMessage::new(
-                                    format!("listener-{}", peer_id.to_string().chars().take(8).collect::<String>()),
+                                    format!(
+                                        "listener-{}",
+                                        peer_id.to_string().chars().take(8).collect::<String>()
+                                    ),
                                     format!("Echo: {}", request.message),
                                 );
-                                
-                                if let Err(e) = swarm.behaviour_mut().request_response.send_response(channel, response_msg.clone()) {
+
+                                if let Err(e) = swarm
+                                    .behaviour_mut()
+                                    .request_response
+                                    .send_response(channel, response_msg.clone())
+                                {
                                     eprintln!("[ERROR] Failed to send response: {:?}", e);
                                     let mut m = metrics.write().await;
                                     m.message_errors += 1;
@@ -461,8 +537,15 @@ pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Bo
     }
 }
 
+/// Run listener node (extracted for unified binary).
+///
+/// Backwards-compatible wrapper that defaults to dual-stack transport.
+pub async fn run_listener(bootstrap: String, namespace: String) -> Result<(), Box<dyn Error>> {
+    run_listener_with_transport(bootstrap, namespace, TransportType::DualStack).await
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    run_listener(args.bootstrap, args.namespace).await
+    run_listener_with_transport(args.bootstrap, args.namespace, args.transport).await
 }

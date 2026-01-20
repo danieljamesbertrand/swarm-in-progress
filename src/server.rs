@@ -7,20 +7,17 @@
 use clap::Parser;
 use libp2p::{
     identity,
-    tcp,
-    noise,
-    yamux,
     kad,
     ping,
     relay,
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
-    core::transport::Transport,
     PeerId, Multiaddr,
 };
 use libp2p::swarm::Config as SwarmConfig;
 use libp2p::futures::StreamExt;
 use std::error::Error;
 use std::time::Duration;
+use punch_simple::quic_transport::{create_transport, get_dual_listen_addresses, get_listen_address, TransportType};
 
 #[derive(Parser, Debug)]
 #[command(name = "server")]
@@ -33,6 +30,10 @@ struct Args {
     /// Listen port (default: 51820)
     #[arg(long, default_value = "51820")]
     port: u16,
+
+    /// Transport: quic|tcp|dual (default: dual)
+    #[arg(long, default_value = "dual")]
+    transport: TransportType,
 }
 
 #[derive(NetworkBehaviour)]
@@ -43,8 +44,12 @@ struct Behaviour {
     relay: relay::Behaviour,
 }
 
-/// Run bootstrap server (extracted for unified binary)
-pub async fn run_bootstrap(listen_addr: String, port: u16) -> Result<(), Box<dyn Error>> {
+/// Run bootstrap server with a specified transport.
+pub async fn run_bootstrap_with_transport(
+    listen_addr: String,
+    port: u16,
+    transport_type: TransportType,
+) -> Result<(), Box<dyn Error>> {
     println!("=== Simple Kademlia Bootstrap Node ===\n");
     println!("Configuration:");
     println!("  Listen Address: {}:{}", listen_addr, port);
@@ -55,12 +60,8 @@ pub async fn run_bootstrap(listen_addr: String, port: u16) -> Result<(), Box<dyn
     let local_peer_id = PeerId::from(local_key.public());
     println!("Local peer id: {}\n", local_peer_id);
 
-    // Transport: TCP + Noise + Yamux
-    let transport = tcp::tokio::Transport::default()
-        .upgrade(libp2p::core::upgrade::Version::V1)
-        .authenticate(noise::Config::new(&local_key)?)
-        .multiplex(yamux::Config::default())
-        .boxed();
+    // Transport: QUIC/TCP selectable (default dual-stack)
+    let transport = create_transport(&local_key, transport_type)?;
 
     // Kademlia DHT behaviour (bootstrap node) - Large timeout for reliable discovery
     let store = kad::store::MemoryStore::new(local_peer_id);
@@ -103,13 +104,26 @@ pub async fn run_bootstrap(listen_addr: String, port: u16) -> Result<(), Box<dyn
     );
 
     // Listen on specified address and port
-    let addr: Multiaddr = format!("/ip4/{}/tcp/{}", listen_addr, port).parse()?;
     println!("Starting server...");
-    swarm.listen_on(addr)?;
+    match transport_type {
+        TransportType::DualStack => {
+            let (quic, tcp) = get_dual_listen_addresses(port);
+            let quic_addr: Multiaddr = quic.replace("0.0.0.0", &listen_addr).parse()?;
+            let tcp_addr: Multiaddr = tcp.replace("0.0.0.0", &listen_addr).parse()?;
+            swarm.listen_on(quic_addr)?;
+            swarm.listen_on(tcp_addr)?;
+        }
+        other => {
+            let addr: Multiaddr =
+                get_listen_address(other, port).replace("0.0.0.0", &listen_addr).parse()?;
+            swarm.listen_on(addr)?;
+        }
+    }
 
     println!("\n✅ Bootstrap node started! Waiting for connections...\n");
     println!("Clients can bootstrap to this node using:");
-    println!("  --bootstrap /ip4/{}/tcp/{}", listen_addr, port);
+    println!("  --bootstrap /ip4/{}/udp/{}/quic-v1  (QUIC)", listen_addr, port);
+    println!("  --bootstrap /ip4/{}/tcp/{}          (TCP)", listen_addr, port);
     println!("\nPress Ctrl+C to stop the bootstrap node.\n");
 
     // Main event loop
@@ -156,9 +170,16 @@ pub async fn run_bootstrap(listen_addr: String, port: u16) -> Result<(), Box<dyn
     }
 }
 
+/// Run bootstrap server (extracted for unified binary).
+///
+/// Backwards-compatible wrapper that defaults to dual-stack transport.
+pub async fn run_bootstrap(listen_addr: String, port: u16) -> Result<(), Box<dyn Error>> {
+    run_bootstrap_with_transport(listen_addr, port, TransportType::DualStack).await
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    run_bootstrap(args.listen_addr, args.port).await
+    run_bootstrap_with_transport(args.listen_addr, args.port, args.transport).await
 }
 

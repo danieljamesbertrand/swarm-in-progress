@@ -5,20 +5,17 @@
 //!   cargo run --bin node -- dialer --bootstrap ADDR --namespace NAMESPACE
 
 use punch_simple::{JsonMessage, JsonCodec};
+use punch_simple::command_protocol::{Command, CommandResponse, commands};
 
 use clap::Parser;
 use serde_json;
 use libp2p::{
     identity,
-    tcp,
-    noise,
-    yamux,
     kad,
     ping,
     relay,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
-    core::transport::Transport,
     PeerId, Multiaddr, StreamProtocol,
 };
 use libp2p::swarm::Config as SwarmConfig;
@@ -27,6 +24,13 @@ use std::error::Error;
 use std::time::Duration;
 use std::collections::HashMap;
 use rand::Rng;
+use punch_simple::quic_transport::{create_transport, get_dual_listen_addresses, get_listen_address, TransportType};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PeerDiscoveryRecord {
+    peer_id: String,
+    addrs: Vec<String>,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "dialer")]
@@ -39,6 +43,15 @@ struct Args {
     /// Namespace for peer discovery
     #[arg(long, default_value = "simple-chat")]
     namespace: String,
+
+    /// Transport: quic|tcp|dual (default: dual)
+    #[arg(long, default_value = "dual")]
+    transport: TransportType,
+
+    /// Send one AI question (EXECUTE_TASK/ai_inference) once a peer is found.
+    /// Example: --ask "Why is the sky blue?"
+    #[arg(long)]
+    ask: Option<String>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -50,8 +63,13 @@ struct Behaviour {
     relay: relay::Behaviour,
 }
 
-/// Run dialer node (extracted for unified binary)
-pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<dyn Error>> {
+/// Run dialer node with a specified transport and optional question.
+pub async fn run_dialer_with_transport(
+    bootstrap: String,
+    namespace: String,
+    transport_type: TransportType,
+    ask: Option<String>,
+) -> Result<(), Box<dyn Error>> {
     println!("=== Simple Kademlia Dialer ===\n");
     println!("Configuration:");
     println!("  Bootstrap: {}", bootstrap);
@@ -61,12 +79,8 @@ pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<
     let peer_id = PeerId::from(key.public());
     println!("Local Peer ID: {}\n", peer_id);
 
-    // TCP transport with noise encryption and yamux multiplexing
-    let transport = tcp::tokio::Transport::default()
-        .upgrade(libp2p::core::upgrade::Version::V1)
-        .authenticate(noise::Config::new(&key)?)
-        .multiplex(yamux::Config::default())
-        .boxed();
+    // Transport: QUIC/TCP selectable (default dual-stack)
+    let transport = create_transport(&key, transport_type)?;
     
     // Kademlia DHT - Large timeout for reliable discovery
     let store = kad::store::MemoryStore::new(peer_id);
@@ -74,9 +88,7 @@ pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<
     kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
     
-    // Add bootstrap node
     let bootstrap_addr: Multiaddr = bootstrap.parse()?;
-    kademlia.add_address(&peer_id, bootstrap_addr.clone());
     
     // Identify
     let identify = libp2p::identify::Behaviour::new(
@@ -116,8 +128,17 @@ pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<
         swarm_config,
     );
 
-    // Bootstrap to DHT
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    // Bootstrap to DHT: listen on requested transport(s)
+    match transport_type {
+        TransportType::DualStack => {
+            let (quic, tcp) = get_dual_listen_addresses(0);
+            swarm.listen_on(quic.parse()?)?;
+            swarm.listen_on(tcp.parse()?)?;
+        }
+        other => {
+            swarm.listen_on(get_listen_address(other, 0).parse()?)?;
+        }
+    }
     println!("[1] Bootstrapping to DHT via: {}\n", bootstrap);
     
     // Connect to bootstrap node
@@ -127,6 +148,7 @@ pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<
     let mut discovered_peers: Vec<PeerId> = Vec::new();
     let mut connected_peers: HashMap<PeerId, ()> = HashMap::new();
     let mut message_counter = 0u32;
+    let mut pending_ai_request: Option<String> = None; // request_id
     
     // Start bootstrap process
     println!("[VERBOSE] Starting Kademlia bootstrap...");
@@ -185,6 +207,33 @@ pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<
                     println!("  From: {}", json_msg.from);
                     println!("  Message: {}", json_msg.message);
                     println!("  Timestamp: {}", json_msg.timestamp);
+
+                    // If user asked a question, send an AI inference command (once).
+                    if pending_ai_request.is_none() {
+                        if let Some(ref question) = ask {
+                            let mut cmd = Command::new(
+                                commands::EXECUTE_TASK,
+                                &swarm.local_peer_id().to_string(),
+                                Some(&peer_id.to_string()),
+                            );
+                            cmd.params
+                                .insert("task_type".to_string(), serde_json::json!("ai_inference"));
+                            cmd.params
+                                .insert("model_name".to_string(), serde_json::json!("mock"));
+                            cmd.params
+                                .insert("input_data".to_string(), serde_json::json!(question));
+
+                            pending_ai_request = Some(cmd.request_id.clone());
+                            let msg = JsonMessage::new(
+                                swarm.local_peer_id().to_string(),
+                                cmd.to_json().unwrap_or_else(|_| "{}".to_string()),
+                            );
+                            swarm.behaviour_mut()
+                                .request_response
+                                .send_request(&peer_id, msg);
+                            println!("[AI] Sent question with request_id={}", pending_ai_request.as_ref().unwrap());
+                        }
+                    }
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
@@ -204,7 +253,11 @@ pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<
                             
                             // Store our peer info in DHT
                             let key = kad::RecordKey::new(&namespace);
-                            let value = peer_id.to_bytes();
+                            let record_value = PeerDiscoveryRecord {
+                                peer_id: peer_id.to_string(),
+                                addrs: Vec::new(),
+                            };
+                            let value = serde_json::to_vec(&record_value).unwrap_or_else(|_| peer_id.to_bytes());
                             let record = kad::Record::new(key.clone(), value);
                             if let Err(e) = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
                                 eprintln!("[WARN] Failed to put record: {:?}", e);
@@ -297,6 +350,19 @@ pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<
                                 if let Ok(json_str) = serde_json::to_string_pretty(&response) {
                                     println!("  Full JSON:\n{}", json_str);
                                 }
+
+                                // If this looks like a CommandResponse, print AI output and verify request_id match.
+                                if let Ok(cmd_resp) = CommandResponse::from_json(&response.message) {
+                                    if let Some(ref pending) = pending_ai_request {
+                                        if &cmd_resp.request_id == pending {
+                                            if let Some(result) = cmd_resp.result {
+                                                if let Some(output) = result.get("output").and_then(|v| v.as_str()) {
+                                                    println!("\n[AI ANSWER]\n{}\n", output);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -355,8 +421,15 @@ pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<
     }
 }
 
+/// Run dialer node (extracted for unified binary).
+///
+/// Backwards-compatible wrapper that defaults to dual-stack transport.
+pub async fn run_dialer(bootstrap: String, namespace: String) -> Result<(), Box<dyn Error>> {
+    run_dialer_with_transport(bootstrap, namespace, TransportType::DualStack, None).await
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    run_dialer(args.bootstrap, args.namespace).await
+    run_dialer_with_transport(args.bootstrap, args.namespace, args.transport, args.ask).await
 }
