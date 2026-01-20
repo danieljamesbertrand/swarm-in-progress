@@ -18,6 +18,10 @@ These rules exist because agent-local memory does not persist. The repo must enf
   - Use **single quotes** for literal strings.
   - Use **double quotes** only when interpolation is required.
 - **Paths**: build them with `Join-Path` rather than manual quoting/escaping.
+- **Environment variables (PowerShell vs bash)**:
+  - bash style `VAR=1 command ...` **does not work** in PowerShell.
+  - PowerShell: `$env:VAR="1"; command ...`
+  - Cmd.exe: `set VAR=1` then run the command.
 - **Guardrail**: CI runs a **parse check** over all `*.ps1` (`scripts/ci/pwsh_parse_all.ps1`) to catch broken quoting/syntax before it lands.
 
 ### Adjacent/backup folders

@@ -77,6 +77,19 @@ Run the 3-node test with a **full step-by-step trace** (recommended when validat
 PUNCH_TRACE=1 cargo test --locked --test e2e_quic_server_listener_dialer_tests -- --nocapture
 ```
 
+PowerShell equivalent (Windows):
+
+```powershell
+$env:PUNCH_TRACE="1"; cargo test --locked --test e2e_quic_server_listener_dialer_tests -- --nocapture
+```
+
+Cmd.exe equivalent (Windows):
+
+```bat
+set PUNCH_TRACE=1
+cargo test --locked --test e2e_quic_server_listener_dialer_tests -- --nocapture
+```
+
 Run the weighted-routing test:
 
 ```bash
