@@ -27,6 +27,7 @@ hex = "0.4"
 tokio-process = "0.2"
 uuid = { version = "1.10", features = ["v4"] }
 tokio-tungstenite = "0.21"
+url = "2.5"
 [features]
 default = []
 candle = ["candle-core", "candle-transformers", "candle-nn"]
@@ -91,3 +92,11 @@ path = "examples/split_gguf_rust.rs"
 [[example]]
 name = "rust_real_inference"
 path = "examples/rust_real_inference.rs"
+
+[[example]]
+name = "ai_query_client"
+path = "examples/ai_query_client.rs"
+
+[[bin]]
+name = "check_pipeline_status"
+path = "check_pipeline_status.rs"
