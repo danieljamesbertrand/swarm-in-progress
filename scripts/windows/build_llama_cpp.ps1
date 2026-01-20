@@ -17,12 +17,40 @@ $ErrorActionPreference = 'Stop'
 
 $llamaDir = Join-Path $RepoRoot 'llama.cpp'
 
+function Resolve-CMakePath {
+    $cmd = Get-Command cmake -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { return $cmd.Source }
+
+    $candidates = @(
+        "$env:ProgramFiles\CMake\bin\cmake.exe",
+        "${env:ProgramFiles(x86)}\CMake\bin\cmake.exe",
+        "$env:LocalAppData\Programs\CMake\bin\cmake.exe"
+    )
+
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) { return $p }
+    }
+
+    # Last resort: search a few common roots (can be slow; keep bounded).
+    foreach ($root in @("$env:ProgramFiles", "${env:ProgramFiles(x86)}")) {
+        if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        $found = Get-ChildItem -LiteralPath $root -Recurse -File -Filter "cmake.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+        if ($found) { return $found }
+    }
+
+    return $null
+}
+
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     throw "git not found on PATH. Install Git for Windows first."
 }
-if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
-    throw "cmake not found on PATH. Install CMake first."
+
+$cmakeExe = Resolve-CMakePath
+if (-not $cmakeExe) {
+    throw "cmake.exe not found. Install CMake (Kitware) and/or add it to PATH. Example: C:\Program Files\CMake\bin\cmake.exe"
 }
+Write-Host ("Using CMake: {0}" -f $cmakeExe)
 
 if (-not (Test-Path -LiteralPath $llamaDir)) {
     Write-Host "Cloning llama.cpp into: $llamaDir"
@@ -34,10 +62,10 @@ if (-not (Test-Path -LiteralPath $llamaDir)) {
 Push-Location $llamaDir
 try {
     Write-Host "Configuring (Release)..."
-    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    & $cmakeExe -S . -B build -DCMAKE_BUILD_TYPE=Release
 
     Write-Host "Building..."
-    cmake --build build --config Release
+    & $cmakeExe --build build --config Release
 
     $exe = Join-Path $llamaDir 'build\bin\Release\llama-cli.exe'
     if (-not (Test-Path -LiteralPath $exe)) {
