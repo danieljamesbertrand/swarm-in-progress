@@ -1,6 +1,3 @@
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-
 <#
   Recovery + run script for Windows PowerShell.
 
@@ -37,6 +34,9 @@ param(
     [ValidateSet(0,1)]
     [int]$Strict = 1
 )
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
 function Start-RunTranscript {
     # Create a log file under repo root so users can paste errors even if an editor extension hides them.
