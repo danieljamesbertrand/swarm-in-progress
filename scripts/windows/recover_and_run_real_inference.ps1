@@ -59,14 +59,16 @@ function Assert-FileExists {
 
 function Run {
     param(
-        [Parameter(Mandatory)][string]$Cmd,
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(Mandatory)][string[]]$Args,
         [Parameter()][string]$Why = ""
     )
     if ($Why) { Write-Host "`n==> $Why" }
-    Write-Host "    $Cmd"
-    cmd /c $Cmd
+    $joined = ($Args | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+    Write-Host ("    {0} {1}" -f $Exe, $joined)
+    & $Exe @Args
     if ($LASTEXITCODE -ne 0) {
-        throw "Command failed (exit=$LASTEXITCODE): $Cmd"
+        throw ("Command failed (exit={0}): {1} {2}" -f $LASTEXITCODE, $Exe, $joined)
     }
 }
 
@@ -81,17 +83,17 @@ try {
     Write-Host "GGUF path:  $GgufPath"
 
     # 1) Stash local changes (safe)
-    Run -Why "Stash any local changes" -Cmd "git status --porcelain"
-    Run -Cmd "git stash push -u -m \"recovery stash before real inference run\""
+    Run -Why "Stash any local changes" -Exe "git" -Args @("status","--porcelain")
+    Run -Exe "git" -Args @("stash","push","-u","-m","recovery stash before real inference run")
 
     # 2) Switch to the branch with the real-inference backend + test
-    Run -Why "Fetch branch" -Cmd "git fetch origin cursor/request-id-issue-9b2c"
-    Run -Why "Switch branch" -Cmd "git switch cursor/request-id-issue-9b2c"
-    Run -Why "Pull latest" -Cmd "git pull origin cursor/request-id-issue-9b2c"
+    Run -Why "Fetch branch" -Exe "git" -Args @("fetch","origin","cursor/request-id-issue-9b2c")
+    Run -Why "Switch branch" -Exe "git" -Args @("switch","cursor/request-id-issue-9b2c")
+    Run -Why "Pull latest" -Exe "git" -Args @("pull","origin","cursor/request-id-issue-9b2c")
 
     # 3) Ensure Cargo.lock is in sync (so --locked works)
     # If this fails due to network restrictions, you can try --offline afterwards.
-    Run -Why "Generate lockfile (may hit network once)" -Cmd "cargo generate-lockfile"
+    Run -Why "Generate lockfile (may hit network once)" -Exe "cargo" -Args @("generate-lockfile")
 
     # 4) Configure env for real inference
     $env:PUNCH_INFERENCE_BACKEND = "llama_cpp"
@@ -115,7 +117,7 @@ try {
     Write-Host "  PUNCH_STRICT_DISTRIBUTED=$env:PUNCH_STRICT_DISTRIBUTED"
 
     # 5) Run the ignored test
-    Run -Why "Run real inference QUIC test (ignored)" -Cmd "cargo test --locked --test e2e_quic_real_inference_distributed_serving_tests -- --ignored --nocapture"
+    Run -Why "Run real inference QUIC test (ignored)" -Exe "cargo" -Args @("test","--locked","--test","e2e_quic_real_inference_distributed_serving_tests","--","--ignored","--nocapture")
 
     Write-Host "`nDONE: Real inference test completed successfully."
 } finally {
