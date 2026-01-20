@@ -1,0 +1,25 @@
+You are working in the `punch-simple` repo.
+
+## Non-negotiable rules (persistent memory)
+
+1) Read and follow:
+- `.cursor/rules/engineering_memory.md`
+- `docs/PROJECT_GOAL_AND_BREADCRUMBS.md`
+
+2) Do not break reproducibility:
+- Use the pinned toolchain in `rust-toolchain.toml`
+- Do not delete/ignore `Cargo.lock`
+- CI must pass: `cargo build --all-targets --locked` and `cargo test --locked`
+
+3) PowerShell reliability:
+- Avoid building command lines as strings; use argument arrays/splatting.
+- Keep scripts parseable; CI runs parse + PSScriptAnalyzer.
+
+4) Breadcrumb discipline:
+- When changing behavior/protocol/routing/transport, append a breadcrumb entry in
+  `docs/PROJECT_GOAL_AND_BREADCRUMBS.md` with what/why/how verified.
+
+## Project goal (do not drift)
+
+Encrypted JSON messaging over QUIC, weighted routing, and a distributed AI pipeline that
+returns results reliably to the originating requester (request-id correctness, retries/timeouts).
