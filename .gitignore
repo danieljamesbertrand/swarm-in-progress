@@ -1,5 +1,6 @@
 # Rust
 /target/
+**/target/
 **/*.rs.bk
 # Track Cargo.lock to keep dependency resolution reproducible across
 # environments/CI (this repo builds multiple binaries).
