@@ -71,22 +71,27 @@ function Run {
     Write-Host ("    {0} {1}" -f $Exe, $joined)
 
     # Capture native command output reliably (PowerShell transcripts sometimes miss it).
-    $tmp = Join-Path $env:TEMP ("punch_cmd_{0}.log" -f ([Guid]::NewGuid().ToString('N')))
+    $tmpOut = Join-Path $env:TEMP ("punch_cmd_out_{0}.log" -f ([Guid]::NewGuid().ToString('N')))
+    $tmpErr = Join-Path $env:TEMP ("punch_cmd_err_{0}.log" -f ([Guid]::NewGuid().ToString('N')))
     try {
         $p = Start-Process -FilePath $Exe -ArgumentList $Args -NoNewWindow -PassThru -Wait `
-            -RedirectStandardOutput $tmp -RedirectStandardError $tmp
+            -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
 
-        $out = ""
-        if (Test-Path -LiteralPath $tmp) {
-            $out = Get-Content -Raw -LiteralPath $tmp
+        $out = if (Test-Path -LiteralPath $tmpOut) { Get-Content -Raw -LiteralPath $tmpOut } else { "" }
+        $err = if (Test-Path -LiteralPath $tmpErr) { Get-Content -Raw -LiteralPath $tmpErr } else { "" }
+        $combined = ""
+        if ($out) { $combined += $out }
+        if ($err) {
+            if ($combined) { $combined += "`n" }
+            $combined += $err
         }
 
         # Write to console (captured by transcript) and to a persistent command log.
-        if ($out) {
-            Write-Host $out
+        if ($combined) {
+            Write-Host $combined
             if ($script:CommandLogPath) {
                 Add-Content -LiteralPath $script:CommandLogPath -Value ("`n=== {0} {1} ===`n" -f $Exe, $joined)
-                Add-Content -LiteralPath $script:CommandLogPath -Value $out
+                Add-Content -LiteralPath $script:CommandLogPath -Value $combined
             }
         }
 
@@ -94,7 +99,8 @@ function Run {
             throw ("Command failed (exit={0}): {1} {2}" -f $p.ExitCode, $Exe, $joined)
         }
     } finally {
-        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $tmpOut) { Remove-Item -LiteralPath $tmpOut -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $tmpErr) { Remove-Item -LiteralPath $tmpErr -Force -ErrorAction SilentlyContinue }
     }
 }
 
