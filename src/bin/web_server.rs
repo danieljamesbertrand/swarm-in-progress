@@ -2263,3 +2263,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_web_server(bootstrap).await
 }
 
+#[cfg(test)]
+mod work_stealing_deterministic_unit_tests {
+    use super::{calculate_xor_distance, estimate_bucket_depth};
+    use libp2p::PeerId;
+
+    #[test]
+    fn bucket_depth_is_deterministic_and_ordered_by_distance_band() {
+        // These are fixed u64 distances chosen to land in each leading-zero band.
+        // The exact values don't matter; only leading_zeros() does.
+        let very_close = 1u64; // leading_zeros=63 => depth 0..19
+        let close = 1u64 << 8; // leading_zeros=55 => depth 20..39
+        let medium = 1u64 << 16; // leading_zeros=47 => depth 40..79
+        let far = 1u64 << 24; // leading_zeros=39 => depth 80..119
+        let very_far = 1u64 << 40; // leading_zeros=23 => depth 120..159
+
+        let d0 = estimate_bucket_depth(0);
+        let d1 = estimate_bucket_depth(very_close);
+        let d2 = estimate_bucket_depth(close);
+        let d3 = estimate_bucket_depth(medium);
+        let d4 = estimate_bucket_depth(far);
+        let d5 = estimate_bucket_depth(very_far);
+
+        assert_eq!(d0, 0, "zero distance should map to depth 0");
+
+        // Verify each distance maps into the intended band.
+        assert!(d1 < 20, "very close should map to top-of-queue band");
+        assert!((20..40).contains(&d2), "close should map to early band");
+        assert!((40..80).contains(&d3), "medium should map to middle band");
+        assert!((80..120).contains(&d4), "far should map to later band");
+        assert!((120..160).contains(&d5), "very far should map to bottom band");
+
+        // Verify ordering: closer distances should produce lower (higher priority) depths.
+        assert!(d1 < d2 && d2 < d3 && d3 < d4 && d4 < d5);
+    }
+
+    #[test]
+    fn xor_distance_is_symmetric_and_zero_for_same_peer() {
+        // Deterministic property tests: value doesn't matter, only invariants.
+        let a = PeerId::random();
+        let b = PeerId::random();
+
+        assert_eq!(calculate_xor_distance(&a, &a), 0);
+        assert_eq!(
+            calculate_xor_distance(&a, &b),
+            calculate_xor_distance(&b, &a),
+            "xor distance must be symmetric"
+        );
+    }
+}
+
