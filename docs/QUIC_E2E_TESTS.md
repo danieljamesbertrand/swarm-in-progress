@@ -71,6 +71,12 @@ Run the 3-node test:
 cargo test --locked --test e2e_quic_server_listener_dialer_tests -- --nocapture
 ```
 
+Run the 3-node test with a **full step-by-step trace** (recommended when validating an end-to-end AI request visually):
+
+```bash
+PUNCH_TRACE=1 cargo test --locked --test e2e_quic_server_listener_dialer_tests -- --nocapture
+```
+
 Run the weighted-routing test:
 
 ```bash
