@@ -4,8 +4,8 @@
 //! Also available via unified node binary:
 //!   cargo run --bin node -- listener --bootstrap ADDR --namespace NAMESPACE
 
-use crate::{JsonMessage, JsonCodec};
-use crate::metrics::{MetricsCodec, PeerMetrics, MetricsResponse};
+use punch_simple::{JsonMessage, JsonCodec};
+use punch_simple::metrics::{MetricsCodec, PeerMetrics, MetricsResponse};
 
 use clap::Parser;
 use serde_json;

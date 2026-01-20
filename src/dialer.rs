@@ -4,7 +4,7 @@
 //! Also available via unified node binary:
 //!   cargo run --bin node -- dialer --bootstrap ADDR --namespace NAMESPACE
 
-use crate::{JsonMessage, JsonCodec};
+use punch_simple::{JsonMessage, JsonCodec};
 
 use clap::Parser;
 use serde_json;

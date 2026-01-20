@@ -24,6 +24,11 @@
 //! let transport = create_transport(&key, TransportType::DualStack).unwrap();
 //! ```
 
+// Allow referring to this crate by its package name (`punch_simple::...`) even
+// from within the crate itself. This keeps shared source files usable both as
+// library modules and as standalone `[[bin]]` crate roots.
+extern crate self as punch_simple;
+
 pub mod message;
 pub mod metrics;
 pub mod command_protocol;
