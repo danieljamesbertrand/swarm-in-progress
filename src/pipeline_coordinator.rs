@@ -42,6 +42,21 @@ use tokio::sync::{mpsc, oneshot, RwLock, Mutex};
 use tokio::process::Command as TokioCommand;
 use std::process::Stdio;
 
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
+    }
+}
+
+/// When true, simulation fallbacks must not run (fail loudly instead).
+fn strict_no_simulation() -> bool {
+    env_flag("PUNCH_STRICT_DISTRIBUTED") || env_flag("PUNCH_DISABLE_SIMULATION")
+}
+
 /// Strategy for handling incomplete pipelines
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PipelineStrategy {
@@ -595,6 +610,14 @@ impl DynamicShardLoader {
                 }
             }
         } else {
+            if strict_no_simulation() {
+                return Err(PipelineError::ShardLoadFailed {
+                    shard_id,
+                    error: "No command sender configured (strict mode). Refusing to simulate shard load."
+                        .to_string(),
+                });
+            }
+
             // No command sender configured - fallback to local simulation
             println!("[LOADER] WARNING: No command sender configured, simulating shard load");
             
@@ -1343,6 +1366,13 @@ impl PipelineCoordinator {
             println!("[COORDINATOR] Waiting for shards to load (5s)...");
             tokio::time::sleep(Duration::from_secs(5)).await;
         } else {
+            if strict_no_simulation() {
+                return Err(PipelineError::ShardLoadFailed {
+                    shard_id: 0,
+                    error: "No command sender configured (strict mode). Refusing to proceed without LOAD_SHARD capability."
+                        .to_string(),
+                });
+            }
             println!("[COORDINATOR] ⚠️  No command sender configured - cannot send LOAD_SHARD commands");
             println!("[COORDINATOR]   Nodes will need to load shards manually or via other mechanisms");
         }
@@ -2227,6 +2257,16 @@ impl PipelineCoordinator {
                     }
                 }
             } else {
+                if strict_no_simulation() {
+                    return Err(PipelineError::InferenceFailed {
+                        shard_id: shard.shard_id,
+                        error: format!(
+                            "No command sender configured (strict mode). Refusing to simulate inference for shard {}.",
+                            shard.shard_id
+                        ),
+                    });
+                }
+
                 // Fallback: simulate processing if no command sender
                 eprintln!("[INFERENCE] ❌ WARNING: No command sender configured, simulating shard processing");
                 eprintln!("[INFERENCE]   This means inference commands are NOT being sent to shard nodes!");
@@ -2309,6 +2349,14 @@ impl PipelineCoordinator {
         start: Instant,
     ) -> Result<InferenceResponse, PipelineError> {
         println!("[FALLBACK] Processing on single node: {}", node.peer_id);
+
+        if strict_no_simulation() {
+            return Err(PipelineError::InferenceFailed {
+                shard_id: node.shard_id,
+                error: "Fallback processing is simulated in this repo. Refusing to simulate because strict mode is enabled."
+                    .to_string(),
+            });
+        }
 
         // Simulate full model inference on single node
         tokio::time::sleep(Duration::from_millis(200)).await;

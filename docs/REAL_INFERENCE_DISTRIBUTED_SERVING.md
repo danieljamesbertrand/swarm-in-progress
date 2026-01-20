@@ -49,4 +49,6 @@ cargo run --bin dialer -- --transport quic --bootstrap "/ip4/127.0.0.1/udp/51820
 
 - This is **distributed serving**, not pipeline-parallel shards. Each node runs a full local inference.
 - `llama.cpp` invocation is per-request; for high throughput we’ll evolve toward a persistent worker process or an in-process binding.
+- The pipeline-parallel coordinator/shard codepaths still contain simulation fallbacks for development. To ensure you **never** accidentally simulate, set:
+  - `PUNCH_STRICT_DISTRIBUTED=1` (or `PUNCH_DISABLE_SIMULATION=1`)
 
