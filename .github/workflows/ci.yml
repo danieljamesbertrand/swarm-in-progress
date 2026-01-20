@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   rust:
-    name: Rust (build + test, locked)
+    name: Rust (build + test, locked, all targets)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,8 +18,8 @@ jobs:
         with:
           toolchain: 1.82.0
           components: rustfmt, clippy
-      - name: Build (locked)
-        run: cargo build --locked
+      - name: Build (all targets, locked)
+        run: cargo build --all-targets --locked
       - name: Test (locked)
         run: cargo test --locked
 
@@ -31,3 +31,26 @@ jobs:
       - name: Parse all *.ps1
         shell: pwsh
         run: ./scripts/ci/pwsh_parse_all.ps1
+
+  powershell-lint:
+    name: PowerShell (PSScriptAnalyzer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -AllowClobber
+      - name: Analyze *.ps1 (best-practice lint)
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $scripts = Get-ChildItem -Path . -Recurse -File -Filter '*.ps1'
+          $results = Invoke-ScriptAnalyzer -Path $scripts.FullName -Severity Error,Warning
+          if ($results.Count -gt 0) {
+            $results | Sort-Object ScriptName, Line | Format-Table -AutoSize
+            throw ("PSScriptAnalyzer found {0} issue(s)." -f $results.Count)
+          }
