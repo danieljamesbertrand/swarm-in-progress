@@ -830,6 +830,8 @@ pub async fn run_shard_listener(
     let mut announced = false;
     let mut torrent_files_registered = false; // Track if torrent files have been registered in DHT
     let cluster_name = cluster.clone();
+    let mut bootstrap_connected = false; // Track if we're connected to bootstrap
+    let mut bootstrap_retry_timer = tokio::time::Instant::now() + Duration::from_secs(5); // Retry every 5 seconds
 
     // Announcement refresh timer
     let refresh_interval = Duration::from_secs(refresh_interval);
@@ -888,12 +890,23 @@ pub async fn run_shard_listener(
 
                     SwarmEvent::ConnectionEstablished { peer_id: connected_peer, endpoint, .. } => {
                         let direction = if endpoint.is_dialer() { "outbound" } else { "inbound" };
-                        println!("\n[CONNECT] ═══════════════════════════════════════════════════════════════════════════");
-                        println!("[CONNECT] ✓ Connection established!");
-                        println!("[CONNECT]   Peer ID: {}", connected_peer);
-                        println!("[CONNECT]   Direction: {}", direction);
-                        println!("[CONNECT]   Endpoint: {:?}", endpoint);
-                        println!("[CONNECT] ═══════════════════════════════════════════════════════════════════════════\n");
+                        
+                        // Check if this is the bootstrap connection
+                        let is_bootstrap = endpoint.get_remote_address() == &bootstrap_addr_for_dht;
+                        if is_bootstrap && !bootstrap_connected {
+                            bootstrap_connected = true;
+                            println!("\n[CONNECT] ═══════════════════════════════════════════════════════════════════════════");
+                            println!("[CONNECT] ✓✓✓ CONNECTED TO BOOTSTRAP NODE ✓✓✓");
+                            println!("[CONNECT]   Peer ID: {}", connected_peer);
+                            println!("[CONNECT] ═══════════════════════════════════════════════════════════════════════════\n");
+                        } else {
+                            println!("\n[CONNECT] ═══════════════════════════════════════════════════════════════════════════");
+                            println!("[CONNECT] ✓ Connection established!");
+                            println!("[CONNECT]   Peer ID: {}", connected_peer);
+                            println!("[CONNECT]   Direction: {}", direction);
+                            println!("[CONNECT]   Endpoint: {:?}", endpoint);
+                            println!("[CONNECT] ═══════════════════════════════════════════════════════════════════════════\n");
+                        }
 
                         if !bootstrapped {
                             // Add bootstrap node's address to Kademlia (now we know its peer_id from the connection)
@@ -1738,11 +1751,37 @@ pub async fn run_shard_listener(
                     }
 
                     SwarmEvent::OutgoingConnectionError { error, peer_id: failed_peer, .. } => {
-                        eprintln!("[ERROR] Connection failed to {:?}: {:?}", failed_peer, error);
+                        // Check if this is a bootstrap connection failure
+                        if let Some(peer) = failed_peer {
+                            // Try to determine if this was the bootstrap by checking if we're not connected
+                            if !bootstrap_connected {
+                                eprintln!("[CONNECT] ⚠️  Bootstrap connection failed: {:?}", error);
+                                eprintln!("[CONNECT] ↻ Will retry in 5 seconds...");
+                                bootstrap_retry_timer = tokio::time::Instant::now() + Duration::from_secs(5);
+                            } else {
+                                eprintln!("[ERROR] Connection failed to {:?}: {:?}", peer, error);
+                            }
+                        } else {
+                            // No peer_id means it might be the bootstrap (initial dial)
+                            if !bootstrap_connected {
+                                eprintln!("[CONNECT] ⚠️  Bootstrap connection failed: {:?}", error);
+                                eprintln!("[CONNECT] ↻ Will retry in 5 seconds...");
+                                bootstrap_retry_timer = tokio::time::Instant::now() + Duration::from_secs(5);
+                            }
+                        }
                     }
 
                     _ => {}
                 }
+            }
+
+            // Bootstrap connection retry
+            _ = tokio::time::sleep_until(bootstrap_retry_timer), if !bootstrap_connected => {
+                println!("[CONNECT] ↻ Retrying bootstrap connection...");
+                if let Err(e) = swarm.dial(bootstrap_addr.clone()) {
+                    eprintln!("[CONNECT] ⚠️  Retry dial failed: {:?}", e);
+                }
+                bootstrap_retry_timer = tokio::time::Instant::now() + Duration::from_secs(5);
             }
 
             // Periodic announcement refresh
