@@ -71,8 +71,12 @@ enum Mode {
     /// AI inference node for distributed Llama models
     ShardListener {
         /// Bootstrap node address (Multiaddr format)
-        #[arg(long, default_value = "/ip4/127.0.0.1/tcp/51820")]
+        /// Prefer QUIC: /ip4/127.0.0.1/udp/51820/quic-v1
+        #[arg(long, default_value = "/ip4/127.0.0.1/udp/51820/quic-v1")]
         bootstrap: String,
+        /// Transport type: quic, tcp, or dual (default: dual)
+        #[arg(long, default_value = "dual")]
+        transport: String,
         /// Cluster name for shard discovery
         #[arg(long, default_value = "llama-cluster")]
         cluster: String,
@@ -149,11 +153,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             refresh_interval,
             shards_dir,
             enable_torrent,
+            transport,
         } => {
             // Delegate to shard_listener.rs logic
             run_shard_listener(
                 bootstrap, cluster, shard_id, total_shards, total_layers,
-                model_name, port, refresh_interval, shards_dir, enable_torrent
+                model_name, port, refresh_interval, shards_dir, enable_torrent, transport
             ).await
         }
         Mode::Monitor { listen_addr, port, web_port } => {
@@ -206,10 +211,11 @@ async fn run_shard_listener(
     refresh_interval: u64,
     shards_dir: String,
     enable_torrent: bool,
+    transport: String,
 ) -> Result<(), Box<dyn Error>> {
     punch_simple::run_shard_listener(
         bootstrap, cluster, shard_id, total_shards, total_layers,
-        model_name, port, refresh_interval, shards_dir, enable_torrent
+        model_name, port, refresh_interval, shards_dir, enable_torrent, transport
     ).await
 }
 

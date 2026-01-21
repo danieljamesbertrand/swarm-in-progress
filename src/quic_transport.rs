@@ -69,8 +69,20 @@ impl std::error::Error for TransportError {}
 pub fn create_quic_transport(
     keypair: &Keypair,
 ) -> Result<libp2p::core::transport::Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>, TransportError> {
-    // Create QUIC config with default settings
+    // Create QUIC config with persistent connection settings
+    // QUIC has built-in keepalive and connection persistence
     let quic_config = quic::Config::new(keypair);
+    
+    // Note: libp2p's quic::Config may not expose all quinn settings directly
+    // The underlying quinn library handles:
+    // - Idle timeout (default: 30s, but can be configured via TransportConfig)
+    // - Keepalive interval (default: disabled, but can be enabled)
+    // - Connection migration (enabled by default)
+    // 
+    // For persistent connections, we rely on:
+    // 1. Swarm-level idle_connection_timeout (set to 300s in nodes)
+    // 2. Ping protocol keepalive (every 25s)
+    // 3. QUIC's built-in connection management
     
     // Create QUIC transport
     let transport = quic::tokio::Transport::new(quic_config)

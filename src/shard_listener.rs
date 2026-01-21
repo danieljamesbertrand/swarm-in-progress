@@ -29,19 +29,16 @@ use punch_simple::{
 use clap::Parser;
 use libp2p::{
     identity,
-    tcp,
-    noise,
-    yamux,
     kad,
     ping,
     relay,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
-    core::transport::Transport,
     PeerId, Multiaddr, StreamProtocol,
 };
 use libp2p::swarm::Config as SwarmConfig;
 use libp2p::futures::StreamExt;
+use punch_simple::quic_transport::{create_transport, TransportType, get_dual_listen_addresses};
 use std::error::Error;
 use std::time::Duration;
 use std::collections::HashMap;
@@ -142,8 +139,14 @@ struct TorrentMetadata {
 #[command(about = "Kademlia Shard Listener - Announces model shards for distributed Llama inference")]
 struct Args {
     /// Bootstrap node address (Multiaddr format)
-    #[arg(long, default_value = "/ip4/127.0.0.1/tcp/51820")]
+    /// Prefer QUIC: /ip4/127.0.0.1/udp/51820/quic-v1
+    /// TCP fallback: /ip4/127.0.0.1/tcp/51820
+    #[arg(long, default_value = "/ip4/127.0.0.1/udp/51820/quic-v1")]
     bootstrap: String,
+
+    /// Transport type: quic, tcp, or dual (default: dual)
+    #[arg(long, default_value = "dual")]
+    transport: String,
 
     /// Cluster name for shard discovery
     #[arg(long, default_value = "llama-cluster")]
@@ -662,6 +665,7 @@ pub async fn run_shard_listener(
     refresh_interval: u64,
     shards_dir: String,
     _enable_torrent: bool,
+    transport: String,
 ) -> Result<(), Box<dyn Error>> {
     // Determine shard ID
     let shard_id = shard_id.unwrap_or_else(|| {
@@ -747,12 +751,16 @@ pub async fn run_shard_listener(
         }
     }
 
-    // Transport
-    let transport = tcp::tokio::Transport::default()
-        .upgrade(libp2p::core::upgrade::Version::V1)
-        .authenticate(noise::Config::new(&key)?)
-        .multiplex(yamux::Config::default())
-        .boxed();
+    // Transport - Use QUIC (dual-stack: QUIC preferred, TCP fallback)
+    let transport_type = transport.parse::<TransportType>()
+        .unwrap_or_else(|_| {
+            eprintln!("[WARN] Invalid transport type '{}', using dual-stack", transport);
+            TransportType::DualStack
+        });
+    
+    println!("[TRANSPORT] Using transport: {:?}", transport_type);
+    let transport = create_transport(&key, transport_type)
+        .map_err(|e| format!("Failed to create transport: {}", e))?;
 
     // Kademlia DHT - Large timeout for reliable discovery
     let store = kad::store::MemoryStore::new(peer_id);
@@ -760,9 +768,17 @@ pub async fn run_shard_listener(
     kademlia_config.set_query_timeout(Duration::from_secs(120)); // Large timeout for reliable DHT operations
     let kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
 
-    // Bootstrap address will be added after we connect and get the bootstrap node's peer_id
+    // Bootstrap address - prefer QUIC if using dual-stack
+    // With dual-stack transport, libp2p will automatically try QUIC first, then TCP fallback
     let bootstrap_addr: Multiaddr = bootstrap.parse()?;
     let bootstrap_addr_for_dht = bootstrap_addr.clone(); // Clone for use in event handler
+    
+    // Log bootstrap address and transport preference
+    if transport_type == TransportType::DualStack {
+        println!("[TRANSPORT] Bootstrap: {} (dual-stack: will try QUIC first, TCP fallback)", bootstrap);
+    } else {
+        println!("[TRANSPORT] Bootstrap: {} (transport: {:?})", bootstrap, transport_type);
+    }
 
     // Identify
     let identify = libp2p::identify::Behaviour::new(
@@ -813,17 +829,46 @@ pub async fn run_shard_listener(
         relay,
     };
 
-    // Swarm - Increased idle timeout since ping keeps connections alive
+    // Swarm - Increased idle timeout for persistent connections
+    // Ping protocol (every 25s) keeps connections alive, so we can use longer timeout
     let swarm_config = SwarmConfig::with_tokio_executor()
-        .with_idle_connection_timeout(Duration::from_secs(90));
+        .with_idle_connection_timeout(Duration::from_secs(300)); // 5 minutes - ping keeps it alive
     let mut swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
 
-    // Listen
-    let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
-    swarm.listen_on(listen_addr)?;
+    // Listen on transport(s) - dual-stack listens on both QUIC and TCP
+    match transport_type {
+        TransportType::DualStack => {
+            let (quic_addr, tcp_addr) = get_dual_listen_addresses(port);
+            let quic_listen: Multiaddr = quic_addr.replace("0.0.0.0", "0.0.0.0").parse()?;
+            let tcp_listen: Multiaddr = tcp_addr.replace("0.0.0.0", "0.0.0.0").parse()?;
+            swarm.listen_on(quic_listen)?;
+            swarm.listen_on(tcp_listen)?;
+            println!("[LISTEN] Listening on QUIC: {}", quic_addr.replace("0.0.0.0", "0.0.0.0"));
+            println!("[LISTEN] Listening on TCP:  {}", tcp_addr.replace("0.0.0.0", "0.0.0.0"));
+        }
+        TransportType::QuicOnly => {
+            let quic_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port);
+            let listen_addr: Multiaddr = quic_addr.parse()?;
+            swarm.listen_on(listen_addr)?;
+            println!("[LISTEN] Listening on QUIC: {}", quic_addr);
+        }
+        TransportType::TcpOnly => {
+            let tcp_addr = format!("/ip4/0.0.0.0/tcp/{}", port);
+            let listen_addr: Multiaddr = tcp_addr.parse()?;
+            swarm.listen_on(listen_addr)?;
+            println!("[LISTEN] Listening on TCP:  {}", tcp_addr);
+        }
+    }
 
     // Connect to bootstrap
+    // With dual-stack transport, libp2p will automatically try QUIC first, then TCP fallback
     println!("\n🔗 Connecting to bootstrap node...");
+    println!("[CONNECT] Bootstrap address: {}", bootstrap_addr);
+    if transport_type == TransportType::DualStack {
+        println!("[CONNECT] Transport: Dual-stack (QUIC preferred, TCP fallback)");
+    } else {
+        println!("[CONNECT] Transport: {:?}", transport_type);
+    }
     swarm.dial(bootstrap_addr.clone())?;
 
     let mut bootstrapped = false;
@@ -879,7 +924,9 @@ pub async fn run_shard_listener(
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        println!("[LISTEN] Listening on: {}", address);
+                        let is_quic = address.to_string().contains("/quic-v1") || address.to_string().contains("/udp/");
+                        let transport_type_str = if is_quic { "QUIC" } else { "TCP" };
+                        println!("[LISTEN] Listening on {}: {}", transport_type_str, address);
                         let mut s = state.write().await;
                         s.update_listen_addr(&address);
                         swarm.add_external_address(address.clone());
@@ -891,20 +938,28 @@ pub async fn run_shard_listener(
                     SwarmEvent::ConnectionEstablished { peer_id: connected_peer, endpoint, .. } => {
                         let direction = if endpoint.is_dialer() { "outbound" } else { "inbound" };
                         
+                        // Detect transport protocol (QUIC vs TCP)
+                        let remote_addr = endpoint.get_remote_address();
+                        let is_quic = remote_addr.to_string().contains("/quic-v1") || remote_addr.to_string().contains("/udp/");
+                        let transport_protocol = if is_quic { "QUIC" } else { "TCP" };
+                        
                         // Check if this is the bootstrap connection
-                        let is_bootstrap = endpoint.get_remote_address() == &bootstrap_addr_for_dht;
+                        let is_bootstrap = remote_addr == &bootstrap_addr_for_dht;
                         if is_bootstrap && !bootstrap_connected {
                             bootstrap_connected = true;
                             println!("\n[CONNECT] ═══════════════════════════════════════════════════════════════════════════");
                             println!("[CONNECT] ✓✓✓ CONNECTED TO BOOTSTRAP NODE ✓✓✓");
                             println!("[CONNECT]   Peer ID: {}", connected_peer);
+                            println!("[CONNECT]   Transport: {} (persistent connection)", transport_protocol);
+                            println!("[CONNECT]   Address: {}", remote_addr);
                             println!("[CONNECT] ═══════════════════════════════════════════════════════════════════════════\n");
                         } else {
                             println!("\n[CONNECT] ═══════════════════════════════════════════════════════════════════════════");
                             println!("[CONNECT] ✓ Connection established!");
                             println!("[CONNECT]   Peer ID: {}", connected_peer);
+                            println!("[CONNECT]   Transport: {} (persistent connection)", transport_protocol);
                             println!("[CONNECT]   Direction: {}", direction);
-                            println!("[CONNECT]   Endpoint: {:?}", endpoint);
+                            println!("[CONNECT]   Address: {}", remote_addr);
                             println!("[CONNECT] ═══════════════════════════════════════════════════════════════════════════\n");
                         }
 
@@ -956,6 +1011,16 @@ pub async fn run_shard_listener(
                     SwarmEvent::ConnectionClosed { peer_id: closed_peer, cause, .. } => {
                         println!("[DISCONNECT] ✗ Peer disconnected: {} ({:?})", closed_peer, cause);
                         log_connection_closed(&closed_peer.to_string(), "unknown", "P2P");
+                        
+                        // If bootstrap connection closed, mark as disconnected and schedule reconnect
+                        // We detect bootstrap by checking if we were connected and this is a critical peer
+                        if bootstrap_connected {
+                            // Check if this might be the bootstrap peer
+                            // If we lose bootstrap, we need to reconnect
+                            bootstrap_connected = false;
+                            println!("[CONNECT] ⚠️  Bootstrap connection lost, will retry...");
+                            bootstrap_retry_timer = tokio::time::Instant::now() + Duration::from_secs(2); // Quick retry
+                        }
                     }
 
                     SwarmEvent::Behaviour(behaviour_event) => {
@@ -1818,6 +1883,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         args.refresh_interval,
         args.shards_dir,
         args.enable_torrent,
+        args.transport,
     ).await
 }
 

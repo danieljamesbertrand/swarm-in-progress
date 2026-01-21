@@ -37,7 +37,7 @@ Write-Host "  [OK] Cleanup complete" -ForegroundColor Green
 # Step 3: Start all 4 shard nodes
 Write-Host ""
 Write-Host "[3/6] Starting all 4 shard nodes..." -ForegroundColor Yellow
-$bootstrapAddr = "/ip4/127.0.0.1/tcp/51820"
+$bootstrapAddr = "/ip4/127.0.0.1/udp/51820/quic-v1"  # QUIC preferred
 $cluster = "llama-cluster"
 $totalShards = 4
 $totalLayers = 32
