@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use punch_simple::pipeline_coordinator::{PipelineCoordinator, InferenceRequest, PipelineStrategy, NodeSpawner};
 use punch_simple::kademlia_shard_discovery::{KademliaShardDiscovery, dht_keys};
 use punch_simple::message::{JsonCodec, JsonMessage};
+use punch_simple::quic_transport::{create_transport, TransportType, get_dual_listen_addresses};
 use punch_simple::command_validation::validate_command;
 use libp2p::{
     identity,
@@ -516,12 +517,10 @@ impl InferenceEngine {
             min_memory_for_full_mb: 16384,
         });
         
-        // Create P2P swarm for command sending and discovery
-        let transport = tcp::tokio::Transport::default()
-            .upgrade(libp2p::core::upgrade::Version::V1)
-            .authenticate(noise::Config::new(&key).unwrap())
-            .multiplex(yamux::Config::default())
-            .boxed();
+        // Create P2P swarm for command sending and discovery - Use dual-stack (QUIC + TCP)
+        println!("[TRANSPORT] Using dual-stack transport (QUIC preferred, TCP fallback)");
+        let transport = create_transport(&key, TransportType::DualStack)
+            .map_err(|e| format!("Failed to create transport: {}", e))?;
 
         // Kademlia DHT - Large timeout for reliable discovery
         let store = kad::store::MemoryStore::new(peer_id);
@@ -560,12 +559,20 @@ impl InferenceEngine {
             .with_idle_connection_timeout(Duration::from_secs(90));
         let swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
         
-        // Listen on ephemeral port
+           // Listen on both QUIC and TCP for maximum compatibility
         let swarm_arc = Arc::new(Mutex::new(swarm));
         {
             let mut swarm = swarm_arc.lock().await;
-            if let Err(e) = swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()) {
-                eprintln!("[SERVER] Failed to listen: {}", e);
+            let (quic_addr, tcp_addr) = get_dual_listen_addresses(0);
+            if let Err(e) = swarm.listen_on(quic_addr.parse().unwrap()) {
+                eprintln!("[SERVER] Failed to listen on QUIC: {}", e);
+            } else {
+                println!("[SERVER] Listening on QUIC: {}", quic_addr);
+            }
+            if let Err(e) = swarm.listen_on(tcp_addr.parse().unwrap()) {
+                eprintln!("[SERVER] Failed to listen on TCP: {}", e);
+            } else {
+                println!("[SERVER] Listening on TCP: {}", tcp_addr);
             }
         }
         
@@ -1073,6 +1080,36 @@ impl InferenceEngine {
                                     
                                     println!("[DHT] ✓ Discovered shard {} from {} (using queue/depth tree for routing)", 
                                              announcement.shard_id, announcement.peer_id);
+                                    
+                                    // Connect directly to discovered peer using QUIC (add to Kademlia and dial)
+                                    if let Ok(discovered_peer_id) = announcement.peer_id.parse::<PeerId>() {
+                                        if let Ok(peer_multiaddr) = announcement.multiaddr.parse::<Multiaddr>() {
+                                            let mut swarm_guard = swarm_for_events.lock().await;
+                                            
+                                            // Add peer address to Kademlia routing table
+                                            swarm_guard.behaviour_mut().kademlia.add_address(&discovered_peer_id, peer_multiaddr.clone());
+                                            
+                                            // Prefer QUIC address if available
+                                            let is_quic = peer_multiaddr.to_string().contains("/quic-v1") || peer_multiaddr.to_string().contains("/udp/");
+                                            
+                                            // Dial discovered peer directly using QUIC (if QUIC address) or TCP fallback
+                                            match swarm_guard.dial(peer_multiaddr.clone()) {
+                                                Ok(_) => {
+                                                    println!("[DHT] 📡 Dialing discovered peer {} using {} transport (direct P2P connection)", 
+                                                        discovered_peer_id, if is_quic { "QUIC" } else { "TCP" });
+                                                }
+                                                Err(e) => {
+                                                    println!("[DHT] ⚠️  Failed to dial discovered peer {}: {} (will retry via DHT routing)", 
+                                                        discovered_peer_id, e);
+                                                }
+                                            }
+                                            drop(swarm_guard);
+                                        }
+                                    }
+                                    
+                                    // IMPORTANT: Update discovery to trigger LOAD_SHARD command if needed
+                                    // This ensures nodes without loaded shards receive LOAD_SHARD commands automatically
+                                    coordinator_for_events.update_discovery(announcement.clone()).await;
                                     
                                     // Record node join event
                                     {

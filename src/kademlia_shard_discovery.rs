@@ -71,6 +71,62 @@ pub struct ShardAnnouncement {
     pub model_params_billions: f32,
 }
 
+/// Swarm readiness announcement - indicates when all required shards are available
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct SwarmReadiness {
+    /// Cluster name
+    pub cluster_name: String,
+    /// Total expected shards
+    pub total_shards: u32,
+    /// List of available shard IDs (0 to total_shards-1)
+    pub available_shards: Vec<u32>,
+    /// Timestamp when swarm became ready
+    pub timestamp: u64,
+    /// Peer ID of the node announcing readiness
+    pub announcing_peer_id: String,
+    /// Whether all required shards are available
+    pub is_ready: bool,
+}
+
+impl SwarmReadiness {
+    /// Create a new swarm readiness announcement
+    pub fn new(cluster_name: &str, total_shards: u32, available_shards: Vec<u32>, announcing_peer_id: &str) -> Self {
+        let is_ready = available_shards.len() == total_shards as usize
+            && (0..total_shards).all(|id| available_shards.contains(&id));
+        
+        Self {
+            cluster_name: cluster_name.to_string(),
+            total_shards,
+            available_shards,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            announcing_peer_id: announcing_peer_id.to_string(),
+            is_ready,
+        }
+    }
+
+    /// Serialize to bytes for DHT storage
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    /// Deserialize from bytes
+    pub fn from_bytes(data: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_slice(data)?)
+    }
+
+    /// Check if this readiness announcement is fresh (within TTL)
+    pub fn is_fresh(&self, ttl_seconds: u64) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now.saturating_sub(self.timestamp) < ttl_seconds
+    }
+}
+
 /// Capabilities specific to shard processing
 /// Extends NodeCapabilities with shard-specific information
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -325,6 +381,11 @@ pub mod dht_keys {
         format!("/llama-cluster/{}/shards", cluster_name)
     }
 
+    /// Get the key for swarm readiness announcement (when all required shards are available)
+    pub fn swarm_readiness_key(cluster_name: &str) -> String {
+        format!("/llama-cluster/{}/swarm-ready", cluster_name)
+    }
+
     /// Get the key for cluster metadata
     pub fn metadata_key(cluster_name: &str) -> String {
         format!("/llama-cluster/{}/metadata", cluster_name)
@@ -421,6 +482,42 @@ impl KademliaShardDiscovery {
     /// Create Kademlia record key for querying a shard
     pub fn shard_record_key(&self, shard_id: u32) -> kad::RecordKey {
         kad::RecordKey::new(&dht_keys::shard_key(&self.cluster_name, shard_id))
+    }
+
+    /// Create swarm readiness record key
+    pub fn swarm_readiness_key(&self) -> kad::RecordKey {
+        kad::RecordKey::new(&dht_keys::swarm_readiness_key(&self.cluster_name))
+    }
+
+    /// Create a swarm readiness announcement record
+    pub fn create_swarm_readiness_record(&self, announcing_peer_id: &str) -> Option<kad::Record> {
+        let status = self.status();
+        let available_shards: Vec<u32> = (0..status.expected_shards)
+            .filter(|id| self.get_best_node_for_shard(*id).is_some())
+            .collect();
+        
+        let readiness = SwarmReadiness::new(
+            &self.cluster_name,
+            status.expected_shards,
+            available_shards,
+            announcing_peer_id,
+        );
+
+        match readiness.to_bytes() {
+            Ok(value) => {
+                let key = self.swarm_readiness_key();
+                Some(kad::Record::new(key, value))
+            }
+            Err(e) => {
+                eprintln!("[SWARM] Failed to serialize swarm readiness: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Process a discovered swarm readiness record
+    pub fn process_swarm_readiness_record(&self, record: &kad::Record) -> Option<SwarmReadiness> {
+        SwarmReadiness::from_bytes(&record.value).ok()
     }
 
     /// Process a discovered shard record from Kademlia
@@ -735,6 +832,27 @@ impl KademliaShardDiscovery {
 
         // Verify entry and exit nodes exist
         self.entry_node().is_some() && self.exit_node().is_some()
+    }
+
+    /// Check if all required shards are actually loaded (not just announced)
+    /// This is stricter than is_pipeline_complete - requires shards to be loaded in memory
+    pub fn are_all_shards_loaded(&self) -> bool {
+        let Some(expected) = self.expected_shards else {
+            return false;
+        };
+
+        // Check that all shards 0 to N-1 have at least one node with the shard loaded
+        for i in 0..expected {
+            if let Some(node) = self.get_best_node_for_shard(i) {
+                if !node.capabilities.shard_loaded {
+                    return false; // Shard exists but not loaded
+                }
+            } else {
+                return false; // Shard not discovered
+            }
+        }
+
+        true
     }
 
     /// Get missing shard IDs

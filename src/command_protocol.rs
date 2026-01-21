@@ -386,6 +386,9 @@ pub mod commands {
     pub const GET_FILE_METADATA: &str = "GET_FILE_METADATA";
     pub const REQUEST_PIECE: &str = "REQUEST_PIECE";
     pub const LOAD_SHARD: &str = "LOAD_SHARD";
+    pub const SHARD_LOADED: &str = "SHARD_LOADED";
+    pub const SWARM_READY: &str = "SWARM_READY";
+    pub const SWARM_STATUS: &str = "SWARM_STATUS";
 }
 
 #[cfg(test)]
