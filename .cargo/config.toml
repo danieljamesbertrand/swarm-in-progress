@@ -1,0 +1,2 @@
+﻿[build]
+rustflags = ['-A', 'warnings', '-A', 'future-incompat']

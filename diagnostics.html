@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QUIC Protocol Diagnostics - Punch Rendezvous Server</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a0e27;
+            color: #e0e0e0;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        
+        h1 {
+            color: white;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            color: rgba(255,255,255,0.9);
+            font-size: 1.1em;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: #1a1f3a;
+            padding: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+        
+        .stat-label {
+            color: #a0a0a0;
+            font-size: 0.9em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+        }
+        
+        .stat-value {
+            color: #667eea;
+            font-size: 2em;
+            font-weight: bold;
+        }
+        
+        .stat-unit {
+            font-size: 0.6em;
+            color: #888;
+            margin-left: 5px;
+        }
+        
+        .section {
+            background: #1a1f3a;
+            padding: 25px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+        
+        .section-title {
+            color: #667eea;
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #2a2f4a;
+            padding-bottom: 10px;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        
+        th {
+            background: #2a2f4a;
+            color: #667eea;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.85em;
+            letter-spacing: 1px;
+        }
+        
+        td {
+            padding: 12px;
+            border-bottom: 1px solid #2a2f4a;
+            color: #d0d0d0;
+        }
+        
+        tr:hover {
+            background: #252a45;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            font-weight: bold;
+        }
+        
+        .badge-success {
+            background: #10b981;
+            color: white;
+        }
+        
+        .badge-error {
+            background: #ef4444;
+            color: white;
+        }
+        
+        .badge-warning {
+            background: #f59e0b;
+            color: white;
+        }
+        
+        .badge-info {
+            background: #3b82f6;
+            color: white;
+        }
+        
+        .refresh-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1em;
+            margin-bottom: 20px;
+            transition: background 0.3s;
+        }
+        
+        .refresh-btn:hover {
+            background: #5568d3;
+        }
+        
+        .auto-refresh {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .auto-refresh input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+        
+        .error-log {
+            background: #2a1f1f;
+            padding: 15px;
+            border-radius: 5px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        
+        .error-entry {
+            padding: 8px;
+            margin-bottom: 5px;
+            border-left: 3px solid #ef4444;
+            background: #3a2a2a;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #667eea;
+        }
+        
+        .timestamp {
+            color: #888;
+            font-size: 0.85em;
+        }
+        
+        .connection-id {
+            font-family: monospace;
+            color: #a0a0a0;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔍 QUIC Protocol Diagnostics</h1>
+            <div class="subtitle">Real-time connection analysis for Punch Rendezvous Server</div>
+        </header>
+        
+        <div class="auto-refresh">
+            <input type="checkbox" id="autoRefresh" checked>
+            <label for="autoRefresh">Auto-refresh (5s)</label>
+            <button class="refresh-btn" onclick="loadDiagnostics()">🔄 Refresh Now</button>
+        </div>
+        
+        <div id="stats" class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Total Connections</div>
+                <div class="stat-value" id="totalConnections">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Active Connections</div>
+                <div class="stat-value" id="activeConnections">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Failed Connections</div>
+                <div class="stat-value" id="failedConnections">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Handshake Timeouts</div>
+                <div class="stat-value" id="handshakeTimeouts">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Total Bytes Sent</div>
+                <div class="stat-value" id="bytesSent">-<span class="stat-unit">bytes</span></div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Total Bytes Received</div>
+                <div class="stat-value" id="bytesReceived">-<span class="stat-unit">bytes</span></div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Avg Handshake Duration</div>
+                <div class="stat-value" id="avgHandshake">-<span class="stat-unit">ms</span></div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-title">Recent Connection Events</div>
+            <div id="eventsTable">
+                <div class="loading">Loading events...</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-title">Active Connections</div>
+            <div id="connectionsTable">
+                <div class="loading">Loading connections...</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-title">Error Log</div>
+            <div id="errorLog" class="error-log">
+                <div class="loading">Loading errors...</div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const API_BASE = window.location.origin;
+        let autoRefreshInterval = null;
+        
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+        }
+        
+        function formatTimestamp(timestamp) {
+            return new Date(timestamp * 1000).toLocaleString();
+        }
+        
+        function getHandshakeStageBadge(stage) {
+            const badges = {
+                'initial': '<span class="badge badge-info">Initial</span>',
+                'handshake': '<span class="badge badge-warning">Handshake</span>',
+                'one_rtt': '<span class="badge badge-success">1-RTT</span>',
+                'completed': '<span class="badge badge-success">Completed</span>',
+                'failed': '<span class="badge badge-error">Failed</span>'
+            };
+            return badges[stage] || '<span class="badge">Unknown</span>';
+        }
+        
+        async function loadDiagnostics() {
+            try {
+                const response = await fetch(`${API_BASE}/diagnostics`);
+                const data = await response.json();
+                
+                // Update stats
+                document.getElementById('totalConnections').textContent = data.total_connections || 0;
+                document.getElementById('activeConnections').textContent = data.active_connections || 0;
+                document.getElementById('failedConnections').textContent = data.failed_connections || 0;
+                document.getElementById('handshakeTimeouts').textContent = data.handshake_timeouts || 0;
+                document.getElementById('bytesSent').innerHTML = formatBytes(data.total_bytes_sent || 0);
+                document.getElementById('bytesReceived').innerHTML = formatBytes(data.total_bytes_received || 0);
+                document.getElementById('avgHandshake').textContent = 
+                    data.average_handshake_duration_ms ? 
+                    Math.round(data.average_handshake_duration_ms) : '-';
+                
+                // Update events table
+                const events = data.recent_events || [];
+                if (events.length > 0) {
+                    let html = '<table><thead><tr><th>Time</th><th>Event</th><th>Peer ID</th><th>Remote Addr</th><th>Stage</th><th>Error</th></tr></thead><tbody>';
+                    events.slice(0, 50).reverse().forEach(event => {
+                        html += `<tr>
+                            <td class="timestamp">${formatTimestamp(event.timestamp)}</td>
+                            <td>${event.event_type.replace(/_/g, ' ')}</td>
+                            <td class="connection-id">${event.peer_id || '-'}</td>
+                            <td>${event.remote_addr || '-'}</td>
+                            <td>${event.handshake_stage ? getHandshakeStageBadge(event.handshake_stage) : '-'}</td>
+                            <td>${event.error || '-'}</td>
+                        </tr>`;
+                    });
+                    html += '</tbody></table>';
+                    document.getElementById('eventsTable').innerHTML = html;
+                } else {
+                    document.getElementById('eventsTable').innerHTML = '<p>No events yet.</p>';
+                }
+                
+                // Update connections table
+                const connections = Object.values(data.connections || {});
+                if (connections.length > 0) {
+                    let html = '<table><thead><tr><th>Peer ID</th><th>Remote Addr</th><th>Stage</th><th>Duration</th><th>Bytes Sent</th><th>Bytes Recv</th><th>Errors</th></tr></thead><tbody>';
+                    connections.forEach(conn => {
+                        const duration = conn.duration_ms ? `${conn.duration_ms}ms` : 
+                                       conn.established_at ? 'Active' : '-';
+                        html += `<tr>
+                            <td class="connection-id">${conn.peer_id}</td>
+                            <td>${conn.remote_addr}</td>
+                            <td>${getHandshakeStageBadge(conn.handshake_stage)}</td>
+                            <td>${duration}</td>
+                            <td>${formatBytes(conn.bytes_sent)}</td>
+                            <td>${formatBytes(conn.bytes_received)}</td>
+                            <td>${conn.error_count || 0}</td>
+                        </tr>`;
+                    });
+                    html += '</tbody></table>';
+                    document.getElementById('connectionsTable').innerHTML = html;
+                } else {
+                    document.getElementById('connectionsTable').innerHTML = '<p>No active connections.</p>';
+                }
+                
+                // Update error log
+                const errors = data.error_log || [];
+                if (errors.length > 0) {
+                    let html = '';
+                    errors.slice(0, 100).reverse().forEach(error => {
+                        html += `<div class="error-entry">${error}</div>`;
+                    });
+                    document.getElementById('errorLog').innerHTML = html;
+                } else {
+                    document.getElementById('errorLog').innerHTML = '<p>No errors logged.</p>';
+                }
+                
+            } catch (error) {
+                console.error('Failed to load diagnostics:', error);
+                document.getElementById('stats').innerHTML = 
+                    '<div class="stat-card"><div class="stat-label">Error</div><div class="stat-value">Failed to load</div></div>';
+            }
+        }
+        
+        // Auto-refresh
+        document.getElementById('autoRefresh').addEventListener('change', function(e) {
+            if (e.target.checked) {
+                autoRefreshInterval = setInterval(loadDiagnostics, 5000);
+            } else {
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                    autoRefreshInterval = null;
+                }
+            }
+        });
+        
+        // Initial load
+        loadDiagnostics();
+        if (document.getElementById('autoRefresh').checked) {
+            autoRefreshInterval = setInterval(loadDiagnostics, 5000);
+        }
+    </script>
+</body>
+</html>

@@ -1216,8 +1216,8 @@ impl InferenceEngine {
                     }
                 }
                 
-                // Schedule next query in 10 seconds
-                next_query = tokio::time::Instant::now() + Duration::from_secs(10);
+                // Schedule next query in 2 seconds (optimized for faster discovery)
+                next_query = tokio::time::Instant::now() + Duration::from_secs(2);
             } else {
                 // Check again in 100ms if not bootstrapped
                 next_query = tokio::time::Instant::now() + Duration::from_millis(100);

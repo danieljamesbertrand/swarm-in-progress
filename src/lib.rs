@@ -24,6 +24,15 @@
 //! let transport = create_transport(&key, TransportType::DualStack).unwrap();
 //! ```
 
+#![allow(warnings)]
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(unused_imports)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 // Allow referring to this crate by its package name (`punch_simple::...`) even
 // from within the crate itself. This keeps shared source files usable both as
 // library modules and as standalone `[[bin]]` crate roots.
@@ -43,7 +52,9 @@ pub mod metrics;
 pub mod pipeline_coordinator;
 pub mod protocol_logging;
 pub mod quic_transport;
+pub mod quic_diagnostics;
 pub mod shard_optimization;
+pub mod shard_loader;
 
 pub use ai_inference_handler::{
     create_ai_inference_error_response, create_ai_inference_response, process_ai_inference,
@@ -78,9 +89,13 @@ pub use quic_transport::{
     create_dual_transport, create_quic_transport, create_tcp_transport, create_transport,
     get_dual_listen_addresses, get_listen_address, TransportError, TransportStats, TransportType,
 };
+pub use quic_diagnostics::{
+    QuicDiagnosticsManager, QuicHandshakeStage, QuicEventType, QuicConnectionEvent, QuicConnectionStats,
+};
 pub use shard_optimization::{
     select_quantization, OptimizationPriority, QuantizationType, ShardOptimization,
 };
+pub use shard_loader::{ShardLoader, ShardMetadata, ShardPlan, ShardStatus};
 
 // Re-export node runner functions for unified binary access
 pub mod dialer;

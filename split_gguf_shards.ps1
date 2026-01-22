@@ -70,7 +70,8 @@ $shardStream = $null
 
 try {
     while ($shardNumber -lt $NumShards) {
-        $shardPath = Join-Path $ShardOutputDir "shard-$shardNumber.gguf"
+        # Use temporary names to avoid conflicts with locked files
+        $shardPath = Join-Path $ShardOutputDir "shard-new-$shardNumber.gguf"
         
         if ($shardStream) {
             $shardStream.Close()
@@ -79,7 +80,9 @@ try {
         $shardStream = [System.IO.File]::Create($shardPath)
         $shardBytesWritten = 0
         
-        Write-Host "Creating shard $($shardNumber + 1)/$NumShards: $(Split-Path $shardPath -Leaf)" -ForegroundColor Cyan
+        $shardName = Split-Path $shardPath -Leaf
+        $shardNumDisplay = $shardNumber + 1
+        Write-Host "Creating shard $shardNumDisplay/$NumShards - $shardName" -ForegroundColor Cyan
         
         while ($shardBytesWritten -lt $shardSize -and ($bytesRead = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
             $bytesToWrite = [Math]::Min($bytesRead, $shardSize - $shardBytesWritten)
@@ -121,11 +124,26 @@ try {
 Write-Host "Shard splitting complete!" -ForegroundColor Green
 Write-Host ""
 
+# Rename shard-new-* files to shard-*
+Write-Host "Renaming shard files..." -ForegroundColor Yellow
+Get-ChildItem "$ShardOutputDir\shard-new-*.gguf" | ForEach-Object {
+    $newName = $_.Name -replace "shard-new-", "shard-"
+    $newPath = Join-Path $ShardOutputDir $newName
+    # Remove old file if it exists
+    if (Test-Path $newPath) {
+        Remove-Item $newPath -Force -ErrorAction SilentlyContinue
+    }
+    Move-Item $_.FullName $newPath -Force
+    Write-Host "  Renamed: $($_.Name) -> $newName" -ForegroundColor Gray
+}
+
 # Show created shards
+Write-Host ""
 Write-Host "Created shards in ${ShardOutputDir}:" -ForegroundColor Cyan
-Get-ChildItem "$ShardOutputDir\shard-*.gguf" | Sort-Object Name | ForEach-Object {
+Get-ChildItem "$ShardOutputDir\shard-[0-9]*.gguf" | Sort-Object { [int]($_.BaseName -replace 'shard-', '') } | ForEach-Object {
     $sizeMB = [math]::Round($_.Length / 1MB, 2)
-    Write-Host ("  {0,-30} {1,10} MB" -f $_.Name, $sizeMB) -ForegroundColor White
+    $sizeGB = [math]::Round($_.Length / 1GB, 2)
+    Write-Host ("  {0,-30} {1,10} MB ({2} GB)" -f $_.Name, $sizeMB, $sizeGB) -ForegroundColor White
 }
 
 Write-Host ""

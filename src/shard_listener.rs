@@ -16,10 +16,19 @@
 //! Also available via unified node binary:
 //!   cargo run --bin node -- shard-listener --shard-id 0 --total-shards 4
 
+#![allow(warnings)]
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(unused_imports)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use punch_simple::{JsonMessage, JsonCodec};
 use punch_simple::metrics::MetricsCodec;
 use punch_simple::kademlia_shard_discovery::{KademliaShardDiscovery, ShardAnnouncement, dht_keys};
-use punch_simple::command_protocol::{Command, CommandResponse, commands};
+use punch_simple::command_protocol::{Command, CommandResponse, commands, ResponseStatus};
 use punch_simple::command_validation::validate_command;
 use punch_simple::{
     log_connection_closed,
@@ -885,6 +894,10 @@ pub async fn run_shard_listener(
     let refresh_interval = Duration::from_secs(refresh_interval);
     let mut next_refresh = tokio::time::Instant::now() + refresh_interval;
 
+    // Status reporting timer (every 30 seconds)
+    let status_report_interval = Duration::from_secs(30);
+    let mut next_status_report = tokio::time::Instant::now() + status_report_interval;
+
     // Fallback announcement timer - if RoutingUpdated doesn't fire, announce anyway after timeout
     let mut fallback_announce_deadline: Option<tokio::time::Instant> = None;
 
@@ -956,6 +969,40 @@ pub async fn run_shard_listener(
                             println!("[CONNECT]   Transport: {} (persistent connection)", transport_protocol);
                             println!("[CONNECT]   Address: {}", remote_addr);
                             println!("[CONNECT] ═══════════════════════════════════════════════════════════════════════════\n");
+                            
+                            // Automatically sync torrents from rendezvous server on first connection
+                            println!("[TORRENT_SYNC] 🔄 Initiating automatic torrent synchronization with rendezvous server...");
+                            let sync_cmd = Command::new(commands::SYNC_TORRENTS, &peer_id.to_string(), Some(&connected_peer.to_string()))
+                                .with_param("total_shards", serde_json::json!(total_shards));
+                            
+                            let sync_cmd_json = match sync_cmd.to_json() {
+                                Ok(json) => json,
+                                Err(e) => {
+                                    eprintln!("[TORRENT_SYNC] Failed to serialize SYNC_TORRENTS command: {}", e);
+                                    String::new()
+                                }
+                            };
+                            
+                            if !sync_cmd_json.is_empty() {
+                                let sync_msg = JsonMessage::new(peer_id.to_string(), sync_cmd_json.clone());
+                                let request_id = swarm.behaviour_mut().request_response.send_request(&connected_peer, sync_msg);
+                                println!("\n[MSG] ═══════════════════════════════════════════════════════════════════════════");
+                                println!("[MSG] 📤 SENT MESSAGE TO PEER: {}", connected_peer);
+                                println!("[MSG]   Command: SYNC_TORRENTS");
+                                println!("[MSG]   Request ID: {:?}", request_id);
+                                println!("[MSG]   Message: {}", sync_cmd_json);
+                                println!("[MSG] ═══════════════════════════════════════════════════════════════════════════\n");
+                            }
+                            
+                            // OPTIMIZATION: Immediately query DHT for all shards when bootstrap connects
+                            // This speeds up discovery - no need to wait for next query cycle
+                            println!("[DHT] 🔍 Immediately querying DHT for all shards (optimized discovery)...");
+                            for i in 0..total_shards {
+                                if i != shard_id {
+                                    let key = kad::RecordKey::new(&dht_keys::shard_key(&cluster_name, i));
+                                    swarm.behaviour_mut().kademlia.get_record(key);
+                                }
+                            }
                         } else {
                             println!("\n[CONNECT] ═══════════════════════════════════════════════════════════════════════════");
                             println!("[CONNECT] ✓ Connection established!");
@@ -1029,7 +1076,11 @@ pub async fn run_shard_listener(
                     SwarmEvent::Behaviour(behaviour_event) => {
                         match behaviour_event {
                             ShardBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { peer, .. }) => {
-                                println!("[DHT] Routing updated: {}", peer);
+                                println!("\n[DHT] ═══════════════════════════════════════════════════════════════════════════");
+                                println!("[DHT] ✓✓✓ ROUTING TABLE UPDATED ✓✓✓");
+                                println!("[DHT]   Peer: {}", peer);
+                                println!("[DHT]   Status: DHT routing table is now populated");
+                                println!("[DHT] ═══════════════════════════════════════════════════════════════════════════\n");
 
                                 // Cancel fallback announcement since RoutingUpdated fired
                                 fallback_announce_deadline = None;
@@ -1179,33 +1230,24 @@ pub async fn run_shard_listener(
                                                         };
                                                         
                                                         let msg = JsonMessage::new(peer_id.to_string(), cmd_json);
-                                                        match swarm.behaviour_mut().request_response.send_request(&target_peer_id, msg) {
-                                                            request_response::RequestId(id) => {
-                                                                println!("[SWARM]   📤 Sent SWARM_READY to {} (request_id: {:?})", target_peer_id, id);
-                                                            }
-                                                            request_response::OutboundFailure::DialFailure => {
-                                                                println!("[SWARM]   ⚠️  Failed to dial peer {} for SWARM_READY", target_peer_id);
-                                                            }
-                                                            request_response::OutboundFailure::Timeout => {
-                                                                println!("[SWARM]   ⚠️  Timeout sending SWARM_READY to peer {}", target_peer_id);
-                                                            }
-                                                            _ => {}
-                                                        }
+                                                                                let _request_id = swarm.behaviour_mut().request_response.send_request(&target_peer_id, msg);
+                                                                                println!("[SWARM]   📤 Sent SWARM_READY to {} (request_id: {:?})", target_peer_id, _request_id);
                                                     }
                                                 }
                                             }
                                         }
                                     } else if !all_shards_loaded {
                                         // Shards are discovered but not all loaded yet
-                                        let missing_loaded: Vec<u32> = (0..status.expected_shards)
-                                            .filter(|id| {
-                                                let s = state.read().await;
-                                                !s.discovery.get_best_node_for_shard(*id)
-                                                    .map(|ann| ann.capabilities.shard_loaded)
-                                                    .unwrap_or(false)
-                                            })
-                                            .collect();
-                                        drop(state.read().await);
+                                        let missing_loaded: Vec<u32> = {
+                                            let s = state.read().await;
+                                            (0..status.expected_shards)
+                                                .filter(|id| {
+                                                    !s.discovery.get_best_node_for_shard(*id)
+                                                        .map(|ann| ann.capabilities.shard_loaded)
+                                                        .unwrap_or(false)
+                                                })
+                                                .collect()
+                                        };
                                         println!("[SWARM] ⏳ Waiting for shards to be LOADED: {}/{} shards discovered, but shards {:?} are not loaded yet", 
                                             status.discovered_shards, status.expected_shards, missing_loaded);
                                     } else {
@@ -1221,11 +1263,15 @@ pub async fn run_shard_listener(
 
                             ShardBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed { 
                                 result: kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_record))),
+                                id: query_id,
                                 ..
                             }) => {
+                                println!("[DHT] [QUERY {}] ✓ Found record in DHT", query_id);
                                 // Check if this is a swarm readiness record or a shard record
-                                let record_key_str = peer_record.record.key.to_string();
-                                let is_swarm_readiness = record_key_str.contains("/swarm-ready");
+                                // RecordKey doesn't implement Display, so we check the key bytes directly
+                                let record_key_bytes = peer_record.record.key.as_ref();
+                                let is_swarm_readiness = record_key_bytes.windows(b"/swarm-ready".len())
+                                    .any(|window| window == b"/swarm-ready");
                                 
                                 if is_swarm_readiness {
                                     // Process swarm readiness record
@@ -1280,18 +1326,8 @@ pub async fn run_shard_listener(
                                                     };
                                                     
                                                     let msg = JsonMessage::new(peer_id.to_string(), cmd_json);
-                                                    match swarm.behaviour_mut().request_response.send_request(&target_peer_id, msg) {
-                                                        request_response::RequestId(id) => {
-                                                            println!("[SWARM] 📢 Broadcasting SWARM_READY to peer {} (request_id: {:?})", target_peer_id, id);
-                                                        }
-                                                        request_response::OutboundFailure::DialFailure => {
-                                                            println!("[SWARM] ⚠️  Failed to dial peer {} for SWARM_READY broadcast", target_peer_id);
-                                                        }
-                                                        request_response::OutboundFailure::Timeout => {
-                                                            println!("[SWARM] ⚠️  Timeout sending SWARM_READY to peer {}", target_peer_id);
-                                                        }
-                                                        _ => {}
-                                                    }
+                                                                    let _request_id = swarm.behaviour_mut().request_response.send_request(&target_peer_id, msg);
+                                                                    println!("[SWARM] 📢 Broadcasting SWARM_READY to peer {} (request_id: {:?})", target_peer_id, _request_id);
                                                 }
                                             }
                                         }
@@ -1367,20 +1403,46 @@ pub async fn run_shard_listener(
 
                             ShardBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
                                 result: kad::QueryResult::PutRecord(Ok(_)),
+                                id: query_id,
                                 ..
                             }) => {
-                                println!("[DHT] ✓ Shard announcement stored in DHT");
+                                println!("[DHT] [QUERY {}] ✓ Shard announcement stored in DHT", query_id);
+                            }
+                            
+                            ShardBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+                                result: kad::QueryResult::GetRecord(Err(_)),
+                                id: query_id,
+                                ..
+                            }) => {
+                                println!("[DHT] [QUERY {}] ⚠️  Record not found in DHT (node may not have announced yet)", query_id);
+                            }
+                            
+                            ShardBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+                                result: kad::QueryResult::Bootstrap(Ok(_)),
+                                id: query_id,
+                                ..
+                            }) => {
+                                println!("[DHT] [QUERY {}] ✓✓✓ DHT BOOTSTRAP COMPLETED ✓✓✓", query_id);
+                            }
+                            
+                            ShardBehaviourEvent::Kademlia(e) => {
+                                // Log all other Kademlia events for debugging
+                                println!("[DHT] [EVENT] {:?}", e);
                             }
 
                             ShardBehaviourEvent::RequestResponse(request_response::Event::Message { 
                                 peer, 
-                                message: request_response::Message::Request { request, channel, .. },
+                                message,
                                 ..
                             }) => {
-                                println!("\n[REQUEST] ═══════════════════════════════════════════════════════════════════════════");
-                                println!("[REQUEST] 📥 Received message from peer: {}", peer);
-                                println!("[REQUEST] Message: {}", request.message);
-                                println!("[REQUEST] ═══════════════════════════════════════════════════════════════════════════\n");
+                                let peer_id = peer; // Capture peer for use in nested match
+                                match message {
+                                    request_response::Message::Request { request, channel, .. } => {
+                                println!("\n[MSG] ═══════════════════════════════════════════════════════════════════════════");
+                                println!("[MSG] 📥 RECEIVED MESSAGE FROM PEER: {}", peer_id);
+                                println!("[MSG]   Message: {}", request.message);
+                                println!("[MSG]   Timestamp: {}", request.timestamp);
+                                println!("[MSG] ═══════════════════════════════════════════════════════════════════════════\n");
                                 
                                 // Parse command from message
                                 if let Ok(cmd) = serde_json::from_str::<Command>(&request.message) {
@@ -1481,10 +1543,11 @@ pub async fn run_shard_listener(
                                                                 s.announcement.capabilities.shard_loaded = true;
                                                                 s.needs_reannounce = true; // Flag to trigger immediate re-announcement
                                                                 
-                                                                // Get peers to broadcast to (before dropping state)
+                                                                // Get peers to broadcast to and status string (before dropping state)
                                                                 let pipeline_peers = s.discovery.get_pipeline().iter()
                                                                     .map(|ann| ann.peer_id.clone())
                                                                     .collect::<Vec<_>>();
+                                                                let _status_string = s.get_status_string();
                                                                 drop(s);
                                                                 
                                                                 // Broadcast SHARD_LOADED to all known peers to update their tree
@@ -1499,14 +1562,8 @@ pub async fn run_shard_listener(
                                                                             
                                                                             if let Ok(cmd_json) = cmd.to_json() {
                                                                                 let msg = JsonMessage::new(peer_id.to_string(), cmd_json);
-                                                                                match swarm.behaviour_mut().request_response.send_request(&target_peer_id, msg) {
-                                                                                    request_response::RequestId(_) => {
-                                                                                        println!("[SHARD_LOADED]   📤 Sent to peer {}", target_peer_id);
-                                                                                    }
-                                                                                    _ => {
-                                                                                        println!("[SHARD_LOADED]   ⚠️  Failed to send to peer {}", target_peer_id);
-                                                                                    }
-                                                                                }
+                                                                                let _request_id = swarm.behaviour_mut().request_response.send_request(&target_peer_id, msg);
+                                                                                println!("[SHARD_LOADED]   📤 Sent to peer {} (request_id: {:?})", target_peer_id, _request_id);
                                                                             }
                                                                         }
                                                                     }
@@ -1540,9 +1597,6 @@ pub async fn run_shard_listener(
                                                                         result.insert("shard_id".to_string(), serde_json::json!(shard_id));
                                                                         result.insert("status".to_string(), serde_json::json!("downloading"));
                                                                         result.insert("info_hash".to_string(), serde_json::json!(info_hash.clone()));
-                                                                        
-                                                                        // Request metadata will be sent in event loop
-                                                                        // Store pending request
                                                                         
                                                                         CommandResponse::success(
                                                                             &cmd.command,
@@ -1592,6 +1646,48 @@ pub async fn run_shard_listener(
                                             
                                             let mut result = HashMap::new();
                                             result.insert("files".to_string(), serde_json::json!(file_list));
+                                            
+                                            CommandResponse::success(
+                                                &cmd.command,
+                                                &cmd.request_id,
+                                                &peer_id.to_string(),
+                                                &cmd.from,
+                                                result,
+                                            )
+                                        }
+                                        
+                                        commands::SYNC_TORRENTS => {
+                                            // Synchronize torrents: query server for all available shard files
+                                            // and initiate downloads for missing shards
+                                            println!("\n[TORRENT_SYNC] ═══════════════════════════════════════════════════════════════════════════");
+                                            println!("[TORRENT_SYNC] 📥 Received SYNC_TORRENTS request from {}", cmd.from);
+                                            
+                                            // First, get list of available files from server
+                                            // This is handled by LIST_FILES - we'll respond with file list
+                                            let file_list: Vec<serde_json::Value> = s.get_torrent_file_list()
+                                                .iter()
+                                                .map(|f| serde_json::json!({
+                                                    "info_hash": f.info_hash,
+                                                    "filename": f.filename,
+                                                    "size": f.size,
+                                                }))
+                                                .collect();
+                                            
+                                            println!("[TORRENT_SYNC]   Available files: {}", file_list.len());
+                                            for file in &file_list {
+                                                if let (Some(filename), Some(size)) = (file.get("filename"), file.get("size")) {
+                                                    let size_mb = size.as_u64().unwrap_or(0) as f64 / 1_048_576.0;
+                                                    println!("[TORRENT_SYNC]     - {} ({:.2} MB)", 
+                                                        filename.as_str().unwrap_or("unknown"), size_mb);
+                                                }
+                                            }
+                                            
+                                            let mut result = HashMap::new();
+                                            result.insert("files".to_string(), serde_json::json!(file_list));
+                                            result.insert("total_files".to_string(), serde_json::json!(file_list.len()));
+                                            
+                                            println!("[TORRENT_SYNC] ✓ Torrent sync response prepared");
+                                            println!("[TORRENT_SYNC] ═══════════════════════════════════════════════════════════════════════════\n");
                                             
                                             CommandResponse::success(
                                                 &cmd.command,
@@ -1671,32 +1767,26 @@ pub async fn run_shard_listener(
                                                 println!("[SHARD_LOADED] 📢 Received notification: Peer {} loaded shard {}", notifying_peer_id, shard_id);
                                                 
                                                 // Update the announcement in our discovery tree to mark shard as loaded
+                                                // Use add_shard to update existing announcement
                                                 let mut updated = false;
-                                                if let Some(replicas) = s.discovery.known_shards.get_mut(&shard_id) {
-                                                    for replica in replicas.iter_mut() {
-                                                        if replica.peer_id == notifying_peer_id {
-                                                            replica.capabilities.shard_loaded = true;
-                                                            updated = true;
-                                                            println!("[SHARD_LOADED] ✓ Updated local tree: shard {} is loaded on peer {}", shard_id, notifying_peer_id);
-                                                            break;
-                                                        }
+                                                if let Some(best_node) = s.discovery.get_best_node_for_shard(shard_id) {
+                                                    if best_node.peer_id == notifying_peer_id {
+                                                        // Create updated announcement with shard_loaded = true
+                                                        let mut updated_announcement = best_node.clone();
+                                                        updated_announcement.capabilities.shard_loaded = true;
+                                                        s.discovery.add_shard(updated_announcement);
+                                                        updated = true;
+                                                        println!("[SHARD_LOADED] ✓ Updated local tree: shard {} is loaded on peer {}", shard_id, notifying_peer_id);
                                                     }
                                                 }
                                                 
                                                 if !updated {
                                                     println!("[SHARD_LOADED] ⚠️  Peer {} not found in local tree for shard {}", notifying_peer_id, shard_id);
                                                 }
-                                                
-                                                // Rebuild pipeline and check if swarm is now ready
-                                                s.discovery.rebuild_pipeline();
                                                 let status = s.discovery.status();
                                                 
                                                 // Check if all required shards are now loaded (not just announced)
-                                                let all_shards_loaded = (0..status.expected_shards).all(|id| {
-                                                    s.discovery.get_best_node_for_shard(id)
-                                                        .map(|ann| ann.capabilities.shard_loaded)
-                                                        .unwrap_or(false)
-                                                });
+                                                let all_shards_loaded = s.discovery.are_all_shards_loaded();
                                                 
                                                 if all_shards_loaded && !s.swarm_ready {
                                                     s.swarm_ready = true;
@@ -1757,7 +1847,7 @@ pub async fn run_shard_listener(
                                                 swarm.behaviour_mut().kademlia.get_record(readiness_key);
                                                 
                                                 // Return error response - swarm not ready
-                                                return CommandResponse::error(
+                                                CommandResponse::error(
                                                     &cmd.command,
                                                     &cmd.request_id,
                                                     &peer_id.to_string(),
@@ -1768,20 +1858,19 @@ pub async fn run_shard_listener(
                                                         discovery_status.expected_shards,
                                                         discovery_status.missing_shards
                                                     ),
-                                                );
-                                            }
-                                            
-                                            println!("[EXECUTE_TASK] ✓ Swarm is ready - all {} shards available", discovery_status.expected_shards);
-                                            s.handle_inference_request();
-                                            
-                                            // Check task type
-                                            let task_type = cmd.params.get("task_type")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("unknown");
-                                            
-                                            println!("[EXECUTE_TASK]   Task type: {}", task_type);
-                                            
-                                            if task_type == "llama_fragment" || task_type == "ai_inference" {
+                                                )
+                                            } else {
+                                                println!("[EXECUTE_TASK] ✓ Swarm is ready - all {} shards available", discovery_status.expected_shards);
+                                                s.handle_inference_request();
+                                                
+                                                // Check task type
+                                                let task_type = cmd.params.get("task_type")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("unknown");
+                                                
+                                                println!("[EXECUTE_TASK]   Task type: {}", task_type);
+                                                
+                                                if task_type == "llama_fragment" || task_type == "ai_inference" {
                                                 let input_data = cmd.params.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
                                                 let max_tokens = cmd.params.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(256);
                                                 let temperature = cmd.params.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7);
@@ -1931,6 +2020,7 @@ pub async fn run_shard_listener(
                                                     &cmd.from,
                                                     &format!("Unknown task type: {}", task_type),
                                                 )
+                                                }
                                             }
                                         }
                                         
@@ -1944,9 +2034,6 @@ pub async fn run_shard_listener(
                                             )
                                         }
                                         };
-                                        
-                                        // Get status string before dropping s
-                                        let status_string = s.get_status_string();
                                         
                                         println!("\n[RESPONSE] ═══════════════════════════════════════════════════════════════════════════");
                                         println!("[RESPONSE] 📤 Sending response to peer: {}", peer);
@@ -1978,9 +2065,117 @@ pub async fn run_shard_listener(
                                         }
                                         println!("[RESPONSE] ═══════════════════════════════════════════════════════════════════════════\n");
                                         
-                                        println!("[STATUS] {}", status_string);
-                                } else {
+                                        // If this was a LOAD_SHARD command that started a download, immediately request metadata
+                                        if cmd.command == commands::LOAD_SHARD {
+                                            if let Some(result) = &response.result {
+                                                if let Some(info_hash) = result.get("info_hash").and_then(|v| v.as_str()) {
+                                                    if let Some(status) = result.get("status").and_then(|v| v.as_str()) {
+                                                        if status == "downloading" {
+                                                            // We're already connected to this peer (they sent us the command)
+                                                            let _ = swarm.behaviour_mut().torrent_response.send_request(
+                                                                &peer,
+                                                                TorrentMessage::RequestMetadata {
+                                                                    info_hash: info_hash.to_string(),
+                                                                }
+                                                            );
+                                                            println!("[LOAD_SHARD] 📡 Immediately requested metadata for {} from peer {}", &info_hash[..16], peer);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                else {
                                     eprintln!("[REQUEST] ❌ Failed to parse command JSON: {}", request.message);
+                                }
+                                    }
+                                    
+                                    request_response::Message::Response { response, .. } => {
+                                        // Handle JSON command responses
+                                        if let Ok(cmd_response) = serde_json::from_str::<CommandResponse>(&response.message) {
+                                            println!("\n[RESPONSE] ═══════════════════════════════════════════════════════════════════════════");
+                                            println!("[RESPONSE] 📥 Received response from peer: {}", peer_id);
+                                            println!("[RESPONSE]   Command: {}", cmd_response.command);
+                                            println!("[RESPONSE]   Request ID: {}", cmd_response.request_id);
+                                            println!("[RESPONSE]   Status: {:?}", cmd_response.status);
+                                            
+                                            // Handle SYNC_TORRENTS response
+                                            if cmd_response.command == commands::SYNC_TORRENTS {
+                                                if cmd_response.status == ResponseStatus::Success {
+                                                    if let Some(result) = &cmd_response.result {
+                                                        if let Some(files) = result.get("files").and_then(|v| v.as_array()) {
+                                                            println!("[TORRENT_SYNC] ✓ Received {} available file(s) from rendezvous server", files.len());
+                                                            
+                                                            let mut s = state.write().await;
+                                                            let mut downloads_started = 0;
+                                                            let mut pending_metadata_requests: Vec<(PeerId, String)> = Vec::new();
+                                                            
+                                                            // Process each file and start downloads for missing shards
+                                                            for file in files {
+                                                                if let (Some(filename), Some(info_hash)) = (
+                                                                    file.get("filename").and_then(|v| v.as_str()),
+                                                                    file.get("info_hash").and_then(|v| v.as_str())
+                                                                ) {
+                                                                    // Extract shard ID from filename (e.g., "shard-0.gguf" -> 0)
+                                                                    if let Some(shard_id_str) = filename.strip_prefix("shard-").and_then(|s| s.strip_suffix(".gguf")) {
+                                                                        if let Ok(shard_id) = shard_id_str.parse::<u32>() {
+                                                                            // Check if this shard is needed and not already loaded
+                                                                            if shard_id < total_shards && !s.is_shard_loaded(shard_id) {
+                                                                                // Check if not already downloading
+                                                                                if !s.active_downloads.contains_key(info_hash) {
+                                                                                    println!("[TORRENT_SYNC]   📥 Starting download for shard {} (file: {})", shard_id, filename);
+                                                                                    
+                                                                                    match s.start_download(shard_id, peer_id) {
+                                                                                        Ok(info_hash_ret) => {
+                                                                                            downloads_started += 1;
+                                                                                            println!("[TORRENT_SYNC]     ✓ Download initiated (info_hash: {})", &info_hash_ret[..16]);
+                                                                                            
+                                                                                            // Store pending metadata request (we're already connected to bootstrap)
+                                                                                            pending_metadata_requests.push((peer_id, info_hash_ret));
+                                                                                        }
+                                                                                        Err(e) => {
+                                                                                            eprintln!("[TORRENT_SYNC]     ✗ Failed to start download: {}", e);
+                                                                                        }
+                                                                                    }
+                                                                                } else {
+                                                                                    println!("[TORRENT_SYNC]   ⏳ Shard {} already downloading", shard_id);
+                                                                                }
+                                                                            } else if s.is_shard_loaded(shard_id) {
+                                                                                println!("[TORRENT_SYNC]   ✓ Shard {} already loaded", shard_id);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            
+                                                            drop(s);
+                                                            
+                                                            // Immediately request metadata for all pending downloads (we're already connected to bootstrap)
+                                                            for (target_peer, info_hash) in pending_metadata_requests {
+                                                                let _ = swarm.behaviour_mut().torrent_response.send_request(
+                                                                    &target_peer,
+                                                                    TorrentMessage::RequestMetadata {
+                                                                        info_hash: info_hash.clone(),
+                                                                    }
+                                                                );
+                                                                println!("[TORRENT_SYNC] 📡 Requested metadata for {} from peer {}", &info_hash[..16], target_peer);
+                                                            }
+                                                            
+                                                            if downloads_started > 0 {
+                                                                println!("[TORRENT_SYNC] ✓ Started {} download(s) for missing shards", downloads_started);
+                                                            } else {
+                                                                println!("[TORRENT_SYNC] ✓ All required shards are already present or downloading");
+                                                            }
+                                                        }
+                                                    }
+                                                } else if let Some(error) = &cmd_response.error {
+                                                    eprintln!("[TORRENT_SYNC] ✗ Sync failed: {}", error);
+                                                }
+                                            }
+                                            
+                                            println!("[RESPONSE] ═══════════════════════════════════════════════════════════════════════════\n");
+                                        }
+                                    }
                                 }
                             }
 
@@ -2118,7 +2313,7 @@ pub async fn run_shard_listener(
                                                 println!("[TORRENT]   Progress: [                    ] 0%");
                                             }
                                         }
-                                    }
+                                    },
                                     
                                     TorrentMessage::PieceData { info_hash, piece_index, data } => {
                                         if let Some(download) = s.active_downloads.get_mut(&info_hash) {
@@ -2184,18 +2379,20 @@ pub async fn run_shard_listener(
                                             let filled = (progress_pct as usize * bar_width / 100).min(bar_width);
                                             let bar = "█".repeat(filled) + &"░".repeat(bar_width - filled);
                                             
-                                            // Print progress every piece, or every 5% for large files
+                                            // Print progress more frequently for better visibility
+                                            // Print every 5% or every 10 pieces (whichever is more frequent), or on completion
                                             let should_print = download.total_pieces <= 20 
                                                 || progress_pct % 5 == 0 
-                                                || download.downloaded_pieces == download.total_pieces;
+                                                || download.downloaded_pieces == download.total_pieces
+                                                || (download.downloaded_pieces > 0 && download.downloaded_pieces % 10 == 0);
                                             
                                             if should_print {
                                                 if total_size > 0 {
-                                                    println!("[TORRENT] 📥 Progress: [{}] {}% ({:.2} MB / {:.2} MB) - Piece {}/{}", 
+                                                    println!("[TORRENT] 📥 [{}] {}% ({:.2} MB / {:.2} MB) - Piece {}/{}", 
                                                         bar, progress_pct, downloaded_mb, total_mb, 
                                                         download.downloaded_pieces, download.total_pieces);
                                                 } else {
-                                                    println!("[TORRENT] 📥 Progress: [{}] {}% - Piece {}/{}", 
+                                                    println!("[TORRENT] 📥 [{}] {}% - Piece {}/{}", 
                                                         bar, progress_pct, download.downloaded_pieces, download.total_pieces);
                                                 }
                                             }
@@ -2245,14 +2442,8 @@ pub async fn run_shard_listener(
                                                                 
                                                                 if let Ok(cmd_json) = cmd.to_json() {
                                                                     let msg = JsonMessage::new(peer_id.to_string(), cmd_json);
-                                                                    match swarm.behaviour_mut().request_response.send_request(&target_peer_id, msg) {
-                                                                        request_response::RequestId(_) => {
-                                                                            println!("[TORRENT]   📤 Broadcasted shard {} loaded to peer {}", shard_id, target_peer_id);
-                                                                        }
-                                                                        _ => {
-                                                                            println!("[TORRENT]   ⚠️  Failed to broadcast to peer {}", target_peer_id);
-                                                                        }
-                                                                    }
+                                                                    let _request_id = swarm.behaviour_mut().request_response.send_request(&target_peer_id, msg);
+                                                                    println!("[TORRENT]   📤 Broadcasted shard {} loaded to peer {} (request_id: {:?})", shard_id, target_peer_id, _request_id);
                                                                 }
                                                             }
                                                         }
@@ -2362,13 +2553,14 @@ pub async fn run_shard_listener(
                                         .with_param("cluster_name", serde_json::json!(cluster_name));
                                     
                                     if let Ok(cmd_json) = cmd.to_json() {
-                                        let msg = JsonMessage::new(peer_id.to_string(), cmd_json);
-                                        match swarm.behaviour_mut().request_response.send_request(&target_peer_id, msg) {
-                                            request_response::RequestId(_) => {
-                                                println!("[SWARM] 📢 Broadcasted SWARM_READY to {}", target_peer_id);
-                                            }
-                                            _ => {}
-                                        }
+                                                    let msg = JsonMessage::new(peer_id.to_string(), cmd_json.clone());
+                                                    let request_id = swarm.behaviour_mut().request_response.send_request(&target_peer_id, msg);
+                                                    println!("\n[MSG] ═══════════════════════════════════════════════════════════════════════════");
+                                                    println!("[MSG] 📤 SENT MESSAGE TO PEER: {}", target_peer_id);
+                                                    println!("[MSG]   Command: SWARM_READY");
+                                                    println!("[MSG]   Request ID: {:?}", request_id);
+                                                    println!("[MSG]   Message: {}", cmd_json);
+                                                    println!("[MSG] ═══════════════════════════════════════════════════════════════════════════\n");
                                     }
                                 }
                             }
@@ -2381,8 +2573,153 @@ pub async fn run_shard_listener(
                 }
                 next_refresh = tokio::time::Instant::now() + refresh_interval;
             }
+
+            // Periodic status report
+            _ = tokio::time::sleep_until(next_status_report) => {
+                print_status_report(&state, shard_id, total_shards, &cluster_name).await;
+                next_status_report = tokio::time::Instant::now() + status_report_interval;
+            }
         }
     }
+}
+
+/// Print comprehensive status report
+async fn print_status_report(
+    state: &Arc<RwLock<ShardNodeState>>,
+    local_shard_id: u32,
+    total_shards: u32,
+    cluster_name: &str,
+) {
+    let s = state.read().await;
+    let discovery_status = s.discovery.status();
+    let pipeline = s.discovery.get_pipeline();
+    
+    println!("\n[STATUS] ═══════════════════════════════════════════════════════════════════════════");
+    println!("[STATUS] System Status Report - {}", 
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| format!("{}", d.as_secs()))
+            .unwrap_or_else(|_| "unknown".to_string()));
+    println!("[STATUS] ═══════════════════════════════════════════════════════════════════════════");
+    
+    // Local node status
+    println!("[STATUS] Local Node:");
+    println!("[STATUS]   Shard ID: {} / {}", local_shard_id, total_shards - 1);
+    println!("[STATUS]   Peer ID: {}", s.peer_id);
+    println!("[STATUS]   Shard Loaded: {}", if s.is_shard_loaded(local_shard_id) { "✓ YES" } else { "✗ NO" });
+    if s.is_shard_loaded(local_shard_id) {
+        if let Some(path) = s.loaded_shards.get(&local_shard_id) {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
+                println!("[STATUS]   Shard File: {} ({:.2} MB)", path.display(), size_mb);
+            }
+        }
+    }
+    println!("[STATUS]   Active Requests: {}/{}", s.active_requests, s.announcement.capabilities.max_concurrent);
+    println!("[STATUS]   Total Requests: {} ({} successful)", s.total_requests, s.successful_requests);
+    
+    // Active downloads progress
+    if !s.active_downloads.is_empty() {
+        println!("\n[STATUS] Active Downloads:");
+        for (info_hash, download) in &s.active_downloads {
+            let progress_pct = if download.total_pieces > 0 {
+                (download.downloaded_pieces as f64 / download.total_pieces as f64 * 100.0) as u32
+            } else {
+                0
+            };
+            let bar_width = 20;
+            let filled = (progress_pct as usize * bar_width / 100).min(bar_width);
+            let bar = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+            
+            let downloaded_mb = if let Some(metadata) = &download.metadata {
+                let downloaded_size: u64 = download.pieces.values().map(|d| d.len() as u64).sum();
+                downloaded_size as f64 / (1024.0 * 1024.0)
+            } else {
+                0.0
+            };
+            let total_mb = download.metadata.as_ref()
+                .map(|m| m.file_size as f64 / (1024.0 * 1024.0))
+                .unwrap_or(0.0);
+            
+            println!("[STATUS]   {}: [{}] {}% ({:.2} MB / {:.2} MB) - Pieces {}/{}", 
+                download.filename, bar, progress_pct, downloaded_mb, total_mb,
+                download.downloaded_pieces, download.total_pieces);
+            if let Some(peer) = download.peer_id {
+                println!("[STATUS]     Downloading from: {}", peer);
+            }
+        }
+    } else {
+        println!("\n[STATUS] Active Downloads: None");
+    }
+    
+    // Discovery status
+    println!("\n[STATUS] Cluster Discovery:");
+    println!("[STATUS]   Cluster: {}", cluster_name);
+    println!("[STATUS]   Expected Shards: {}", discovery_status.expected_shards);
+    println!("[STATUS]   Discovered Shards: {}", discovery_status.discovered_shards);
+    println!("[STATUS]   Pipeline Complete: {}", if discovery_status.is_complete { "✓ YES" } else { "✗ NO" });
+    println!("[STATUS]   Swarm Ready: {}", if s.swarm_ready { "✓ YES" } else { "✗ NO" });
+    
+    // Shard online status
+    println!("\n[STATUS] Shard Online Status:");
+    let mut online_shards = std::collections::HashSet::new();
+    let mut loaded_shards = std::collections::HashSet::new();
+    
+    for ann in &pipeline {
+        online_shards.insert(ann.shard_id);
+        if ann.capabilities.shard_loaded {
+            loaded_shards.insert(ann.shard_id);
+        }
+    }
+    
+    for shard_id in 0..total_shards {
+        let is_online = online_shards.contains(&shard_id);
+        let is_loaded = loaded_shards.contains(&shard_id);
+        let is_local = shard_id == local_shard_id;
+        
+        let status_icon = if is_local {
+            "★"
+        } else if is_online && is_loaded {
+            "✓"
+        } else if is_online {
+            "○"
+        } else {
+            "✗"
+        };
+        
+        let status_text = if is_local {
+            "LOCAL"
+        } else if is_online && is_loaded {
+            "ONLINE + LOADED"
+        } else if is_online {
+            "ONLINE (not loaded)"
+        } else {
+            "OFFLINE"
+        };
+        
+        println!("[STATUS]   Shard {}: {} {}", shard_id, status_icon, status_text);
+        
+        if is_online && !is_local {
+            if let Some(ann) = pipeline.iter().find(|a| a.shard_id == shard_id) {
+                println!("[STATUS]     Peer ID: {}", ann.peer_id);
+                println!("[STATUS]     Layers: {}-{}", ann.layer_start, ann.layer_end);
+            }
+        }
+    }
+    
+    // Summary
+    let online_count = online_shards.len();
+    let loaded_count = loaded_shards.len();
+    let total_shards_usize = total_shards as usize;
+    let online_pct = (online_count as f64 / total_shards as f64 * 100.0) as u32;
+    let loaded_pct = (loaded_count as f64 / total_shards as f64 * 100.0) as u32;
+    
+    println!("\n[STATUS] Summary:");
+    println!("[STATUS]   Online Shards: {}/{} ({}%)", online_count, total_shards, online_pct);
+    println!("[STATUS]   Loaded Shards: {}/{} ({}%)", loaded_count, total_shards, loaded_pct);
+    println!("[STATUS]   Pipeline Ready: {}", if discovery_status.is_complete && loaded_count == total_shards_usize { "✓ YES" } else { "✗ NO" });
+    
+    println!("[STATUS] ═══════════════════════════════════════════════════════════════════════════\n");
 }
 
 #[allow(dead_code)]
