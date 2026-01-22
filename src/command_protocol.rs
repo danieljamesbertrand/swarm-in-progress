@@ -390,6 +390,7 @@ pub mod commands {
     pub const SHARD_LOADED: &str = "SHARD_LOADED";
     pub const SWARM_READY: &str = "SWARM_READY";
     pub const SWARM_STATUS: &str = "SWARM_STATUS";
+    pub const GET_NODE_STATUS: &str = "GET_NODE_STATUS";
 }
 
 #[cfg(test)]

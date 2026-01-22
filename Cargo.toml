@@ -146,3 +146,7 @@ path = "check_pipeline_status.rs"
 [[bin]]
 name = "full_pipeline"
 path = "src/bin/full_pipeline.rs"
+
+[[bin]]
+name = "node_monitor"
+path = "src/bin/node_monitor.rs"

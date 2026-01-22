@@ -1753,6 +1753,77 @@ pub async fn run_shard_listener(
                                             )
                                         }
 
+                                        commands::GET_NODE_STATUS => {
+                                            // Comprehensive node status report for monitoring
+                                            let status = s.discovery.status();
+                                            let all_shards_loaded = s.discovery.are_all_shards_loaded();
+                                            
+                                            // Build detailed shard status
+                                            let mut shard_statuses = HashMap::new();
+                                            for shard_id in 0..status.expected_shards {
+                                                if let Some(node) = s.discovery.get_best_node_for_shard(shard_id) {
+                                                    shard_statuses.insert(
+                                                        shard_id.to_string(),
+                                                        serde_json::json!({
+                                                            "discovered": true,
+                                                            "shard_loaded": node.capabilities.shard_loaded,
+                                                            "peer_id": node.peer_id,
+                                                            "is_local": node.peer_id == peer_id.to_string(),
+                                                        })
+                                                    );
+                                                } else {
+                                                    shard_statuses.insert(
+                                                        shard_id.to_string(),
+                                                        serde_json::json!({
+                                                            "discovered": false,
+                                                            "shard_loaded": false,
+                                                            "peer_id": null,
+                                                            "is_local": false,
+                                                        })
+                                                    );
+                                                }
+                                            }
+                                            
+                                            // Local node shard info
+                                            let local_shard_loaded = s.is_shard_loaded(s.shard_id);
+                                            let local_shard_path = s.loaded_shards.get(&s.shard_id)
+                                                .map(|p| p.to_string_lossy().to_string());
+                                            
+                                            let mut result = HashMap::new();
+                                            result.insert("peer_id".to_string(), serde_json::json!(peer_id.to_string()));
+                                            result.insert("shard_id".to_string(), serde_json::json!(s.shard_id));
+                                            result.insert("local_shard_loaded".to_string(), serde_json::json!(local_shard_loaded));
+                                            if let Some(path) = local_shard_path {
+                                                result.insert("local_shard_path".to_string(), serde_json::json!(path));
+                                            }
+                                            result.insert("swarm_ready".to_string(), serde_json::json!(s.swarm_ready));
+                                            result.insert("discovered_shards".to_string(), serde_json::json!(status.discovered_shards));
+                                            result.insert("expected_shards".to_string(), serde_json::json!(status.expected_shards));
+                                            result.insert("is_complete".to_string(), serde_json::json!(status.is_complete));
+                                            result.insert("all_shards_loaded".to_string(), serde_json::json!(all_shards_loaded));
+                                            result.insert("missing_shards".to_string(), serde_json::json!(status.missing_shards));
+                                            result.insert("shard_statuses".to_string(), serde_json::json!(shard_statuses));
+                                            result.insert("active_requests".to_string(), serde_json::json!(s.active_requests));
+                                            result.insert("total_requests".to_string(), serde_json::json!(s.total_requests));
+                                            result.insert("successful_requests".to_string(), serde_json::json!(s.successful_requests));
+                                            result.insert("capabilities".to_string(), serde_json::json!({
+                                                "cpu_cores": s.announcement.capabilities.cpu_cores,
+                                                "memory_total_mb": s.announcement.capabilities.memory_total_mb,
+                                                "memory_available_mb": s.announcement.capabilities.memory_available_mb,
+                                                "gpu_available": s.announcement.capabilities.gpu_available,
+                                                "gpu_memory_mb": s.announcement.capabilities.gpu_memory_mb,
+                                                "shard_loaded": s.announcement.capabilities.shard_loaded,
+                                            }));
+                                            
+                                            CommandResponse::success(
+                                                &cmd.command,
+                                                &cmd.request_id,
+                                                &peer_id.to_string(),
+                                                &cmd.from,
+                                                result,
+                                            )
+                                        }
+
                                         commands::SHARD_LOADED => {
                                             // Another node is notifying us that it loaded a shard - update our tree
                                             let loaded_shard_id = cmd.params.get("shard_id")

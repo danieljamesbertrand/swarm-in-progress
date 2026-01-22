@@ -173,3 +173,26 @@ Write-Host "====================================================================
 Write-Host "  DEPLOYMENT COMPLETE" -ForegroundColor Green
 Write-Host "================================================================================" -ForegroundColor Green
 Write-Host ""
+
+# Step 7: Create backup after deployment
+Write-Host "[7/7] Creating backup of deployment..." -ForegroundColor Yellow
+$gitCommit = ""
+try {
+    $gitCommitCmd = "ssh ${RemoteUser}@${RemoteHost} `"cd ${RemoteDir} && git rev-parse HEAD 2>/dev/null || echo ''`""
+    $gitCommit = Invoke-Expression $gitCommitCmd | Select-Object -Last 1
+} catch {
+    $gitCommit = ""
+}
+
+$backupLabel = "deployment-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+$backupScript = Join-Path $PSScriptRoot "backup_to_rsync.ps1"
+if (Test-Path $backupScript) {
+    Write-Host "  Running backup script..." -ForegroundColor Gray
+    & $backupScript -RemoteUser $RemoteUser -RemoteHost $RemoteHost -RemoteDir $RemoteDir -BackupLabel $backupLabel -GitCommit $gitCommit -SkipDeployment
+    Write-Host "  [OK] Backup created" -ForegroundColor Green
+} else {
+    Write-Host "  [WARNING] Backup script not found at: $backupScript" -ForegroundColor Yellow
+    Write-Host "  [INFO] Manual backup: .\backup_to_rsync.ps1 -BackupLabel $backupLabel" -ForegroundColor Gray
+}
+
+Write-Host ""
